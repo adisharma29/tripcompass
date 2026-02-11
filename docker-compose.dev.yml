@@ -1,0 +1,22 @@
+services:
+  db:
+    image: imresamu/postgis:17-3.5-bookworm
+    container_name: tcomp_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tcomp_db
+      POSTGRES_USER: tcomp_user
+      POSTGRES_PASSWORD: tcomp_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgis.sql:/docker-entrypoint-initdb.d/init-postgis.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tcomp_user -d tcomp_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

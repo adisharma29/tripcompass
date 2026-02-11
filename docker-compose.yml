@@ -1,0 +1,67 @@
+services:
+  db:
+    image: imresamu/postgis:17-3.5-bookworm
+    container_name: tcomp_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tcomp_db
+      POSTGRES_USER: tcomp_user
+      POSTGRES_PASSWORD: tcomp_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgis.sql:/docker-entrypoint-initdb.d/init-postgis.sql
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tcomp_user -d tcomp_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: tcomp_web
+    restart: unless-stopped
+    command: >
+      sh -c "
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput &&
+        uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --reload
+      "
+    volumes:
+      - ./tcomp:/app
+      - ./data:/data
+      - ${TCOMP_SRC:-../tcomp}:/tcomp-src:ro
+      - media_volume:/app/media
+    ports:
+      - "8000:8000"
+    environment:
+      - DJANGO_SETTINGS_MODULE=tcomp.settings.dev
+      - DB_HOST=db
+      - DB_NAME=tcomp_db
+      - DB_USER=tcomp_user
+      - DB_PASSWORD=tcomp_password
+      - DB_PORT=5432
+      - SECRET_KEY=MU2dqipgmV0LJQjMquMKcKUdtH5oiXFokWRU_E71zhtGJx6lov2eVTIRPcT6IfZj_X4
+      - DEBUG=True
+      - ALLOWED_HOSTS=localhost,127.0.0.1,0.0.0.0
+    depends_on:
+      db:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
+  media_volume:

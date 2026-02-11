@@ -1,0 +1,75 @@
+[
+  {
+    "id": "calm-nature",
+    "name": "Slow Down",
+    "tagline": "Quiet walks · Forest trails · Stillness",
+    "tip": "Best enjoyed before 8:30 am when the air is crisp and the trails are peaceful.",
+    "illustration": "resources/mood_cards/calm-nature.png",
+    "color": "#1D4ED8",
+    "isSpecial": false,
+    "experiences": [
+      "Sunset walk at Forest Hill Road",
+      "Glen Hiking Trail-1",
+      "Morning in Forest Hill Road"
+    ]
+  },
+  {
+    "id": "wander-discover",
+    "name": "Wander & Discover",
+    "tagline": "Heritage lanes · Street photography · Unhurried discovery",
+    "tip": "Perfect for culture and architecture lovers. Mornings for heritage, late afternoon for street photography.",
+    "illustration": "resources/mood_cards/wander-discover.png",
+    "color": "#7C3AED",
+    "isSpecial": false,
+    "experiences": [
+      "Heritage Architectural Walk (West)",
+      "Shimla Short Heritage Walk",
+      "Short Toy Train Ride",
+      "Shimla Kalka Vistadome Train",
+      "Lower Bazar- Food & Photowalk",
+      "Victorian Twilight",
+      "Bantony",
+      "Cactarium & Heritage Museum"
+    ]
+  },
+  {
+    "id": "move-a-little",
+    "name": "Move a little",
+    "tagline": "Uphill walks · Longer loops · Earned views",
+    "tip": "These routes require more effort but reward you with stunning views and a sense of accomplishment.",
+    "illustration": "resources/mood_cards/move-a-little.png",
+    "color": "#059669",
+    "isSpecial": false,
+    "experiences": [
+      "Hike to Jakhoo Hill (One Side)",
+      "Taradevi Day Hike",
+      "Larger Shimla eMTB Loop"
+    ]
+  },
+  {
+    "id": "cafes-conversations",
+    "name": "Cafés & Conversations",
+    "tagline": "Cafés · Evening strolls · People-watching",
+    "tip": "The Mall Road comes alive in the evenings. Perfect for your first day in Shimla.",
+    "illustration": "resources/mood_cards/cafes-conversations.png",
+    "color": "#EA580C",
+    "isSpecial": false,
+    "experiences": [
+      "Malling at The Mall Road"
+    ]
+  },
+  {
+    "id": "with-a-local",
+    "name": "With a Local",
+    "tagline": "E-biking · Forest bathing · Slow, guided exploration",
+    "tip": "Book in advance. These experiences include equipment, guides, and safety gear.",
+    "illustration": "resources/mood_cards/with-a-local.png",
+    "color": "#7C2D12",
+    "supportLine": "Hosted experiences, led by cherrypicked local professionals.",
+    "isSpecial": true,
+    "experiences": [
+      "The Calm Circuit",
+      "Ride into Stillness"
+    ]
+  }
+]

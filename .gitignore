@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# Django
+*.log
+db.sqlite3
+staticfiles/
+media/
+
+# Docker
+postgres_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (large)
+data/india/*.shp
+data/india/*.shx
+data/india/*.dbf
+data/india/*.prj
+data/india/*.cpg
+carousel_images/
