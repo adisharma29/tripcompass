@@ -53,6 +53,7 @@ services:
       - SECRET_KEY=MU2dqipgmV0LJQjMquMKcKUdtH5oiXFokWRU_E71zhtGJx6lov2eVTIRPcT6IfZj_X4
       - DEBUG=True
       - ALLOWED_HOSTS=localhost,127.0.0.1,0.0.0.0
+      - CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:6001,http://127.0.0.1:6001
     depends_on:
       db:
         condition: service_healthy
@@ -61,6 +62,28 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  frontend:
+    build:
+      context: ../tcomp-frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: tcomp_frontend
+    restart: unless-stopped
+    volumes:
+      - ../tcomp-frontend/src:/app/src
+      - ../tcomp-frontend/public:/app/public
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "6001:6001"
+    environment:
+      - NEXT_PUBLIC_MAPBOX_TOKEN=pk.eyJ1IjoiYWRpc2hhcm1hMjkiLCJhIjoiY21rbm82YnoyMG56bDNmcjF0MzJycGRiZyJ9.f8rob6O7_PXt2I4fTs9g-w
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - API_URL=http://web:8000
+      - NEXT_PUBLIC_MAPBOX_STYLE=mapbox://styles/adisharma29/cmksp8la3000c01sh8l085gaf
+    depends_on:
+      - web
 
 volumes:
   postgres_data:
