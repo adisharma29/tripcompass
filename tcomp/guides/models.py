@@ -31,6 +31,12 @@ class Destination(models.Model):
     default_bearing = models.FloatField(default=0)
     mapbox_style = models.CharField(max_length=200, blank=True)
 
+    # Map bounds (SW corner → NE corner)
+    bounds_sw_lng = models.FloatField(null=True, blank=True)
+    bounds_sw_lat = models.FloatField(null=True, blank=True)
+    bounds_ne_lng = models.FloatField(null=True, blank=True)
+    bounds_ne_lat = models.FloatField(null=True, blank=True)
+
     # Theme
     background_color = models.CharField(max_length=9, default='#FFE9CF')
     text_color = models.CharField(max_length=9, default='#434431')
@@ -60,6 +66,7 @@ class Mood(models.Model):
     tip = models.TextField(blank=True)
     support_line = models.CharField(max_length=300, blank=True)
     color = models.CharField(max_length=9, default='#000000')
+    card_background = models.CharField(max_length=60, blank=True, help_text='CSS color for mood card background, e.g. rgba(61,122,104,0.25)')
     illustration = models.ImageField(upload_to='mood_illustrations/', blank=True)
     is_special = models.BooleanField(default=False)
     sort_order = models.IntegerField(default=0)

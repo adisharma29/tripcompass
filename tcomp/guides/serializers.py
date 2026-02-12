@@ -9,7 +9,7 @@ class MoodSerializer(serializers.ModelSerializer):
         model = Mood
         fields = [
             'slug', 'name', 'tagline', 'tip', 'support_line',
-            'color', 'illustration', 'is_special', 'sort_order',
+            'color', 'card_background', 'illustration', 'is_special', 'sort_order',
             'experience_codes',
         ]
 
@@ -47,6 +47,8 @@ class DestinationDetailSerializer(serializers.ModelSerializer):
             'slug', 'name', 'tagline', 'description',
             'center_lng', 'center_lat', 'default_zoom',
             'default_pitch', 'default_bearing', 'mapbox_style',
+            'bounds_sw_lng', 'bounds_sw_lat',
+            'bounds_ne_lng', 'bounds_ne_lat',
             'background_color', 'text_color',
             'moods',
         ]
