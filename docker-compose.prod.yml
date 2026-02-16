@@ -5,11 +5,10 @@ services:
     image: traefik:v3.2
     container_name: tcomp_traefik
     restart: unless-stopped
-    environment:
-      - DOCKER_API_VERSION=1.44
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
+      - --providers.docker.apiVersion=1.44
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL:-admin@example.com}
