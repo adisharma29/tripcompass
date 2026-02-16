@@ -1,6 +1,6 @@
 import json
 
-from django.db.models import Count, Prefetch
+from django.db.models import Count, Prefetch, Q
 from django.http import JsonResponse
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
@@ -25,7 +25,11 @@ class DestinationListView(generics.ListAPIView):
     def get_queryset(self):
         return Destination.objects.filter(is_published=True).annotate(
             mood_count=Count('moods', distinct=True),
-            experience_count=Count('experiences', distinct=True),
+            experience_count=Count(
+                'experiences',
+                filter=Q(experiences__is_published=True),
+                distinct=True,
+            ),
         ).order_by('sort_order', 'name')
 
 
@@ -76,7 +80,10 @@ class GeoJSONView(APIView):
     @method_decorator(cache_page(3600))
     def get(self, request, slug):
         features = GeoFeature.objects.filter(
-            destination__slug=slug
+            destination__slug=slug,
+            destination__is_published=True,
+        ).filter(
+            Q(experience__isnull=True) | Q(experience__is_published=True)
         ).select_related('experience')
 
         geojson_features = []
@@ -133,5 +140,7 @@ class NearbyPlaceListView(generics.ListAPIView):
         code = self.kwargs['code']
         return NearbyPlace.objects.filter(
             destination__slug=slug,
+            destination__is_published=True,
             experience__code=code,
+            experience__is_published=True,
         )
