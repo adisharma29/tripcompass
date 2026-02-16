@@ -2,11 +2,9 @@
 # docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 services:
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.2
     container_name: tcomp_traefik
     restart: unless-stopped
-    environment:
-      - DOCKER_API_VERSION=1.44
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
