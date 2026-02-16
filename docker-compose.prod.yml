@@ -1,0 +1,63 @@
+# Run with:
+# docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: tcomp_traefik
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL:-admin@example.com}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/letsencrypt:/letsencrypt
+    networks:
+      - web
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: tcomp_web
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    command: >
+      sh -c "
+      python manage.py migrate --noinput &&
+      python manage.py collectstatic --noinput &&
+      uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --workers 4
+      "
+    expose:
+      - "8000"
+    volumes:
+      - media_volume:/app/media
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.tcomp.rule=Host(`${API_DOMAIN:-api.example.com}`)
+      - traefik.http.routers.tcomp.entrypoints=websecure
+      - traefik.http.routers.tcomp.tls=true
+      - traefik.http.routers.tcomp.tls.certresolver=letsencrypt
+      - traefik.http.services.tcomp.loadbalancer.server.port=8000
+      - traefik.http.routers.tcomp-http.rule=Host(`${API_DOMAIN:-api.example.com}`)
+      - traefik.http.routers.tcomp-http.entrypoints=web
+      - traefik.http.routers.tcomp-http.middlewares=tcomp-https-redirect
+      - traefik.http.middlewares.tcomp-https-redirect.redirectscheme.scheme=https
+    networks:
+      - web
+
+networks:
+  web:
+    driver: bridge
+
+volumes:
+  media_volume:

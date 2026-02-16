@@ -21,6 +21,7 @@ env/
 
 # Environment
 .env
+.env.prod
 
 # Django
 *.log
@@ -34,6 +35,9 @@ postgres_data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Traefik cert storage
+traefik/letsencrypt/acme.json
 
 # Data files (large)
 data/india/*.shp
