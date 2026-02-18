@@ -23,6 +23,24 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  redis:
+    image: redis:7.4-alpine
+    container_name: tcomp_redis
+    restart: unless-stopped
+    command: redis-server --appendonly no --maxmemory 128mb --maxmemory-policy noeviction
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   web:
     build:
       context: .
@@ -54,8 +72,82 @@ services:
       - DEBUG=True
       - ALLOWED_HOSTS=localhost,127.0.0.1,0.0.0.0
       - CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:6001,http://127.0.0.1:6001
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CACHE_REDIS_URL=redis://redis:6379/1
+      - SSE_REDIS_URL=redis://redis:6379/2
+      - FRONTEND_ORIGIN=http://localhost:6001
     depends_on:
       db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: tcomp_celery_worker
+    restart: unless-stopped
+    command: celery -A tcomp worker -l info --concurrency=2 --prefetch-multiplier=1 --max-tasks-per-child=200 -O fair
+    volumes:
+      - ./tcomp:/app
+      - ./data:/data
+      - media_volume:/app/media
+    environment:
+      - DJANGO_SETTINGS_MODULE=tcomp.settings.dev
+      - DB_HOST=db
+      - DB_NAME=tcomp_db
+      - DB_USER=tcomp_user
+      - DB_PASSWORD=tcomp_password
+      - DB_PORT=5432
+      - SECRET_KEY=MU2dqipgmV0LJQjMquMKcKUdtH5oiXFokWRU_E71zhtGJx6lov2eVTIRPcT6IfZj_X4
+      - DEBUG=True
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CACHE_REDIS_URL=redis://redis:6379/1
+      - SSE_REDIS_URL=redis://redis:6379/2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: tcomp_celery_beat
+    restart: unless-stopped
+    command: celery -A tcomp beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - ./tcomp:/app
+      - ./data:/data
+    environment:
+      - DJANGO_SETTINGS_MODULE=tcomp.settings.dev
+      - DB_HOST=db
+      - DB_NAME=tcomp_db
+      - DB_USER=tcomp_user
+      - DB_PASSWORD=tcomp_password
+      - DB_PORT=5432
+      - SECRET_KEY=MU2dqipgmV0LJQjMquMKcKUdtH5oiXFokWRU_E71zhtGJx6lov2eVTIRPcT6IfZj_X4
+      - DEBUG=True
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CACHE_REDIS_URL=redis://redis:6379/1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     logging:
       driver: json-file
@@ -78,7 +170,7 @@ services:
     ports:
       - "6001:6001"
     environment:
-      - NEXT_PUBLIC_MAPBOX_TOKEN=pk.eyJ1IjoiYWRpc2hhcm1hMjkiLCJhIjoiY21rbm82YnoyMG56bDNmcjF0MzJycGRiZyJ9.f8rob6O7_PXt2I4fTs9g-w
+      - NEXT_PUBLIC_MAPBOX_TOKEN=${MAPBOX_TOKEN}
       - NEXT_PUBLIC_API_URL=http://localhost:8000
       - API_URL=http://web:8000
       - NEXT_PUBLIC_MAPBOX_STYLE=mapbox://styles/adisharma29/cmksp8la3000c01sh8l085gaf

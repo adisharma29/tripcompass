@@ -23,6 +23,24 @@ services:
     networks:
       - web
 
+  redis:
+    image: redis:7.4-alpine
+    container_name: tcomp_redis
+    restart: unless-stopped
+    command: redis-server --appendonly no --maxmemory 128mb --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - web
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   web:
     build:
       context: .
@@ -31,28 +49,95 @@ services:
     restart: unless-stopped
     env_file:
       - .env.prod
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CACHE_REDIS_URL=redis://redis:6379/1
+      - SSE_REDIS_URL=redis://redis:6379/2
     command: >
       sh -c "
       python manage.py migrate --noinput &&
-      uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --workers 4
+      uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --workers 4 --proxy-headers --forwarded-allow-ips='${TRUSTED_PROXY_IPS:-172.16.0.0/12,192.168.0.0/16,10.0.0.0/8}'
       "
     expose:
       - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s=socket.create_connection((\"localhost\", 8000), timeout=2); s.close()'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     volumes:
       - media_volume:/app/media
+    depends_on:
+      redis:
+        condition: service_healthy
     labels:
       - traefik.enable=true
-      - traefik.http.routers.tcomp.rule=Host(`${API_DOMAIN:-api.example.com}`)
+      - traefik.http.routers.tcomp.rule=Host(`${API_DOMAIN:-api.refuje.com}`)
       - traefik.http.routers.tcomp.entrypoints=websecure
       - traefik.http.routers.tcomp.tls=true
       - traefik.http.routers.tcomp.tls.certresolver=letsencrypt
       - traefik.http.services.tcomp.loadbalancer.server.port=8000
-      - traefik.http.routers.tcomp-http.rule=Host(`${API_DOMAIN:-api.example.com}`)
+      - traefik.http.routers.tcomp-http.rule=Host(`${API_DOMAIN:-api.refuje.com}`)
       - traefik.http.routers.tcomp-http.entrypoints=web
       - traefik.http.routers.tcomp-http.middlewares=tcomp-https-redirect
       - traefik.http.middlewares.tcomp-https-redirect.redirectscheme.scheme=https
     networks:
       - web
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: tcomp_celery_worker
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CACHE_REDIS_URL=redis://redis:6379/1
+      - SSE_REDIS_URL=redis://redis:6379/2
+    command: celery -A tcomp worker -l info --concurrency=2 --prefetch-multiplier=1 --max-tasks-per-child=200 -O fair
+    volumes:
+      - media_volume:/app/media
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "tcomp", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - web
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: tcomp_celery_beat
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CACHE_REDIS_URL=redis://redis:6379/1
+    command: celery -A tcomp beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - web
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   web:

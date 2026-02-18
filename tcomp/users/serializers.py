@@ -20,3 +20,77 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'email', 'first_name', 'last_name', 'phone', 'avatar', 'bio']
         read_only_fields = ['id', 'email']
+
+
+class UserMinimalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'first_name', 'last_name', 'phone']
+        read_only_fields = fields
+
+
+class AuthProfileSerializer(serializers.ModelSerializer):
+    """User profile + hotel memberships (staff) or stays (guest)."""
+    memberships = serializers.SerializerMethodField()
+    stays = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            'id', 'email', 'first_name', 'last_name', 'phone',
+            'avatar', 'user_type', 'memberships', 'stays',
+        ]
+        read_only_fields = fields
+
+    def get_memberships(self, obj):
+        if obj.user_type != 'STAFF':
+            return []
+        from concierge.serializers import MemberSerializer
+        memberships = obj.hotel_memberships.filter(
+            is_active=True,
+        ).select_related('hotel', 'department')
+        return MemberSerializer(memberships, many=True).data
+
+    def get_stays(self, obj):
+        if obj.user_type != 'GUEST':
+            return []
+        from concierge.serializers import GuestStaySerializer
+        stays = obj.stays.order_by('-created_at')[:5]
+        return GuestStaySerializer(stays, many=True).data
+
+
+class AuthProfileUpdateSerializer(serializers.ModelSerializer):
+    """Allows authenticated user to update phone, first_name, last_name."""
+
+    class Meta:
+        model = User
+        fields = ['phone', 'first_name', 'last_name']
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        # Check uniqueness (partial unique index allows blank)
+        user = self.instance
+        qs = User.objects.filter(phone=value).exclude(pk=user.pk).exclude(phone='')
+        if qs.exists():
+            raise serializers.ValidationError('This phone number is already in use.')
+        return value
+
+
+class OTPSendSerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=20)
+    hotel_slug = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_phone(self, value):
+        # Basic phone validation
+        cleaned = value.strip().replace(' ', '')
+        if not cleaned:
+            raise serializers.ValidationError('Phone number is required.')
+        return cleaned
+
+
+class OTPVerifySerializer(serializers.Serializer):
+    phone = serializers.CharField(max_length=20)
+    code = serializers.CharField(max_length=10, write_only=True)
+    hotel_slug = serializers.CharField(required=False, allow_blank=True, default='')
+    qr_code = serializers.CharField(required=False, allow_blank=True, default='')

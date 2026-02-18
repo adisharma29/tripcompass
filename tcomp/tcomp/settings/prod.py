@@ -29,6 +29,18 @@ SECURE_HSTS_PRELOAD = True
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 
+# Cookie-only auth in production — no Bearer fallback
+# (inherits from base.py which only has JWTCookieAuthentication)
+
+# Cross-subdomain cookies for refuje.com / api.refuje.com
+CSRF_TRUSTED_ORIGINS = ['https://refuje.com', 'https://api.refuje.com']
+CSRF_COOKIE_DOMAIN = '.refuje.com'
+CSRF_COOKIE_SAMESITE = 'Lax'
+CORS_ALLOWED_ORIGINS = ['https://refuje.com']
+SESSION_COOKIE_DOMAIN = '.refuje.com'
+SIMPLE_JWT['AUTH_COOKIE_DOMAIN'] = '.refuje.com'
+FRONTEND_ORIGIN = 'https://refuje.com'
+
 STORAGE_BACKEND = config('STORAGE_BACKEND', default='local')
 
 if STORAGE_BACKEND == 'r2':
