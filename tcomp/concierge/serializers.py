@@ -130,16 +130,25 @@ class ExperienceSerializer(serializers.ModelSerializer):
         return value
 
 
+class HotelMinimalSerializer(serializers.ModelSerializer):
+    """Lightweight hotel serializer for embedding in membership responses."""
+
+    class Meta:
+        model = Hotel
+        fields = ['id', 'name', 'slug']
+
+
 class MemberSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(source='user.email', read_only=True)
     first_name = serializers.CharField(source='user.first_name', read_only=True)
     last_name = serializers.CharField(source='user.last_name', read_only=True)
     phone = serializers.CharField(source='user.phone', read_only=True)
+    hotel = HotelMinimalSerializer(read_only=True)
 
     class Meta:
         model = HotelMembership
         fields = [
-            'id', 'email', 'first_name', 'last_name', 'phone',
+            'id', 'hotel', 'email', 'first_name', 'last_name', 'phone',
             'role', 'department', 'is_active', 'created_at',
         ]
         read_only_fields = ['id', 'created_at']

@@ -473,6 +473,10 @@ class DashboardStats(HotelScopedMixin, APIView):
 class RequestSSEStream(HotelScopedMixin, APIView):
     permission_classes = [IsStaffOrAbove]
 
+    def perform_content_negotiation(self, request, force=False):
+        """Bypass DRF content negotiation — this view returns a StreamingHttpResponse directly."""
+        return (self.renderer_classes[0](), self.renderer_classes[0].media_type)
+
     def get(self, request, **kwargs):
         hotel = self.get_hotel()
         user = request.user
@@ -552,7 +556,7 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
     def get_queryset(self):
         return HotelMembership.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('user', 'department')
+        ).select_related('user', 'department', 'hotel')
 
     def create(self, request, *args, **kwargs):
         from django.contrib.auth import get_user_model
@@ -646,7 +650,7 @@ class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         return HotelMembership.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('user', 'department')
+        ).select_related('user', 'department', 'hotel')
 
     def perform_destroy(self, instance):
         instance.is_active = False
