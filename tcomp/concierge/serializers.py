@@ -1,13 +1,30 @@
 import re
 
+import bleach
 from django.utils import timezone
 from rest_framework import serializers
 
 from .models import (
-    Hotel, HotelMembership, Department, Experience,
+    Hotel, HotelMembership, Department, Experience, ExperienceImage,
     GuestStay, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode,
 )
+
+ALLOWED_HTML_TAGS = [
+    'p', 'br', 'strong', 'em', 's', 'h2', 'h3',
+    'ul', 'ol', 'li', 'blockquote', 'hr',
+]
+
+
+# ---------------------------------------------------------------------------
+# Image serializer (used by both public and admin)
+# ---------------------------------------------------------------------------
+
+class ExperienceImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ExperienceImage
+        fields = ['id', 'image', 'alt_text', 'display_order', 'created_at']
+        read_only_fields = ['id', 'created_at']
 
 
 # ---------------------------------------------------------------------------
@@ -15,12 +32,14 @@ from .models import (
 # ---------------------------------------------------------------------------
 
 class ExperiencePublicSerializer(serializers.ModelSerializer):
+    gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+
     class Meta:
         model = Experience
         fields = [
             'id', 'name', 'slug', 'description', 'photo', 'cover_image',
             'price_display', 'category', 'timing', 'duration', 'capacity',
-            'highlights', 'display_order',
+            'highlights', 'display_order', 'gallery_images',
         ]
 
 
@@ -102,13 +121,19 @@ class DepartmentSerializer(serializers.ModelSerializer):
             'display_order', 'schedule', 'is_ops', 'is_active',
             'experiences', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'slug', 'created_at', 'updated_at']
+
+    def validate_description(self, value):
+        if value:
+            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+        return value
 
 
 class ExperienceSerializer(serializers.ModelSerializer):
     department = serializers.PrimaryKeyRelatedField(
         queryset=Department.objects.all(),
     )
+    gallery_images = ExperienceImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Experience
@@ -117,9 +142,9 @@ class ExperienceSerializer(serializers.ModelSerializer):
             'photo', 'cover_image', 'price', 'price_display',
             'category', 'timing', 'duration', 'capacity',
             'highlights', 'is_active', 'display_order',
-            'created_at', 'updated_at',
+            'gallery_images', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'slug', 'created_at', 'updated_at']
 
     def validate_department(self, value):
         hotel = self.context.get('hotel')
@@ -127,6 +152,11 @@ class ExperienceSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 'Department does not belong to this hotel.'
             )
+        return value
+
+    def validate_description(self, value):
+        if value:
+            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
         return value
 
 
@@ -161,10 +191,19 @@ class MemberSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def validate(self, data):
+        role = data.get('role', getattr(self.instance, 'role', None))
+        department = data.get('department', getattr(self.instance, 'department', None))
+        if role == HotelMembership.Role.STAFF and not department:
+            raise serializers.ValidationError(
+                {'department': 'Department is required for STAFF role.'}
+            )
+        return data
+
 
 class MemberCreateSerializer(serializers.Serializer):
-    email = serializers.EmailField()
-    phone = serializers.CharField(required=True)
+    email = serializers.EmailField(required=False, default='')
+    phone = serializers.CharField(required=False, default='')
     first_name = serializers.CharField(required=False, allow_blank=True, default='')
     last_name = serializers.CharField(required=False, allow_blank=True, default='')
     role = serializers.ChoiceField(choices=HotelMembership.Role.choices)
@@ -181,6 +220,10 @@ class MemberCreateSerializer(serializers.Serializer):
         return value
 
     def validate(self, data):
+        if not data.get('email') and not data.get('phone'):
+            raise serializers.ValidationError(
+                'At least one of email or phone is required.'
+            )
         if data['role'] == HotelMembership.Role.STAFF and not data.get('department'):
             raise serializers.ValidationError(
                 {'department': 'Department is required for STAFF role.'}

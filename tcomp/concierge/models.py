@@ -4,6 +4,7 @@ import uuid
 from django.conf import settings
 from django.contrib.gis.db import models as gis_models
 from django.db import models
+from django.utils.text import slugify
 
 
 class Hotel(models.Model):
@@ -139,6 +140,15 @@ class Department(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.name) or 'department'
+            slug = base[:100]
+            counter = 1
+            while Department.objects.filter(hotel=self.hotel, slug=slug).exclude(pk=self.pk).exists():
+                suffix = f'-{counter}'
+                slug = f'{base[:100 - len(suffix)]}{suffix}'
+                counter += 1
+            self.slug = slug
         if not self.schedule:
             self.schedule = {
                 'timezone': 'Asia/Kolkata',
@@ -185,11 +195,40 @@ class Experience(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.name) or 'experience'
+            slug = base[:100]
+            counter = 1
+            while Experience.objects.filter(department=self.department, slug=slug).exclude(pk=self.pk).exists():
+                suffix = f'-{counter}'
+                slug = f'{base[:100 - len(suffix)]}{suffix}'
+                counter += 1
+            self.slug = slug
+        super().save(*args, **kwargs)
+
     class Meta:
         ordering = ['display_order', 'name']
 
     def __str__(self):
         return f'{self.name} ({self.department.name})'
+
+
+class ExperienceImage(models.Model):
+    """Gallery images for an experience (separate from thumbnail/cover)."""
+    experience = models.ForeignKey(
+        Experience, on_delete=models.CASCADE, related_name='gallery_images',
+    )
+    image = models.ImageField(upload_to='experience_gallery/')
+    alt_text = models.CharField(max_length=255, blank=True)
+    display_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['display_order', 'created_at']
+
+    def __str__(self):
+        return f'Image {self.id} for {self.experience.name}'
 
 
 class GuestStay(models.Model):

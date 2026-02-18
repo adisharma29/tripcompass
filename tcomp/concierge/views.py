@@ -4,8 +4,10 @@ import json
 import logging
 
 from django.conf import settings
-from django.db.models import Count
+from django.db import transaction
+from django.db.models import Count, Max
 from django.http import StreamingHttpResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status, viewsets
 from rest_framework.decorators import action
@@ -16,9 +18,9 @@ from rest_framework.views import APIView
 from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
-    Department, Experience, GuestStay, Hotel, HotelMembership,
-    Notification, PushSubscription, QRCode, ServiceRequest,
-    RequestActivity,
+    Department, Experience, ExperienceImage, GuestStay, Hotel,
+    HotelMembership, Notification, PushSubscription, QRCode,
+    ServiceRequest, RequestActivity,
 )
 from .permissions import (
     CanAccessRequestObject, CanAccessRequestObjectByLookup,
@@ -27,8 +29,9 @@ from .permissions import (
 )
 from .serializers import (
     DashboardStatsSerializer, DepartmentPublicSerializer,
-    DepartmentSerializer, ExperiencePublicSerializer,
-    ExperienceSerializer, GuestStaySerializer,
+    DepartmentSerializer, ExperienceImageSerializer,
+    ExperiencePublicSerializer, ExperienceSerializer,
+    GuestStaySerializer,
     GuestStayUpdateSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
     MemberSerializer, NotificationSerializer,
@@ -58,7 +61,7 @@ class HotelPublicDetail(generics.RetrieveAPIView):
     lookup_field = 'slug'
     lookup_url_kwarg = 'hotel_slug'
     queryset = Hotel.objects.filter(is_active=True).prefetch_related(
-        'departments__experiences',
+        'departments__experiences__gallery_images',
     )
 
 
@@ -71,7 +74,7 @@ class DepartmentPublicList(generics.ListAPIView):
             hotel__slug=self.kwargs['hotel_slug'],
             hotel__is_active=True,
             is_active=True,
-        ).prefetch_related('experiences')
+        ).prefetch_related('experiences__gallery_images')
 
 
 class DepartmentPublicDetail(generics.RetrieveAPIView):
@@ -85,7 +88,7 @@ class DepartmentPublicDetail(generics.RetrieveAPIView):
             hotel__slug=self.kwargs['hotel_slug'],
             hotel__is_active=True,
             is_active=True,
-        ).prefetch_related('experiences')
+        ).prefetch_related('experiences__gallery_images')
 
 
 class ExperiencePublicDetail(generics.RetrieveAPIView):
@@ -99,7 +102,7 @@ class ExperiencePublicDetail(generics.RetrieveAPIView):
             department__hotel__slug=self.kwargs['hotel_slug'],
             department__hotel__is_active=True,
             is_active=True,
-        )
+        ).prefetch_related('gallery_images')
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +243,14 @@ class ServiceRequestList(HotelScopedMixin, generics.ListAPIView):
         return qs
 
 
-class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveAPIView):
+class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveUpdateAPIView):
     permission_classes = [IsStaffOrAbove, CanAccessRequestObject]
-    serializer_class = ServiceRequestDetailSerializer
+    http_method_names = ['get', 'patch']
+
+    def get_serializer_class(self):
+        if self.request.method == 'PATCH':
+            return ServiceRequestUpdateSerializer
+        return ServiceRequestDetailSerializer
 
     def get_queryset(self):
         return ServiceRequest.objects.filter(
@@ -261,6 +269,45 @@ class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveAPIView):
         )
         serializer = self.get_serializer(instance)
         return Response(serializer.data)
+
+    def perform_update(self, serializer):
+        old_status = serializer.instance.status
+        new_status = serializer.validated_data.get('status')
+
+        instance = serializer.save()
+
+        if new_status:
+            if new_status == ServiceRequest.Status.CONFIRMED:
+                instance.confirmed_at = timezone.now()
+                instance.save(update_fields=['confirmed_at'])
+
+            action = (
+                RequestActivity.Action.CONFIRMED
+                if new_status == ServiceRequest.Status.CONFIRMED
+                else RequestActivity.Action.CLOSED
+            )
+            RequestActivity.objects.create(
+                request=instance,
+                actor=self.request.user,
+                action=action,
+                details={
+                    'status_from': old_status,
+                    'status_to': new_status,
+                },
+            )
+
+            publish_request_event(instance.hotel, 'request.updated', instance)
+
+        # Staff notes activity
+        if serializer.validated_data.get('staff_notes'):
+            RequestActivity.objects.create(
+                request=instance,
+                actor=self.request.user,
+                action=RequestActivity.Action.NOTE_ADDED,
+                details={
+                    'note_length': len(serializer.validated_data['staff_notes']),
+                },
+            )
 
 
 class ServiceRequestDetailByPublicId(HotelScopedMixin, generics.RetrieveAPIView):
@@ -347,54 +394,6 @@ class ServiceRequestTakeOwnership(HotelScopedMixin, APIView):
         )
 
         return Response(ServiceRequestDetailSerializer(req).data)
-
-
-class ServiceRequestUpdate(HotelScopedMixin, generics.UpdateAPIView):
-    permission_classes = [IsStaffOrAbove, CanAccessRequestObject]
-    serializer_class = ServiceRequestUpdateSerializer
-    http_method_names = ['patch']
-
-    def get_queryset(self):
-        return ServiceRequest.objects.filter(hotel=self.get_hotel())
-
-    def perform_update(self, serializer):
-        old_status = serializer.instance.status
-        new_status = serializer.validated_data.get('status')
-
-        instance = serializer.save()
-
-        if new_status:
-            if new_status == ServiceRequest.Status.CONFIRMED:
-                instance.confirmed_at = timezone.now()
-                instance.save(update_fields=['confirmed_at'])
-
-            action = (
-                RequestActivity.Action.CONFIRMED
-                if new_status == ServiceRequest.Status.CONFIRMED
-                else RequestActivity.Action.CLOSED
-            )
-            RequestActivity.objects.create(
-                request=instance,
-                actor=self.request.user,
-                action=action,
-                details={
-                    'status_from': old_status,
-                    'status_to': new_status,
-                },
-            )
-
-            publish_request_event(instance.hotel, 'request.updated', instance)
-
-        # Staff notes activity
-        if serializer.validated_data.get('staff_notes'):
-            RequestActivity.objects.create(
-                request=instance,
-                actor=self.request.user,
-                action=RequestActivity.Action.NOTE_ADDED,
-                details={
-                    'note_length': len(serializer.validated_data['staff_notes']),
-                },
-            )
 
 
 class RequestNoteCreate(HotelScopedMixin, APIView):
@@ -514,7 +513,147 @@ class ExperienceViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         return Experience.objects.filter(
             department__hotel=self.get_hotel(),
             department__slug=self.kwargs.get('dept_slug'),
+        ).prefetch_related('gallery_images')
+
+
+# ---------------------------------------------------------------------------
+# Bulk reorder
+# ---------------------------------------------------------------------------
+
+class DepartmentBulkReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            departments = Department.objects.filter(hotel=hotel, id__in=ordered_ids)
+            if departments.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more IDs do not belong to this hotel.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            dept_map = {d.id: d for d in departments}
+            for idx, dept_id in enumerate(ordered_ids):
+                dept_map[dept_id].display_order = idx
+            Department.objects.bulk_update(dept_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} departments reordered.'})
+
+
+class ExperienceBulkReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        dept_slug = self.kwargs['dept_slug']
+        with transaction.atomic():
+            experiences = Experience.objects.filter(
+                department__hotel=hotel,
+                department__slug=dept_slug,
+                id__in=ordered_ids,
+            )
+            if experiences.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more IDs do not belong to this department.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            exp_map = {e.id: e for e in experiences}
+            for idx, exp_id in enumerate(ordered_ids):
+                exp_map[exp_id].display_order = idx
+            Experience.objects.bulk_update(exp_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} experiences reordered.'})
+
+
+# ---------------------------------------------------------------------------
+# Experience gallery images
+# ---------------------------------------------------------------------------
+
+class ExperienceImageUpload(HotelScopedMixin, generics.CreateAPIView):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = ExperienceImageSerializer
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        exp = get_object_or_404(
+            Experience,
+            pk=self.kwargs['exp_id'],
+            department__hotel=hotel,
+            department__slug=self.kwargs['dept_slug'],
         )
+        max_order = exp.gallery_images.aggregate(m=Max('display_order'))['m'] or 0
+        serializer.save(experience=exp, display_order=max_order + 1)
+
+
+class ExperienceImageDelete(HotelScopedMixin, generics.DestroyAPIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get_queryset(self):
+        return ExperienceImage.objects.filter(
+            experience__department__hotel=self.get_hotel(),
+            experience__department__slug=self.kwargs.get('dept_slug'),
+        )
+
+
+class ExperienceImageReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            images = ExperienceImage.objects.filter(
+                experience__department__hotel=hotel,
+                experience__department__slug=self.kwargs['dept_slug'],
+                experience__pk=self.kwargs['exp_id'],
+                id__in=ordered_ids,
+            )
+            if images.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more image IDs are invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            img_map = {img.id: img for img in images}
+            for idx, img_id in enumerate(ordered_ids):
+                img_map[img_id].display_order = idx
+            ExperienceImage.objects.bulk_update(img_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} images reordered.'})
 
 
 class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
@@ -657,10 +796,10 @@ class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
         instance.save(update_fields=['is_active'])
 
 
-class HotelSettingsUpdate(HotelScopedMixin, generics.UpdateAPIView):
+class HotelSettingsUpdate(HotelScopedMixin, generics.RetrieveUpdateAPIView):
     permission_classes = [IsSuperAdmin]
     serializer_class = HotelSettingsSerializer
-    http_method_names = ['patch']
+    http_method_names = ['get', 'patch']
 
     def get_object(self):
         return self.get_hotel()
