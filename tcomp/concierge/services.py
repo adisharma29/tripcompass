@@ -728,15 +728,19 @@ def expire_stale_requests():
 
 
 def send_response_due_reminders():
-    """Send reminder if response_due_at passed and request still CREATED."""
+    """Send reminder if response_due_at passed and request still CREATED.
+    Only sends once per request (sets reminder_sent_at to prevent duplicates)."""
     now = timezone.now()
     overdue = ServiceRequest.objects.filter(
         status=ServiceRequest.Status.CREATED,
         response_due_at__lt=now,
+        reminder_sent_at__isnull=True,
     ).select_related('department', 'hotel', 'guest_stay')
 
     for req in overdue:
         notify_department_staff(req.department, req)
+        req.reminder_sent_at = now
+        req.save(update_fields=['reminder_sent_at'])
 
 
 # ---------------------------------------------------------------------------

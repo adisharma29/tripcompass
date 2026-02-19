@@ -429,6 +429,7 @@ class ServiceRequest(models.Model):
     confirmation_reason = models.CharField(max_length=50, blank=True)
     after_hours = models.BooleanField(default=False)
     response_due_at = models.DateTimeField(null=True, blank=True)
+    reminder_sent_at = models.DateTimeField(null=True, blank=True)
     acknowledged_at = models.DateTimeField(null=True, blank=True)
     confirmed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

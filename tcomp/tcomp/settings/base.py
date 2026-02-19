@@ -214,10 +214,10 @@ CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 # DatabaseScheduler syncs these into the DB on first beat startup.
 # Can be overridden/tuned via Django admin afterwards.
 CELERY_BEAT_SCHEDULE = {
-    'check-escalations': {
-        'task': 'concierge.tasks.check_escalations_task',
-        'schedule': 5 * 60,  # every 5 minutes
-    },
+    # 'check-escalations': {
+    #     'task': 'concierge.tasks.check_escalations_task',
+    #     'schedule': 5 * 60,  # every 5 minutes
+    # },
     'expire-stale-stays': {
         'task': 'concierge.tasks.expire_stale_stays_task',
         'schedule': 60 * 60,  # every hour
@@ -226,10 +226,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'concierge.tasks.expire_stale_requests_task',
         'schedule': 60 * 60,  # every hour
     },
-    'response-due-reminder': {
-        'task': 'concierge.tasks.response_due_reminder_task',
-        'schedule': 5 * 60,  # every 5 minutes
-    },
+    # 'response-due-reminder': {
+    #     'task': 'concierge.tasks.response_due_reminder_task',
+    #     'schedule': 5 * 60,  # every 5 minutes
+    # },
     'otp-wa-fallback-sweep': {
         'task': 'concierge.tasks.otp_wa_fallback_sweep_task',
         'schedule': 10,  # every 10 seconds

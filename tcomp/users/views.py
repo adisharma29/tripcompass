@@ -273,6 +273,8 @@ class OTPVerifyView(APIView):
         data = AuthProfileSerializer(user).data
         if stay:
             data['stay_id'] = stay.id
+            data['stay_room_number'] = stay.room_number or ''
+            data['stay_expires_at'] = stay.expires_at.isoformat()
 
         response = Response(data)
         return _set_auth_cookies(response, user)

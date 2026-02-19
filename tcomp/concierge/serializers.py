@@ -145,8 +145,23 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
         return data
 
 
+class _ExperienceNestedSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for experiences nested inside admin DepartmentSerializer.
+    Includes status/is_active fields that ExperiencePublicSerializer omits."""
+    gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Experience
+        fields = [
+            'id', 'name', 'slug', 'description', 'photo', 'cover_image',
+            'price', 'price_display', 'category', 'timing', 'duration',
+            'capacity', 'highlights', 'display_order', 'gallery_images',
+            'is_active', 'status', 'published_at', 'created_at', 'updated_at',
+        ]
+
+
 class DepartmentSerializer(serializers.ModelSerializer):
-    experiences = ExperiencePublicSerializer(many=True, read_only=True)
+    experiences = _ExperienceNestedSerializer(many=True, read_only=True)
     icon_clear = serializers.BooleanField(write_only=True, required=False, default=False)
 
     class Meta:
@@ -553,6 +568,16 @@ class PushSubscriptionSerializer(serializers.ModelSerializer):
         model = PushSubscription
         fields = ['id', 'subscription_info', 'is_active', 'created_at']
         read_only_fields = ['id', 'created_at']
+
+    def validate_subscription_info(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Must be a JSON object.')
+        if not value.get('endpoint'):
+            raise serializers.ValidationError('Missing required key "endpoint".')
+        keys = value.get('keys')
+        if not isinstance(keys, dict) or not keys.get('p256dh') or not keys.get('auth'):
+            raise serializers.ValidationError('Missing required "keys.p256dh" and "keys.auth".')
+        return value
 
 
 # ---------------------------------------------------------------------------

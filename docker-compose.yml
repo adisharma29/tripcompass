@@ -76,6 +76,9 @@ services:
       - CACHE_REDIS_URL=redis://redis:6379/1
       - SSE_REDIS_URL=redis://redis:6379/2
       - FRONTEND_ORIGIN=http://localhost:6001
+      - VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY}
+      - VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY}
+      - VAPID_ADMIN_EMAIL=${VAPID_ADMIN_EMAIL:-admin@refuje.com}
     depends_on:
       db:
         condition: service_healthy
@@ -111,6 +114,9 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CACHE_REDIS_URL=redis://redis:6379/1
       - SSE_REDIS_URL=redis://redis:6379/2
+      - VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY}
+      - VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY}
+      - VAPID_ADMIN_EMAIL=${VAPID_ADMIN_EMAIL:-admin@refuje.com}
     depends_on:
       db:
         condition: service_healthy
@@ -174,6 +180,7 @@ services:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
       - API_URL=http://web:8000
       - NEXT_PUBLIC_MAPBOX_STYLE=mapbox://styles/adisharma29/cmksp8la3000c01sh8l085gaf
+      - NEXT_PUBLIC_VAPID_PUBLIC_KEY=${NEXT_PUBLIC_VAPID_PUBLIC_KEY}
     depends_on:
       - web
 

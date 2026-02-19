@@ -862,7 +862,11 @@ class NotificationList(generics.ListAPIView):
     serializer_class = NotificationSerializer
 
     def get_queryset(self):
-        return Notification.objects.filter(user=self.request.user)
+        qs = Notification.objects.filter(user=self.request.user)
+        is_read = self.request.query_params.get('is_read')
+        if is_read is not None:
+            qs = qs.filter(is_read=is_read.lower() in ('true', '1'))
+        return qs.order_by('-created_at')
 
 
 class NotificationMarkRead(APIView):
@@ -886,7 +890,47 @@ class PushSubscriptionCreate(generics.CreateAPIView):
     serializer_class = PushSubscriptionSerializer
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        # Upsert by endpoint to prevent duplicate rows from repeated
+        # registrations on the same device while preserving multi-device subs.
+        # Lock the user row to serialize all push sub operations for this
+        # user — select_for_update on PushSubscription alone is a no-op
+        # when no matching row exists yet, so we lock the parent instead.
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+
+        endpoint = serializer.validated_data['subscription_info']['endpoint']
+        with transaction.atomic():
+            # Lock user row — serializes concurrent push registrations
+            User.objects.select_for_update().filter(
+                pk=self.request.user.pk,
+            ).first()
+
+            dupes = list(
+                PushSubscription.objects.filter(
+                    user=self.request.user,
+                    subscription_info__endpoint=endpoint,
+                ).order_by('pk')
+            )
+
+            if dupes:
+                # Keep the first, update it, delete any extras
+                existing = dupes[0]
+                existing.subscription_info = serializer.validated_data[
+                    'subscription_info'
+                ]
+                existing.is_active = True
+                existing.save(
+                    update_fields=['subscription_info', 'is_active'],
+                )
+                if len(dupes) > 1:
+                    PushSubscription.objects.filter(
+                        pk__in=[d.pk for d in dupes[1:]],
+                    ).delete()
+                # Point serializer.instance at the model so DRF
+                # returns the full object (including id) in the response.
+                serializer.instance = existing
+                return
+            serializer.save(user=self.request.user)
 
 
 class PushSubscriptionDelete(generics.DestroyAPIView):
