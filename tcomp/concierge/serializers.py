@@ -147,11 +147,12 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
 
 class DepartmentSerializer(serializers.ModelSerializer):
     experiences = ExperiencePublicSerializer(many=True, read_only=True)
+    icon_clear = serializers.BooleanField(write_only=True, required=False, default=False)
 
     class Meta:
         model = Department
         fields = [
-            'id', 'name', 'slug', 'description', 'photo', 'icon',
+            'id', 'name', 'slug', 'description', 'photo', 'icon', 'icon_clear',
             'display_order', 'schedule', 'is_ops', 'is_active',
             'status', 'published_at',
             'experiences', 'created_at', 'updated_at',
@@ -174,9 +175,14 @@ class DepartmentSerializer(serializers.ModelSerializer):
         new_status = validated_data.get('status')
         if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
+        if validated_data.pop('icon_clear', False):
+            if instance.icon:
+                instance.icon.delete(save=False)
+            setattr(instance, 'icon', '')
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
+        validated_data.pop('icon_clear', None)
         if validated_data.get('status') == ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
@@ -412,6 +418,10 @@ class ServiceRequestCreateSerializer(serializers.ModelSerializer):
                 )
             # Derive department from experience
             derived_dept = experience.department
+            if derived_dept.is_ops:
+                raise serializers.ValidationError(
+                    {'experience': 'This experience is not available for guest requests.'}
+                )
             if department and department != derived_dept:
                 raise serializers.ValidationError(
                     {'department': 'Department does not match the experience.'}
@@ -421,6 +431,10 @@ class ServiceRequestCreateSerializer(serializers.ModelSerializer):
             if department.hotel != hotel:
                 raise serializers.ValidationError(
                     {'department': 'Department does not belong to this hotel.'}
+                )
+            if department.is_ops:
+                raise serializers.ValidationError(
+                    {'department': 'This department is not available for guest requests.'}
                 )
         else:
             raise serializers.ValidationError(

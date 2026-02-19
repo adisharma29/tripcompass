@@ -63,7 +63,7 @@ class HotelPublicDetail(generics.RetrieveAPIView):
     queryset = Hotel.objects.filter(is_active=True).prefetch_related(
         Prefetch(
             'departments',
-            queryset=Department.objects.filter(status=ContentStatus.PUBLISHED),
+            queryset=Department.objects.filter(status=ContentStatus.PUBLISHED, is_ops=False),
         ),
         Prefetch(
             'departments__experiences',
@@ -82,6 +82,7 @@ class DepartmentPublicList(generics.ListAPIView):
             hotel__slug=self.kwargs['hotel_slug'],
             hotel__is_active=True,
             status=ContentStatus.PUBLISHED,
+            is_ops=False,
         ).prefetch_related(
             Prefetch(
                 'experiences',
@@ -102,6 +103,7 @@ class DepartmentPublicDetail(generics.RetrieveAPIView):
             hotel__slug=self.kwargs['hotel_slug'],
             hotel__is_active=True,
             status=ContentStatus.PUBLISHED,
+            is_ops=False,
         ).prefetch_related(
             Prefetch(
                 'experiences',
@@ -114,13 +116,15 @@ class DepartmentPublicDetail(generics.RetrieveAPIView):
 class ExperiencePublicDetail(generics.RetrieveAPIView):
     permission_classes = [AllowAny]
     serializer_class = ExperiencePublicSerializer
-    lookup_field = 'pk'
-    lookup_url_kwarg = 'exp_id'
+    lookup_field = 'slug'
+    lookup_url_kwarg = 'exp_slug'
 
     def get_queryset(self):
         return Experience.objects.filter(
             department__hotel__slug=self.kwargs['hotel_slug'],
+            department__slug=self.kwargs['dept_slug'],
             department__hotel__is_active=True,
+            department__is_ops=False,
             status=ContentStatus.PUBLISHED,
         ).prefetch_related('gallery_images')
 

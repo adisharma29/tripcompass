@@ -92,12 +92,12 @@ class Hotel(models.Model):
 
     # --- Typography ---
     heading_font = models.CharField(
-        max_length=100, blank=True, default='',
-        help_text='Google Font name for headings',
+        max_length=100, blank=True, default='BioRhyme',
+        help_text='Font name for headings',
     )
     body_font = models.CharField(
-        max_length=100, blank=True, default='',
-        help_text='Google Font name for body text',
+        max_length=100, blank=True, default='Brinnan',
+        help_text='Font name for body text',
     )
 
     # --- Favicon & OG ---
@@ -183,7 +183,7 @@ class Department(models.Model):
     slug = models.SlugField(max_length=100)
     description = models.TextField(blank=True)
     photo = models.ImageField(upload_to='department_photos/', blank=True)
-    icon = models.CharField(max_length=50, blank=True)
+    icon = models.ImageField(upload_to='department_icons/', blank=True)
     display_order = models.IntegerField(default=0)
     schedule = models.JSONField(
         default=dict,
@@ -282,6 +282,7 @@ class Experience(models.Model):
         super().save(*args, **kwargs)
 
     class Meta:
+        unique_together = ('department', 'slug')
         ordering = ['display_order', 'name']
 
     def __str__(self):

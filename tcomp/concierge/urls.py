@@ -10,7 +10,7 @@ urlpatterns = [
          views.DepartmentPublicList.as_view(), name='department-public-list'),
     path('hotels/<slug:hotel_slug>/departments/<slug:dept_slug>/',
          views.DepartmentPublicDetail.as_view(), name='department-public-detail'),
-    path('hotels/<slug:hotel_slug>/experiences/<int:exp_id>/',
+    path('hotels/<slug:hotel_slug>/departments/<slug:dept_slug>/experiences/<slug:exp_slug>/',
          views.ExperiencePublicDetail.as_view(), name='experience-public-detail'),
 
     # --- Guest ---
