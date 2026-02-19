@@ -4,7 +4,7 @@ from .models import ServiceRequest
 
 
 class ServiceRequestFilter(django_filters.FilterSet):
-    status = django_filters.ChoiceFilter(choices=ServiceRequest.Status.choices)
+    status = django_filters.MultipleChoiceFilter(choices=ServiceRequest.Status.choices)
     department = django_filters.NumberFilter(field_name='department_id')
     request_type = django_filters.ChoiceFilter(choices=ServiceRequest.RequestType.choices)
     after_hours = django_filters.BooleanFilter()

@@ -457,6 +457,7 @@ class RequestActivity(models.Model):
         CLOSED = 'CLOSED', 'Closed'
         ESCALATED = 'ESCALATED', 'Escalated'
         NOTE_ADDED = 'NOTE_ADDED', 'Note Added'
+        OWNERSHIP_TAKEN = 'OWNERSHIP_TAKEN', 'Ownership Taken'
         EXPIRED = 'EXPIRED', 'Expired'
 
     ALLOWED_DETAIL_KEYS = {

@@ -419,15 +419,19 @@ class ServiceRequestTakeOwnership(HotelScopedMixin, APIView):
 
         self.check_object_permissions(request, req)
 
-        req.assigned_to = request.user
-        req.save(update_fields=['assigned_to', 'updated_at'])
+        # Idempotent — skip if already owned by this user
+        if req.assigned_to_id != request.user.id:
+            req.assigned_to = request.user
+            req.save(update_fields=['assigned_to', 'updated_at'])
 
-        RequestActivity.objects.create(
-            request=req,
-            actor=request.user,
-            action=RequestActivity.Action.ACKNOWLEDGED,
-            details={'assigned_to_id': request.user.id},
-        )
+            RequestActivity.objects.create(
+                request=req,
+                actor=request.user,
+                action=RequestActivity.Action.OWNERSHIP_TAKEN,
+                details={'assigned_to_id': request.user.id},
+            )
+
+            publish_request_event(hotel, 'request.updated', req)
 
         return Response(ServiceRequestDetailSerializer(req).data)
 

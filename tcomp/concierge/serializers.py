@@ -487,11 +487,19 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
 
 class ServiceRequestDetailSerializer(ServiceRequestListSerializer):
     activities = RequestActivitySerializer(many=True, read_only=True)
+    assigned_to_name = serializers.SerializerMethodField()
+    assigned_to_id = serializers.IntegerField(source='assigned_to.id', read_only=True, default=None)
 
     class Meta(ServiceRequestListSerializer.Meta):
         fields = ServiceRequestListSerializer.Meta.fields + [
             'staff_notes', 'confirmation_reason', 'activities',
+            'assigned_to_name', 'assigned_to_id',
         ]
+
+    def get_assigned_to_name(self, obj):
+        if not obj.assigned_to:
+            return None
+        return f'{obj.assigned_to.first_name} {obj.assigned_to.last_name}'.strip() or obj.assigned_to.email
 
 
 ALLOWED_CONFIRMATION_REASONS = {
