@@ -19,6 +19,19 @@ def check_escalations_task():
 
 
 @shared_task
+def expire_stale_stays_task():
+    """Runs hourly. Deactivates GuestStay records whose expires_at has passed."""
+    from .models import GuestStay
+    now = timezone.now()
+    expired = GuestStay.objects.filter(
+        is_active=True,
+        expires_at__lte=now,
+    ).update(is_active=False)
+    if expired:
+        logger.info('Deactivated %d expired guest stays', expired)
+
+
+@shared_task
 def expire_stale_requests_task():
     """Runs hourly. Marks CREATED requests older than 72h as EXPIRED."""
     from .services import expire_stale_requests

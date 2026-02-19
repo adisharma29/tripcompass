@@ -238,12 +238,24 @@ class MyRequestsList(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = ServiceRequestListSerializer
 
+    def list(self, request, *args, **kwargs):
+        if request.user.user_type == 'GUEST' and not request.query_params.get('hotel'):
+            return Response(
+                {'detail': 'hotel query parameter is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().list(request, *args, **kwargs)
+
     def get_queryset(self):
-        return ServiceRequest.objects.filter(
+        qs = ServiceRequest.objects.filter(
             guest_stay__guest=self.request.user,
         ).select_related(
             'department', 'experience', 'guest_stay__guest',
         ).order_by('-created_at')
+        hotel_slug = self.request.query_params.get('hotel')
+        if hotel_slug:
+            qs = qs.filter(guest_stay__hotel__slug=hotel_slug)
+        return qs
 
 
 # ---------------------------------------------------------------------------

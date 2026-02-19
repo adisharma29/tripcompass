@@ -328,6 +328,13 @@ class GuestStay(models.Model):
             models.Index(fields=['hotel', 'room_number', 'created_at']),
             models.Index(fields=['guest', 'hotel']),
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['guest', 'hotel'],
+                condition=models.Q(is_active=True),
+                name='unique_active_stay_per_guest_hotel',
+            ),
+        ]
 
     def __str__(self):
         return f'Stay: {self.guest} @ {self.hotel.name} room {self.room_number}'

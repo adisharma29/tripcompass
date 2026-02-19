@@ -218,6 +218,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'concierge.tasks.check_escalations_task',
         'schedule': 5 * 60,  # every 5 minutes
     },
+    'expire-stale-stays': {
+        'task': 'concierge.tasks.expire_stale_stays_task',
+        'schedule': 60 * 60,  # every hour
+    },
     'expire-stale-requests': {
         'task': 'concierge.tasks.expire_stale_requests_task',
         'schedule': 60 * 60,  # every hour

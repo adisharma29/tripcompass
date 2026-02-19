@@ -85,6 +85,10 @@ def send_otp(phone, ip_address='', hotel=None):
     now = timezone.now()
     expires = now + timedelta(seconds=settings.OTP_EXPIRY_SECONDS)
 
+    # In DEBUG mode, log the code so developers can verify without real delivery
+    if settings.DEBUG:
+        logger.info('DEV OTP for %s: %s', phone, code)
+
     otp = OTPCode.objects.create(
         phone=phone,
         code_hash=_hash_code(code),
@@ -93,6 +97,10 @@ def send_otp(phone, ip_address='', hotel=None):
         ip_hash=_hash_ip(ip_address) if ip_address else '',
         expires_at=expires,
     )
+
+    # In DEBUG mode, skip delivery entirely — code was logged above
+    if settings.DEBUG:
+        return
 
     # Attempt WhatsApp delivery
     wa_success = _send_whatsapp_otp(otp, code)
@@ -319,13 +327,31 @@ def verify_otp(phone, code, hotel=None, qr_code_str=None):
         except QRCode.DoesNotExist:
             qr = None  # Silently ignore invalid QR
 
-    # Create guest stay
-    stay = GuestStay.objects.create(
-        guest=user,
-        hotel=hotel,
-        qr_code=qr,
-        expires_at=now + timedelta(hours=24),
-    )
+    # Reuse active stay for this hotel, or create a new one.
+    # Atomic + row lock prevents double-verify races.
+    new_expiry = now + timedelta(hours=24)
+    with transaction.atomic():
+        existing_stay = (
+            GuestStay.objects.select_for_update()
+            .filter(guest=user, hotel=hotel, is_active=True)
+            .order_by('-created_at')
+            .first()
+        )
+        if existing_stay:
+            existing_stay.expires_at = new_expiry
+            update_fields = ['expires_at']
+            if qr:
+                existing_stay.qr_code = qr
+                update_fields.append('qr_code')
+            existing_stay.save(update_fields=update_fields)
+            stay = existing_stay
+        else:
+            stay = GuestStay.objects.create(
+                guest=user,
+                hotel=hotel,
+                qr_code=qr,
+                expires_at=new_expiry,
+            )
 
     return user, stay
 
