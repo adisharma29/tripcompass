@@ -25,15 +25,15 @@ class HotelMembershipAdmin(admin.ModelAdmin):
 
 @admin.register(Department)
 class DepartmentAdmin(admin.ModelAdmin):
-    list_display = ['name', 'hotel', 'is_ops', 'is_active', 'display_order']
-    list_filter = ['hotel', 'is_ops', 'is_active']
+    list_display = ['name', 'hotel', 'is_ops', 'status', 'is_active', 'display_order']
+    list_filter = ['hotel', 'is_ops', 'status', 'is_active']
     search_fields = ['name']
 
 
 @admin.register(Experience)
 class ExperienceAdmin(admin.ModelAdmin):
-    list_display = ['name', 'department', 'category', 'is_active', 'display_order']
-    list_filter = ['category', 'is_active', 'department__hotel']
+    list_display = ['name', 'department', 'category', 'status', 'is_active', 'display_order']
+    list_filter = ['category', 'status', 'is_active', 'department__hotel']
     search_fields = ['name']
 
 

@@ -17,8 +17,8 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .models import (
-    Hotel, HotelMembership, Department, GuestStay, OTPCode,
-    ServiceRequest, RequestActivity, Notification,
+    ContentStatus, Hotel, HotelMembership, Department, Experience,
+    GuestStay, OTPCode, ServiceRequest, RequestActivity, Notification,
     PushSubscription, QRCode, EscalationHeartbeat,
 )
 
@@ -812,10 +812,23 @@ def get_dashboard_stats(hotel, department=None):
     conversion_rate = (confirmed / total * 100) if total > 0 else 0
 
     by_department = []
-    depts = Department.objects.filter(hotel=hotel, is_active=True)
+    depts = Department.objects.filter(hotel=hotel, status=ContentStatus.PUBLISHED)
     for dept in depts:
         count = today_qs.filter(department=dept).count()
         by_department.append({'name': dept.name, 'count': count})
+
+    setup = {
+        'settings_configured': hotel.settings_configured,
+        'has_departments': hotel.departments.exists(),
+        'has_experiences': Experience.objects.filter(department__hotel=hotel).exists(),
+        'has_photos': (
+            hotel.departments.exclude(photo='').exists()
+            or Experience.objects.filter(department__hotel=hotel).exclude(photo='').exists()
+        ),
+        'has_team': hotel.memberships.filter(is_active=True).count() > 1,
+        'has_qr_codes': hotel.qr_codes.exists(),
+        'has_published': hotel.departments.filter(status=ContentStatus.PUBLISHED).exists(),
+    }
 
     return {
         'total_requests': total,
@@ -824,6 +837,7 @@ def get_dashboard_stats(hotel, department=None):
         'confirmed': confirmed,
         'conversion_rate': round(conversion_rate, 1),
         'by_department': by_department,
+        'setup': setup,
     }
 
 

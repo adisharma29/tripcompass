@@ -5,8 +5,8 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from .models import (
-    Hotel, HotelMembership, Department, Experience, ExperienceImage,
-    GuestStay, ServiceRequest, RequestActivity,
+    ContentStatus, Hotel, HotelMembership, Department, Experience,
+    ExperienceImage, GuestStay, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode,
 )
 
@@ -61,7 +61,16 @@ class HotelPublicSerializer(serializers.ModelSerializer):
         model = Hotel
         fields = [
             'id', 'name', 'slug', 'description', 'tagline',
-            'logo', 'cover_image', 'timezone', 'departments',
+            'logo', 'cover_image', 'timezone',
+            # Brand
+            'primary_color', 'secondary_color', 'accent_color',
+            'heading_font', 'body_font', 'favicon', 'og_image',
+            # Social
+            'instagram_url', 'facebook_url', 'twitter_url', 'whatsapp_number',
+            # Footer & Legal
+            'footer_text', 'terms_url', 'privacy_url',
+            # Relations
+            'departments',
         ]
 
 
@@ -70,6 +79,10 @@ class HotelPublicSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 
 class HotelSettingsSerializer(serializers.ModelSerializer):
+    # Write-only flags to clear image fields via multipart or JSON
+    favicon_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    og_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+
     class Meta:
         model = Hotel
         fields = [
@@ -77,8 +90,29 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'room_number_min', 'room_number_max',
             'escalation_enabled', 'escalation_fallback_channel',
             'oncall_email', 'oncall_phone', 'require_frontdesk_kiosk',
-            'escalation_tier_minutes',
+            'escalation_tier_minutes', 'settings_configured',
+            # Brand
+            'primary_color', 'secondary_color', 'accent_color',
+            'heading_font', 'body_font', 'favicon', 'og_image',
+            'favicon_clear', 'og_image_clear',
+            # Social
+            'instagram_url', 'facebook_url', 'twitter_url', 'whatsapp_number',
+            # Footer & Legal
+            'footer_text', 'terms_url', 'privacy_url',
         ]
+        read_only_fields = ['settings_configured']
+
+    def update(self, instance, validated_data):
+        if not instance.settings_configured:
+            validated_data['settings_configured'] = True
+        # Handle image field clearing
+        for field in ('favicon', 'og_image'):
+            if validated_data.pop(f'{field}_clear', False):
+                file_field = getattr(instance, field)
+                if file_field:
+                    file_field.delete(save=False)
+                setattr(instance, field, '')
+        return super().update(instance, validated_data)
 
     def validate(self, data):
         escalation_enabled = data.get(
@@ -119,14 +153,33 @@ class DepartmentSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'slug', 'description', 'photo', 'icon',
             'display_order', 'schedule', 'is_ops', 'is_active',
+            'status', 'published_at',
             'experiences', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'slug', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at']
 
     def validate_description(self, value):
         if value:
             return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
         return value
+
+    def validate_status(self, value):
+        instance = self.instance
+        if instance and instance.status != ContentStatus.PUBLISHED and value == ContentStatus.PUBLISHED:
+            # First publish — published_at will be set in update/create
+            pass
+        return value
+
+    def update(self, instance, validated_data):
+        new_status = validated_data.get('status')
+        if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        return super().update(instance, validated_data)
+
+    def create(self, validated_data):
+        if validated_data.get('status') == ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        return super().create(validated_data)
 
 
 class ExperienceSerializer(serializers.ModelSerializer):
@@ -142,9 +195,10 @@ class ExperienceSerializer(serializers.ModelSerializer):
             'photo', 'cover_image', 'price', 'price_display',
             'category', 'timing', 'duration', 'capacity',
             'highlights', 'is_active', 'display_order',
+            'status', 'published_at',
             'gallery_images', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'slug', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at']
 
     def validate_department(self, value):
         hotel = self.context.get('hotel')
@@ -158,6 +212,17 @@ class ExperienceSerializer(serializers.ModelSerializer):
         if value:
             return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
         return value
+
+    def update(self, instance, validated_data):
+        new_status = validated_data.get('status')
+        if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        return super().update(instance, validated_data)
+
+    def create(self, validated_data):
+        if validated_data.get('status') == ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        return super().create(validated_data)
 
 
 class HotelMinimalSerializer(serializers.ModelSerializer):
@@ -480,6 +545,16 @@ class PushSubscriptionSerializer(serializers.ModelSerializer):
 # Dashboard stats
 # ---------------------------------------------------------------------------
 
+class SetupFlagsSerializer(serializers.Serializer):
+    settings_configured = serializers.BooleanField()
+    has_departments = serializers.BooleanField()
+    has_experiences = serializers.BooleanField()
+    has_photos = serializers.BooleanField()
+    has_team = serializers.BooleanField()
+    has_qr_codes = serializers.BooleanField()
+    has_published = serializers.BooleanField()
+
+
 class DashboardStatsSerializer(serializers.Serializer):
     total_requests = serializers.IntegerField()
     pending = serializers.IntegerField()
@@ -487,3 +562,4 @@ class DashboardStatsSerializer(serializers.Serializer):
     confirmed = serializers.IntegerField()
     conversion_rate = serializers.FloatField()
     by_department = serializers.ListField()
+    setup = SetupFlagsSerializer()

@@ -3,8 +3,20 @@ import uuid
 
 from django.conf import settings
 from django.contrib.gis.db import models as gis_models
+from django.core.validators import RegexValidator
 from django.db import models
 from django.utils.text import slugify
+
+hex_color_validator = RegexValidator(
+    regex=r'^#[0-9a-fA-F]{6}$',
+    message='Enter a valid hex color (e.g. #1a1a1a)',
+)
+
+
+class ContentStatus(models.TextChoices):
+    DRAFT = 'DRAFT', 'Draft'
+    PUBLISHED = 'PUBLISHED', 'Published'
+    UNPUBLISHED = 'UNPUBLISHED', 'Unpublished'
 
 
 class Hotel(models.Model):
@@ -55,10 +67,56 @@ class Hotel(models.Model):
     oncall_email = models.EmailField(blank=True)
     oncall_phone = models.CharField(max_length=20, blank=True)
     require_frontdesk_kiosk = models.BooleanField(default=True)
+    settings_configured = models.BooleanField(
+        default=False,
+        help_text='Set to True when admin first saves hotel settings',
+    )
     escalation_tier_minutes = models.JSONField(
         null=True, blank=True,
         help_text='Per-hotel override, e.g. [15, 30, 60]. Falls back to settings default.',
     )
+
+    # --- Brand Colors ---
+    primary_color = models.CharField(
+        max_length=7, default='#1a1a1a', validators=[hex_color_validator],
+        help_text='Primary brand color (hex)',
+    )
+    secondary_color = models.CharField(
+        max_length=7, default='#f5f5f4', validators=[hex_color_validator],
+        help_text='Secondary brand color (hex)',
+    )
+    accent_color = models.CharField(
+        max_length=7, default='#b45309', validators=[hex_color_validator],
+        help_text='Accent/CTA color (hex)',
+    )
+
+    # --- Typography ---
+    heading_font = models.CharField(
+        max_length=100, blank=True, default='',
+        help_text='Google Font name for headings',
+    )
+    body_font = models.CharField(
+        max_length=100, blank=True, default='',
+        help_text='Google Font name for body text',
+    )
+
+    # --- Favicon & OG ---
+    favicon = models.ImageField(upload_to='hotel_favicons/', blank=True)
+    og_image = models.ImageField(upload_to='hotel_og/', blank=True)
+
+    # --- Social Links ---
+    instagram_url = models.URLField(blank=True, default='')
+    facebook_url = models.URLField(blank=True, default='')
+    twitter_url = models.URLField(blank=True, default='')
+    whatsapp_number = models.CharField(
+        max_length=20, blank=True, default='',
+        help_text='With country code, e.g. +919876543210',
+    )
+
+    # --- Legal & Footer ---
+    footer_text = models.CharField(max_length=500, blank=True, default='')
+    terms_url = models.URLField(blank=True, default='')
+    privacy_url = models.URLField(blank=True, default='')
 
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -135,11 +193,19 @@ class Department(models.Model):
         default=False,
         help_text='Ops departments never pause escalation',
     )
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True)  # deprecated — transitional, computed from status
+    status = models.CharField(
+        max_length=12,
+        choices=ContentStatus.choices,
+        default=ContentStatus.DRAFT,
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def save(self, *args, **kwargs):
+        # Keep is_active in sync with status (dual-write)
+        self.is_active = self.status == ContentStatus.PUBLISHED
         if not self.slug:
             base = slugify(self.name) or 'department'
             slug = base[:100]
@@ -190,12 +256,20 @@ class Experience(models.Model):
     duration = models.CharField(max_length=100, blank=True)
     capacity = models.CharField(max_length=100, blank=True)
     highlights = models.JSONField(default=list)
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True)  # deprecated — transitional, computed from status
+    status = models.CharField(
+        max_length=12,
+        choices=ContentStatus.choices,
+        default=ContentStatus.DRAFT,
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
     display_order = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def save(self, *args, **kwargs):
+        # Keep is_active in sync with status (dual-write)
+        self.is_active = self.status == ContentStatus.PUBLISHED
         if not self.slug:
             base = slugify(self.name) or 'experience'
             slug = base[:100]

@@ -5,7 +5,7 @@ import logging
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Count, Max
+from django.db.models import Count, Max, Prefetch
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -18,8 +18,8 @@ from rest_framework.views import APIView
 from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
-    Department, Experience, ExperienceImage, GuestStay, Hotel,
-    HotelMembership, Notification, PushSubscription, QRCode,
+    ContentStatus, Department, Experience, ExperienceImage, GuestStay,
+    Hotel, HotelMembership, Notification, PushSubscription, QRCode,
     ServiceRequest, RequestActivity,
 )
 from .permissions import (
@@ -61,6 +61,14 @@ class HotelPublicDetail(generics.RetrieveAPIView):
     lookup_field = 'slug'
     lookup_url_kwarg = 'hotel_slug'
     queryset = Hotel.objects.filter(is_active=True).prefetch_related(
+        Prefetch(
+            'departments',
+            queryset=Department.objects.filter(status=ContentStatus.PUBLISHED),
+        ),
+        Prefetch(
+            'departments__experiences',
+            queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
+        ),
         'departments__experiences__gallery_images',
     )
 
@@ -73,8 +81,14 @@ class DepartmentPublicList(generics.ListAPIView):
         return Department.objects.filter(
             hotel__slug=self.kwargs['hotel_slug'],
             hotel__is_active=True,
-            is_active=True,
-        ).prefetch_related('experiences__gallery_images')
+            status=ContentStatus.PUBLISHED,
+        ).prefetch_related(
+            Prefetch(
+                'experiences',
+                queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
+            ),
+            'experiences__gallery_images',
+        )
 
 
 class DepartmentPublicDetail(generics.RetrieveAPIView):
@@ -87,8 +101,14 @@ class DepartmentPublicDetail(generics.RetrieveAPIView):
         return Department.objects.filter(
             hotel__slug=self.kwargs['hotel_slug'],
             hotel__is_active=True,
-            is_active=True,
-        ).prefetch_related('experiences__gallery_images')
+            status=ContentStatus.PUBLISHED,
+        ).prefetch_related(
+            Prefetch(
+                'experiences',
+                queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
+            ),
+            'experiences__gallery_images',
+        )
 
 
 class ExperiencePublicDetail(generics.RetrieveAPIView):
@@ -101,7 +121,7 @@ class ExperiencePublicDetail(generics.RetrieveAPIView):
         return Experience.objects.filter(
             department__hotel__slug=self.kwargs['hotel_slug'],
             department__hotel__is_active=True,
-            is_active=True,
+            status=ContentStatus.PUBLISHED,
         ).prefetch_related('gallery_images')
 
 
