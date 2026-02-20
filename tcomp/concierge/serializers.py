@@ -1,6 +1,7 @@
 import re
 
 import bleach
+from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -9,11 +10,26 @@ from .models import (
     ExperienceImage, GuestStay, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode,
 )
+from .validators import validate_image_upload
 
 ALLOWED_HTML_TAGS = [
     'p', 'br', 'strong', 'em', 's', 'h2', 'h3',
     'ul', 'ol', 'li', 'blockquote', 'hr',
 ]
+
+
+def _clean_image(file):
+    """Validate size/type via magic bytes and return sanitized (EXIF-stripped, resized) file."""
+    if not file:
+        return file
+    buf, fmt = validate_image_upload(file)
+    ext = 'png' if fmt == 'png' else 'jpg'
+    name = getattr(file, 'name', 'upload')
+    clean_name = f'{name.rsplit(".", 1)[0]}.{ext}'
+    return InMemoryUploadedFile(
+        buf, 'image', clean_name,
+        f'image/{fmt}', buf.getbuffer().nbytes, None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +41,9 @@ class ExperienceImageSerializer(serializers.ModelSerializer):
         model = ExperienceImage
         fields = ['id', 'image', 'alt_text', 'display_order', 'created_at']
         read_only_fields = ['id', 'created_at']
+
+    def validate_image(self, value):
+        return _clean_image(value)
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +121,12 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['settings_configured']
 
+    def validate_favicon(self, value):
+        return _clean_image(value)
+
+    def validate_og_image(self, value):
+        return _clean_image(value)
+
     def update(self, instance, validated_data):
         if not instance.settings_configured:
             validated_data['settings_configured'] = True
@@ -174,6 +199,12 @@ class DepartmentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at']
 
+    def validate_photo(self, value):
+        return _clean_image(value)
+
+    def validate_icon(self, value):
+        return _clean_image(value)
+
     def validate_description(self, value):
         if value:
             return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
@@ -228,6 +259,12 @@ class ExperienceSerializer(serializers.ModelSerializer):
                 'Department does not belong to this hotel.'
             )
         return value
+
+    def validate_photo(self, value):
+        return _clean_image(value)
+
+    def validate_cover_image(self, value):
+        return _clean_image(value)
 
     def validate_description(self, value):
         if value:

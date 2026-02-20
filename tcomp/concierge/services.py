@@ -13,7 +13,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from .models import (
@@ -253,6 +253,10 @@ def verify_otp(phone, code, hotel=None, qr_code_str=None):
     User = get_user_model()
     now = timezone.now()
 
+    # --- Wrong-code handling: increment attempts in its own atomic block
+    # so the counter persists even when we raise ValidationError after.
+    otp_error = None
+
     with transaction.atomic():
         # Scope OTP lookup by hotel context:
         # - Guest flow (hotel provided): only match OTPs issued for this exact hotel.
@@ -272,11 +276,25 @@ def verify_otp(phone, code, hotel=None, qr_code_str=None):
             raise ValidationError('Invalid or expired OTP.')
 
         if _hash_code(code) != otp.code_hash:
-            otp.attempts += 1
-            otp.save(update_fields=['attempts'])
-            if otp.attempts >= settings.OTP_MAX_ATTEMPTS:
-                raise ValidationError('Too many attempts. Please request a new code.')
-            raise ValidationError('Invalid code.')
+            # Persist the increment — commit happens when this block exits normally.
+            OTPCode.objects.filter(pk=otp.pk).update(attempts=F('attempts') + 1)
+            new_attempts = OTPCode.objects.filter(pk=otp.pk).values_list('attempts', flat=True).first()
+            if new_attempts >= settings.OTP_MAX_ATTEMPTS:
+                otp_error = 'Too many attempts. Please request a new code.'
+            else:
+                otp_error = 'Invalid code.'
+
+    # Raise outside the atomic block so the attempts increment is committed.
+    if otp_error:
+        raise ValidationError(otp_error)
+
+    with transaction.atomic():
+        # Re-fetch under lock for the success path (code was correct above).
+        otp = OTPCode.objects.select_for_update().filter(
+            pk=otp.pk, is_used=False,
+        ).first()
+        if not otp:
+            raise ValidationError('Invalid or expired OTP.')
 
         # Check if phone belongs to existing staff user
         try:
