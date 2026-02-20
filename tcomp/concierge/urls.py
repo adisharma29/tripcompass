@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import analytics_views, views
 
 urlpatterns = [
     # --- Public ---
@@ -47,6 +47,22 @@ urlpatterns = [
     # The requests list for staff uses a separate URL since create is POST.
     path('hotels/<slug:hotel_slug>/requests/list/',
          views.ServiceRequestList.as_view(), name='request-list'),
+
+    # --- Analytics ---
+    path('hotels/<slug:hotel_slug>/analytics/overview/',
+         analytics_views.AnalyticsOverview.as_view(), name='analytics-overview'),
+    path('hotels/<slug:hotel_slug>/analytics/requests-over-time/',
+         analytics_views.AnalyticsRequestsOverTime.as_view(), name='analytics-requests-over-time'),
+    path('hotels/<slug:hotel_slug>/analytics/departments/',
+         analytics_views.AnalyticsDepartments.as_view(), name='analytics-departments'),
+    path('hotels/<slug:hotel_slug>/analytics/experiences/',
+         analytics_views.AnalyticsExperiences.as_view(), name='analytics-experiences'),
+    path('hotels/<slug:hotel_slug>/analytics/response-times/',
+         analytics_views.AnalyticsResponseTimes.as_view(), name='analytics-response-times'),
+    path('hotels/<slug:hotel_slug>/analytics/heatmap/',
+         analytics_views.AnalyticsHeatmap.as_view(), name='analytics-heatmap'),
+    path('hotels/<slug:hotel_slug>/analytics/qr-placements/',
+         analytics_views.AnalyticsQRPlacements.as_view(), name='analytics-qr-placements'),
 
     # --- Admin ---
     path('hotels/<slug:hotel_slug>/admin/departments/',
