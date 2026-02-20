@@ -489,11 +489,12 @@ class ServiceRequestDetailSerializer(ServiceRequestListSerializer):
     activities = RequestActivitySerializer(many=True, read_only=True)
     assigned_to_name = serializers.SerializerMethodField()
     assigned_to_id = serializers.IntegerField(source='assigned_to.id', read_only=True, default=None)
+    guest_stay_id = serializers.IntegerField(source='guest_stay.id', read_only=True)
 
     class Meta(ServiceRequestListSerializer.Meta):
         fields = ServiceRequestListSerializer.Meta.fields + [
             'staff_notes', 'confirmation_reason', 'activities',
-            'assigned_to_name', 'assigned_to_id',
+            'assigned_to_name', 'assigned_to_id', 'guest_stay_id',
         ]
 
     def get_assigned_to_name(self, obj):

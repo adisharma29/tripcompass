@@ -98,8 +98,8 @@ def send_otp(phone, ip_address='', hotel=None):
         expires_at=expires,
     )
 
-    # In DEBUG mode, skip delivery entirely — code was logged above
-    if settings.DEBUG:
+    # In DEBUG mode, skip delivery unless WhatsApp key is configured (sandbox)
+    if settings.DEBUG and not settings.GUPSHUP_WA_API_KEY:
         return
 
     # Attempt WhatsApp delivery
@@ -142,7 +142,7 @@ def _send_whatsapp_otp(otp, code):
             'src.name': settings.GUPSHUP_WA_APP_NAME,
             'template': json.dumps({
                 'id': settings.GUPSHUP_WA_OTP_TEMPLATE_ID,
-                'params': [code],
+                'params': [code, code],
             }),
         }
         resp = http_requests.post(
@@ -151,7 +151,7 @@ def _send_whatsapp_otp(otp, code):
             headers={'apikey': api_key},
             timeout=10,
         )
-        if resp.status_code == 200:
+        if resp.status_code in (200, 202):
             data = resp.json()
             if data.get('status') == 'submitted':
                 otp.gupshup_message_id = data.get('messageId', '')
