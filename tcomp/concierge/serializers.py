@@ -210,6 +210,70 @@ class DepartmentSerializer(serializers.ModelSerializer):
             return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
         return value
 
+    _VALID_DAY_KEYS = frozenset([
+        'monday', 'tuesday', 'wednesday', 'thursday',
+        'friday', 'saturday', 'sunday',
+    ])
+    _LEGACY_DAY_MAP = {
+        'mon': 'monday', 'tue': 'tuesday', 'wed': 'wednesday',
+        'thu': 'thursday', 'fri': 'friday', 'sat': 'saturday', 'sun': 'sunday',
+    }
+    _TIME_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
+
+    def validate_schedule(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Schedule must be a JSON object.')
+        # timezone
+        tz = value.get('timezone')
+        if tz and not isinstance(tz, str):
+            raise serializers.ValidationError('timezone must be a string.')
+        # default slots
+        default = value.get('default')
+        if default is not None:
+            self._validate_slots(default, 'default')
+        # overrides — normalize legacy abbreviated keys (MON → monday, etc.)
+        overrides = value.get('overrides')
+        if overrides is not None:
+            if not isinstance(overrides, dict):
+                raise serializers.ValidationError('overrides must be a JSON object.')
+            normalized = {}
+            for key, slots in overrides.items():
+                canonical = self._LEGACY_DAY_MAP.get(key.lower(), key.lower())
+                if canonical not in self._VALID_DAY_KEYS:
+                    raise serializers.ValidationError(
+                        f'Invalid override key "{key}". Must be a day name '
+                        f'(e.g. "monday").'
+                    )
+                if canonical in normalized:
+                    raise serializers.ValidationError(
+                        f'Duplicate override for "{canonical}" '
+                        f'(check for both abbreviated and full day names).'
+                    )
+                self._validate_slots(slots, f'overrides.{canonical}')
+                normalized[canonical] = slots
+            value['overrides'] = normalized
+        # Reject unknown top-level keys
+        allowed = {'timezone', 'default', 'overrides'}
+        extra = set(value.keys()) - allowed
+        if extra:
+            raise serializers.ValidationError(
+                f'Unknown schedule keys: {", ".join(sorted(extra))}. '
+                f'Allowed: timezone, default, overrides.'
+            )
+        return value
+
+    def _validate_slots(self, slots, field_name):
+        if not isinstance(slots, list):
+            raise serializers.ValidationError(f'{field_name} must be an array of [open, close] pairs.')
+        for i, slot in enumerate(slots):
+            if not isinstance(slot, (list, tuple)) or len(slot) != 2:
+                raise serializers.ValidationError(f'{field_name}[{i}] must be a [open, close] pair.')
+            for t in slot:
+                if not isinstance(t, str) or not self._TIME_RE.match(t):
+                    raise serializers.ValidationError(
+                        f'{field_name}[{i}] contains invalid time "{t}". Use HH:MM format.'
+                    )
+
     def validate_status(self, value):
         instance = self.instance
         if instance and instance.status != ContentStatus.PUBLISHED and value == ContentStatus.PUBLISHED:

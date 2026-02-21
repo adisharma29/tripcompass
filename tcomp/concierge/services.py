@@ -513,6 +513,14 @@ def _is_in_windows(time_str, windows):
     return False
 
 
+def _get_windows(schedule, day_name):
+    """Get schedule windows for a day, checking overrides first then default."""
+    overrides = schedule.get('overrides', {})
+    if day_name in overrides:
+        return overrides[day_name]
+    return schedule.get('default', [['00:00', '23:59']])
+
+
 def is_department_after_hours(department):
     """Check if the department is currently outside its scheduled hours.
 
@@ -534,14 +542,14 @@ def is_department_after_hours(department):
     time_str = now_local.strftime('%H:%M')
 
     # Check today's windows
-    today_windows = schedule.get(today_name, schedule.get('default', [['00:00', '23:59']]))
+    today_windows = _get_windows(schedule, today_name)
     if _is_in_windows(time_str, today_windows):
         return False
 
     # Check yesterday's overnight windows that extend past midnight
     yesterday_local = now_local - td(days=1)
     yesterday_name = yesterday_local.strftime('%A').lower()
-    yesterday_windows = schedule.get(yesterday_name, schedule.get('default', [['00:00', '23:59']]))
+    yesterday_windows = _get_windows(schedule, yesterday_name)
     for window in yesterday_windows:
         if len(window) == 2 and window[0] > window[1]:
             # Overnight window — check if current time is in the "after midnight" portion
