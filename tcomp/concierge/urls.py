@@ -1,0 +1,129 @@
+from django.urls import path
+
+from . import analytics_views, views
+
+urlpatterns = [
+    # --- Public ---
+    path('hotels/<slug:hotel_slug>/',
+         views.HotelPublicDetail.as_view(), name='hotel-public-detail'),
+    path('hotels/<slug:hotel_slug>/departments/',
+         views.DepartmentPublicList.as_view(), name='department-public-list'),
+    path('hotels/<slug:hotel_slug>/departments/<slug:dept_slug>/',
+         views.DepartmentPublicDetail.as_view(), name='department-public-detail'),
+    path('hotels/<slug:hotel_slug>/departments/<slug:dept_slug>/experiences/<slug:exp_slug>/',
+         views.ExperiencePublicDetail.as_view(), name='experience-public-detail'),
+
+    # --- Guest ---
+    path('hotels/<slug:hotel_slug>/requests/',
+         views.ServiceRequestCreate.as_view(), name='request-create'),
+    path('hotels/<slug:hotel_slug>/stays/<int:stay_id>/',
+         views.GuestStayUpdate.as_view(), name='guest-stay-update'),
+    path('me/stays/',
+         views.MyStaysList.as_view(), name='my-stays-list'),
+    path('me/requests/',
+         views.MyRequestsList.as_view(), name='my-requests-list'),
+
+    # --- Staff ---
+    path('hotels/<slug:hotel_slug>/requests/stream/',
+         views.RequestSSEStream.as_view(), name='request-sse-stream'),
+    path('hotels/<slug:hotel_slug>/requests/public/<uuid:public_id>/',
+         views.ServiceRequestDetailByPublicId.as_view(), name='request-detail-by-public-id'),
+    path('hotels/<slug:hotel_slug>/requests/<int:pk>/',
+         views.ServiceRequestDetail.as_view(), name='request-detail'),
+    path('hotels/<slug:hotel_slug>/requests/<int:pk>/acknowledge/',
+         views.ServiceRequestAcknowledge.as_view(), name='request-acknowledge'),
+    path('hotels/<slug:hotel_slug>/requests/<int:pk>/take-ownership/',
+         views.ServiceRequestTakeOwnership.as_view(), name='request-take-ownership'),
+    path('hotels/<slug:hotel_slug>/requests/<int:pk>/notes/',
+         views.RequestNoteCreate.as_view(), name='request-note-create'),
+    path('hotels/<slug:hotel_slug>/stays/<int:stay_id>/revoke/',
+         views.GuestStayRevoke.as_view(), name='guest-stay-revoke'),
+    path('hotels/<slug:hotel_slug>/dashboard/',
+         views.DashboardStats.as_view(), name='dashboard-stats'),
+
+    # Staff list (GET) + Guest create (POST) share the same URL path
+    # but use different views/permissions. We handle this with a combined
+    # URL that dispatches based on the registered view.
+    # The requests list for staff uses a separate URL since create is POST.
+    path('hotels/<slug:hotel_slug>/requests/list/',
+         views.ServiceRequestList.as_view(), name='request-list'),
+
+    # --- Analytics ---
+    path('hotels/<slug:hotel_slug>/analytics/overview/',
+         analytics_views.AnalyticsOverview.as_view(), name='analytics-overview'),
+    path('hotels/<slug:hotel_slug>/analytics/requests-over-time/',
+         analytics_views.AnalyticsRequestsOverTime.as_view(), name='analytics-requests-over-time'),
+    path('hotels/<slug:hotel_slug>/analytics/departments/',
+         analytics_views.AnalyticsDepartments.as_view(), name='analytics-departments'),
+    path('hotels/<slug:hotel_slug>/analytics/experiences/',
+         analytics_views.AnalyticsExperiences.as_view(), name='analytics-experiences'),
+    path('hotels/<slug:hotel_slug>/analytics/response-times/',
+         analytics_views.AnalyticsResponseTimes.as_view(), name='analytics-response-times'),
+    path('hotels/<slug:hotel_slug>/analytics/heatmap/',
+         analytics_views.AnalyticsHeatmap.as_view(), name='analytics-heatmap'),
+    path('hotels/<slug:hotel_slug>/analytics/qr-placements/',
+         analytics_views.AnalyticsQRPlacements.as_view(), name='analytics-qr-placements'),
+
+    # --- Admin ---
+    path('hotels/<slug:hotel_slug>/admin/departments/',
+         views.DepartmentViewSet.as_view({'get': 'list', 'post': 'create'}),
+         name='admin-department-list'),
+    path('hotels/<slug:hotel_slug>/admin/departments/reorder/',
+         views.DepartmentBulkReorder.as_view(),
+         name='admin-department-reorder'),
+    path('hotels/<slug:hotel_slug>/admin/departments/<slug:dept_slug>/',
+         views.DepartmentViewSet.as_view({'get': 'retrieve', 'put': 'update', 'patch': 'partial_update', 'delete': 'destroy'}),
+         name='admin-department-detail'),
+    path('hotels/<slug:hotel_slug>/admin/departments/<slug:dept_slug>/experiences/',
+         views.ExperienceViewSet.as_view({'get': 'list', 'post': 'create'}),
+         name='admin-experience-list'),
+    path('hotels/<slug:hotel_slug>/admin/departments/<slug:dept_slug>/experiences/reorder/',
+         views.ExperienceBulkReorder.as_view(),
+         name='admin-experience-reorder'),
+    path('hotels/<slug:hotel_slug>/admin/departments/<slug:dept_slug>/experiences/<int:pk>/',
+         views.ExperienceViewSet.as_view({'get': 'retrieve', 'put': 'update', 'patch': 'partial_update', 'delete': 'destroy'}),
+         name='admin-experience-detail'),
+    path('hotels/<slug:hotel_slug>/admin/departments/<slug:dept_slug>/experiences/<int:exp_id>/images/',
+         views.ExperienceImageUpload.as_view(),
+         name='admin-experience-image-upload'),
+    path('hotels/<slug:hotel_slug>/admin/departments/<slug:dept_slug>/experiences/<int:exp_id>/images/reorder/',
+         views.ExperienceImageReorder.as_view(),
+         name='admin-experience-image-reorder'),
+    path('hotels/<slug:hotel_slug>/admin/departments/<slug:dept_slug>/experience-images/<int:pk>/',
+         views.ExperienceImageDelete.as_view(),
+         name='admin-experience-image-delete'),
+    path('hotels/<slug:hotel_slug>/admin/qr-codes/',
+         views.QRCodeViewSet.as_view({'get': 'list', 'post': 'create'}),
+         name='admin-qr-list'),
+    path('hotels/<slug:hotel_slug>/admin/qr-codes/<int:pk>/',
+         views.QRCodeViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'delete': 'destroy'}),
+         name='admin-qr-detail'),
+
+    # --- SuperAdmin ---
+    path('hotels/<slug:hotel_slug>/admin/members/',
+         views.MemberList.as_view(), name='admin-member-list'),
+    path('hotels/<slug:hotel_slug>/admin/members/<int:pk>/',
+         views.MemberDetail.as_view(), name='admin-member-detail'),
+    path('hotels/<slug:hotel_slug>/admin/settings/',
+         views.HotelSettingsUpdate.as_view(), name='admin-hotel-settings'),
+
+    # --- User-scoped ---
+    path('me/hotels/',
+         views.MyHotelsList.as_view(), name='my-hotels-list'),
+    path('me/notifications/',
+         views.NotificationList.as_view(), name='notification-list'),
+    path('me/notifications/mark-read/',
+         views.NotificationMarkRead.as_view(), name='notification-mark-read'),
+    path('me/push-subscriptions/',
+         views.PushSubscriptionCreate.as_view(), name='push-subscription-create'),
+    path('me/push-subscriptions/all/',
+         views.PushSubscriptionBulkDelete.as_view(), name='push-subscription-bulk-delete'),
+    path('me/push-subscriptions/<int:pk>/',
+         views.PushSubscriptionDelete.as_view(), name='push-subscription-delete'),
+    path('me/requests/<uuid:public_id>/',
+         views.MyRequestDetail.as_view(), name='my-request-detail'),
+
+    # --- Webhook ---
+    path('webhooks/gupshup-wa/',
+         views.GupshupWAWebhookView.as_view(), name='gupshup-wa-webhook'),
+]
