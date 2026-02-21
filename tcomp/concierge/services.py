@@ -513,6 +513,14 @@ def _is_in_windows(time_str, windows):
     return False
 
 
+def _get_windows(schedule, day_name):
+    """Get schedule windows for a day, checking overrides first then default."""
+    overrides = schedule.get('overrides', {})
+    if day_name in overrides:
+        return overrides[day_name]
+    return schedule.get('default', [['00:00', '23:59']])
+
+
 def is_department_after_hours(department):
     """Check if the department is currently outside its scheduled hours.
 
@@ -534,14 +542,14 @@ def is_department_after_hours(department):
     time_str = now_local.strftime('%H:%M')
 
     # Check today's windows
-    today_windows = schedule.get(today_name, schedule.get('default', [['00:00', '23:59']]))
+    today_windows = _get_windows(schedule, today_name)
     if _is_in_windows(time_str, today_windows):
         return False
 
     # Check yesterday's overnight windows that extend past midnight
     yesterday_local = now_local - td(days=1)
     yesterday_name = yesterday_local.strftime('%A').lower()
-    yesterday_windows = schedule.get(yesterday_name, schedule.get('default', [['00:00', '23:59']]))
+    yesterday_windows = _get_windows(schedule, yesterday_name)
     for window in yesterday_windows:
         if len(window) == 2 and window[0] > window[1]:
             # Overnight window — check if current time is in the "after midnight" portion
@@ -780,6 +788,8 @@ def publish_request_event(hotel, event_type, request_obj):
         'status': request_obj.status,
         'department_id': request_obj.department_id,
         'updated_at': request_obj.updated_at.isoformat(),
+        'event_id': request_obj.event_id,
+        'event_name': request_obj.event.name if request_obj.event_id else None,
     })
     try:
         r = get_sse_redis()
@@ -791,8 +801,14 @@ def publish_request_event(hotel, event_type, request_obj):
 async def stream_request_events(hotel, user):
     """Async SSE generator. Subscribes to Redis pub/sub, yields events.
 
-    Uses async Redis (redis.asyncio) for non-blocking pub/sub and
-    sync_to_async for ORM access to avoid SynchronousOnlyOperation.
+    Uses pubsub.get_message(timeout=N) which blocks on the Redis socket for
+    up to N seconds per call — not busy polling. Returns None on timeout,
+    giving us a natural heartbeat injection point without cancelling any
+    coroutine (unlike asyncio.wait_for which destroys the iterator).
+
+    Django 5.x cancels streaming coroutines on disconnect/shutdown via
+    asyncio.CancelledError, which propagates out of get_message and through
+    the generator's finally block for cleanup.
     """
     import asyncio
 
@@ -815,23 +831,34 @@ async def stream_request_events(hotel, user):
     channel = f'hotel:{hotel.id}:requests'
     await pubsub.subscribe(channel)
 
+    heartbeat_interval = getattr(settings, 'SSE_HEARTBEAT_SECONDS', 15)
+
     try:
         while True:
+            # Blocks on the Redis socket for up to heartbeat_interval seconds.
+            # Returns None on timeout, a dict on message.
             message = await pubsub.get_message(
-                ignore_subscribe_messages=True, timeout=settings.SSE_HEARTBEAT_SECONDS,
+                ignore_subscribe_messages=True, timeout=heartbeat_interval,
             )
-            if message and message['type'] == 'message':
-                data = json.loads(message['data'])
 
-                # Filter by department for STAFF users
-                if staff_department_id is not None:
-                    if data.get('department_id') != staff_department_id:
-                        continue
+            if message is None:
+                # No message within heartbeat window — send keepalive
+                yield ': heartbeat\n\n'
+                continue
 
-                yield f'event: {data["event"]}\ndata: {json.dumps(data)}\n\n'
-            else:
-                # Heartbeat (sent when get_message times out with no data)
-                yield f': heartbeat\n\n'
+            if message['type'] != 'message':
+                continue
+
+            data = json.loads(message['data'])
+
+            # Filter by department for STAFF users
+            if staff_department_id is not None:
+                if data.get('department_id') != staff_department_id:
+                    continue
+
+            yield f'event: {data["event"]}\ndata: {json.dumps(data)}\n\n'
+    except asyncio.CancelledError:
+        raise
     finally:
         await pubsub.unsubscribe(channel)
         await pubsub.aclose()

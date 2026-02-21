@@ -242,6 +242,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'concierge.tasks.daily_digest_task',
         'schedule': 24 * 60 * 60,  # daily
     },
+    'expire-events': {
+        'task': 'concierge.tasks.expire_events_task',
+        'schedule': 60 * 60,  # every hour
+    },
 }
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_REJECT_ON_WORKER_LOST = True

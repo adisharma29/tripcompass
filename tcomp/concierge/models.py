@@ -1,10 +1,14 @@
 import secrets
 import uuid
+import zoneinfo
+from datetime import date, timedelta
 
 from django.conf import settings
 from django.contrib.gis.db import models as gis_models
+from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
+from django.utils import timezone
 from django.utils.text import slugify
 
 hex_color_validator = RegexValidator(
@@ -306,6 +310,262 @@ class ExperienceImage(models.Model):
         return f'Image {self.id} for {self.experience.name}'
 
 
+class Event(models.Model):
+    """Hotel-scoped event with optional experience link, scheduling, and recurrence."""
+
+    VALID_DAYS = {'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'}
+    DAY_MAP = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+
+    hotel = models.ForeignKey(Hotel, on_delete=models.CASCADE, related_name='events')
+    experience = models.ForeignKey(
+        Experience, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='events',
+    )
+    department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='events',
+        help_text='For request routing. Null = hotel-wide (falls back to hotel.fallback_department)',
+    )
+
+    # Display fields
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=220)
+    description = models.TextField(blank=True)
+    photo = models.ImageField(upload_to='event_photos/', blank=True)
+    cover_image = models.ImageField(upload_to='event_covers/', blank=True)
+    price_display = models.CharField(max_length=100, blank=True)
+    highlights = models.JSONField(default=list, blank=True)
+    category = models.CharField(
+        max_length=20, choices=Experience.Category.choices, default='OTHER',
+    )
+
+    # Event timing
+    event_start = models.DateTimeField()
+    event_end = models.DateTimeField(null=True, blank=True)
+    is_all_day = models.BooleanField(default=False)
+
+    # Recurrence (simple JSON — not RFC-5545)
+    # e.g. {"freq": "weekly", "days": ["SAT"], "until": "2026-04-01"}
+    #      {"freq": "daily", "interval": 2, "until": "2026-03-15"}
+    is_recurring = models.BooleanField(default=False)
+    recurrence_rule = models.JSONField(null=True, blank=True)
+
+    # Visibility & status
+    is_featured = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=12, choices=ContentStatus.choices, default=ContentStatus.DRAFT,
+    )
+    is_active = models.BooleanField(default=True)  # dual-write from status
+    published_at = models.DateTimeField(null=True, blank=True)
+    auto_expire = models.BooleanField(default=True)
+    display_order = models.IntegerField(default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['display_order', 'event_start']
+        unique_together = [('hotel', 'slug')]
+        indexes = [
+            models.Index(fields=['hotel', 'status', 'is_featured', 'event_start']),
+            models.Index(fields=['hotel', 'status', 'auto_expire', 'event_end']),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(event_end__isnull=True) | models.Q(event_end__gte=models.F('event_start')),
+                name='event_end_gte_start',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.is_active = self.status == ContentStatus.PUBLISHED
+        if not self.slug:
+            base = slugify(self.name) or 'event'
+            slug = base[:200]
+            counter = 1
+            while Event.objects.filter(hotel=self.hotel, slug=slug).exclude(pk=self.pk).exists():
+                suffix = f'-{counter}'
+                slug = f'{base[:200 - len(suffix)]}{suffix}'
+                counter += 1
+            self.slug = slug
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        """Validate recurrence rule schema."""
+        if self.is_recurring:
+            if not self.recurrence_rule or not isinstance(self.recurrence_rule, dict):
+                raise ValidationError(
+                    {'recurrence_rule': 'Recurrence rule is required when is_recurring is True.'}
+                )
+            rule = self.recurrence_rule
+            freq = rule.get('freq')
+            if freq not in ('daily', 'weekly', 'monthly'):
+                raise ValidationError(
+                    {'recurrence_rule': 'freq must be one of: daily, weekly, monthly.'}
+                )
+            interval = rule.get('interval', 1)
+            if not isinstance(interval, int) or interval < 1:
+                raise ValidationError(
+                    {'recurrence_rule': 'interval must be a positive integer.'}
+                )
+            if freq == 'weekly':
+                days = rule.get('days', [])
+                if not days or not isinstance(days, list):
+                    raise ValidationError(
+                        {'recurrence_rule': 'days is required for weekly recurrence.'}
+                    )
+                if not all(d in self.VALID_DAYS for d in days):
+                    raise ValidationError(
+                        {'recurrence_rule': f'days must be a list of: {", ".join(sorted(self.VALID_DAYS))}'}
+                    )
+            until_str = rule.get('until')
+            if until_str is not None:
+                try:
+                    date.fromisoformat(until_str)
+                except (ValueError, TypeError):
+                    raise ValidationError(
+                        {'recurrence_rule': 'until must be a valid ISO date (YYYY-MM-DD).'}
+                    )
+
+    def get_next_occurrence(self, after=None):
+        """Return the next datetime this event occurs, evaluated in hotel timezone.
+
+        For non-recurring events: returns event_start if future, else None.
+        For recurring events: iterates forward from event_start using the rule.
+        Hard cap of 365 days to prevent infinite loops.
+        """
+        if after is None:
+            after = timezone.now()
+
+        if not self.is_recurring:
+            return self.event_start if self.event_start > after else None
+
+        rule = self.recurrence_rule
+        if not rule or not isinstance(rule, dict):
+            return None
+
+        tz = zoneinfo.ZoneInfo(self.hotel.timezone)
+        freq = rule.get('freq')
+        interval = max(rule.get('interval', 1), 1)
+        days = rule.get('days', [])
+        until_str = rule.get('until')
+
+        until_date = None
+        if until_str:
+            try:
+                until_date = date.fromisoformat(until_str)
+            except (ValueError, TypeError):
+                pass
+
+        start_local = self.event_start.astimezone(tz)
+        start_time = start_local.time()
+        start_date = start_local.date()
+
+        # Start checking from after's date in hotel tz
+        after_local = after.astimezone(tz)
+        check_date = max(start_date, after_local.date())
+        max_date = check_date + timedelta(days=365)
+
+        while check_date <= max_date:
+            if until_date and check_date > until_date:
+                return None
+
+            candidate_dt = timezone.datetime.combine(
+                check_date, start_time, tzinfo=tz,
+            )
+
+            is_match = False
+            if freq == 'daily':
+                days_diff = (check_date - start_date).days
+                is_match = days_diff >= 0 and days_diff % interval == 0
+            elif freq == 'weekly':
+                valid_weekdays = {self.DAY_MAP[d] for d in days if d in self.DAY_MAP}
+                if check_date.weekday() in valid_weekdays:
+                    weeks_diff = (check_date - start_date).days // 7
+                    is_match = weeks_diff >= 0 and weeks_diff % interval == 0
+            elif freq == 'monthly':
+                if check_date.day == start_date.day:
+                    months_diff = (
+                        (check_date.year - start_date.year) * 12
+                        + (check_date.month - start_date.month)
+                    )
+                    is_match = months_diff >= 0 and months_diff % interval == 0
+
+            if is_match and candidate_dt > after:
+                return candidate_dt
+
+            check_date += timedelta(days=1)
+
+        return None
+
+    def get_routing_department(self):
+        """Resolve concrete department for request routing.
+
+        Returns Department or None. Caller (serializer) must guard
+        for same-hotel and not-is_ops — this method only resolves.
+        """
+        if self.department_id:
+            return self.department
+        if self.experience_id and self.experience.department_id:
+            return self.experience.department
+        if self.hotel.fallback_department_id:
+            return self.hotel.fallback_department
+        return None
+
+    def is_valid_occurrence(self, check_date):
+        """Return True if check_date falls on a valid recurrence instance.
+
+        Evaluated in hotel timezone. Used by serializer to validate
+        occurrence_date on recurring event requests.
+        """
+        if not self.is_recurring or not self.recurrence_rule:
+            return False
+
+        tz = zoneinfo.ZoneInfo(self.hotel.timezone)
+        rule = self.recurrence_rule
+        freq = rule.get('freq')
+        interval = max(rule.get('interval', 1), 1)
+        days = rule.get('days', [])
+        until_str = rule.get('until')
+
+        # Check until bound
+        if until_str:
+            try:
+                until_date_val = date.fromisoformat(until_str)
+                if check_date > until_date_val:
+                    return False
+            except (ValueError, TypeError):
+                pass
+
+        # check_date must be >= event_start date (in hotel tz)
+        start_local = self.event_start.astimezone(tz).date()
+        if check_date < start_local:
+            return False
+
+        if freq == 'weekly':
+            valid_days = {self.DAY_MAP[d] for d in days if d in self.DAY_MAP}
+            if check_date.weekday() not in valid_days:
+                return False
+            weeks_diff = (check_date - start_local).days // 7
+            return weeks_diff % interval == 0
+        elif freq == 'daily':
+            days_diff = (check_date - start_local).days
+            return days_diff % interval == 0
+        elif freq == 'monthly':
+            if check_date.day != start_local.day:
+                return False
+            months_diff = (
+                (check_date.year - start_local.year) * 12
+                + (check_date.month - start_local.month)
+            )
+            return months_diff >= 0 and months_diff % interval == 0
+
+        return False
+
+    def __str__(self):
+        return f'{self.name} ({self.hotel.name})'
+
+
 class GuestStay(models.Model):
     guest = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
@@ -407,8 +667,16 @@ class ServiceRequest(models.Model):
         Experience, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='requests',
     )
+    event = models.ForeignKey(
+        'Event', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='requests',
+    )
     department = models.ForeignKey(
         Department, on_delete=models.CASCADE, related_name='requests',
+    )
+    occurrence_date = models.DateField(
+        null=True, blank=True,
+        help_text='For recurring events: which occurrence the guest selected',
     )
     request_type = models.CharField(
         max_length=20, choices=RequestType.choices,

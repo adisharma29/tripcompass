@@ -1,5 +1,6 @@
 import logging
-from datetime import timedelta
+import zoneinfo
+from datetime import date, timedelta
 
 from celery import shared_task
 from django.conf import settings
@@ -95,6 +96,54 @@ def otp_wa_fallback_sweep_task():
 
         # Send SMS outside the row lock
         send_sms_fallback_for_otp(locked)
+
+
+@shared_task
+def expire_events_task():
+    """Runs hourly. Auto-unpublishes published events whose event_end has passed."""
+    from .models import ContentStatus, Event
+
+    now = timezone.now()
+
+    # One-time events: event_end in the past
+    expired_onetime = Event.objects.filter(
+        status=ContentStatus.PUBLISHED,
+        auto_expire=True,
+        is_recurring=False,
+        event_end__isnull=False,
+        event_end__lt=now,
+    ).update(status=ContentStatus.UNPUBLISHED, is_active=False)
+
+    # Recurring events: recurrence_rule.until in the past (evaluated in hotel tz)
+    recurring_candidates = Event.objects.filter(
+        status=ContentStatus.PUBLISHED,
+        auto_expire=True,
+        is_recurring=True,
+    ).select_related('hotel')
+
+    expired_recurring = 0
+    for event in recurring_candidates:
+        rule = event.recurrence_rule or {}
+        until_str = rule.get('until')
+        if until_str:
+            try:
+                hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone)
+                hotel_today = now.astimezone(hotel_tz).date()
+                until_date = date.fromisoformat(until_str)
+                if until_date < hotel_today:
+                    event.status = ContentStatus.UNPUBLISHED
+                    event.is_active = False
+                    event.save(update_fields=['status', 'is_active', 'updated_at'])
+                    expired_recurring += 1
+            except (ValueError, TypeError, KeyError):
+                pass
+
+    total = expired_onetime + expired_recurring
+    if total:
+        logger.info(
+            'Auto-expired %d events (%d one-time, %d recurring)',
+            total, expired_onetime, expired_recurring,
+        )
 
 
 @shared_task

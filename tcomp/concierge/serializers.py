@@ -7,7 +7,7 @@ from rest_framework import serializers
 
 from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
-    ExperienceImage, GuestStay, ServiceRequest, RequestActivity,
+    ExperienceImage, Event, GuestStay, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode,
 )
 from .validators import validate_image_upload
@@ -210,6 +210,70 @@ class DepartmentSerializer(serializers.ModelSerializer):
             return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
         return value
 
+    _VALID_DAY_KEYS = frozenset([
+        'monday', 'tuesday', 'wednesday', 'thursday',
+        'friday', 'saturday', 'sunday',
+    ])
+    _LEGACY_DAY_MAP = {
+        'mon': 'monday', 'tue': 'tuesday', 'wed': 'wednesday',
+        'thu': 'thursday', 'fri': 'friday', 'sat': 'saturday', 'sun': 'sunday',
+    }
+    _TIME_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
+
+    def validate_schedule(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError('Schedule must be a JSON object.')
+        # timezone
+        tz = value.get('timezone')
+        if tz and not isinstance(tz, str):
+            raise serializers.ValidationError('timezone must be a string.')
+        # default slots
+        default = value.get('default')
+        if default is not None:
+            self._validate_slots(default, 'default')
+        # overrides — normalize legacy abbreviated keys (MON → monday, etc.)
+        overrides = value.get('overrides')
+        if overrides is not None:
+            if not isinstance(overrides, dict):
+                raise serializers.ValidationError('overrides must be a JSON object.')
+            normalized = {}
+            for key, slots in overrides.items():
+                canonical = self._LEGACY_DAY_MAP.get(key.lower(), key.lower())
+                if canonical not in self._VALID_DAY_KEYS:
+                    raise serializers.ValidationError(
+                        f'Invalid override key "{key}". Must be a day name '
+                        f'(e.g. "monday").'
+                    )
+                if canonical in normalized:
+                    raise serializers.ValidationError(
+                        f'Duplicate override for "{canonical}" '
+                        f'(check for both abbreviated and full day names).'
+                    )
+                self._validate_slots(slots, f'overrides.{canonical}')
+                normalized[canonical] = slots
+            value['overrides'] = normalized
+        # Reject unknown top-level keys
+        allowed = {'timezone', 'default', 'overrides'}
+        extra = set(value.keys()) - allowed
+        if extra:
+            raise serializers.ValidationError(
+                f'Unknown schedule keys: {", ".join(sorted(extra))}. '
+                f'Allowed: timezone, default, overrides.'
+            )
+        return value
+
+    def _validate_slots(self, slots, field_name):
+        if not isinstance(slots, list):
+            raise serializers.ValidationError(f'{field_name} must be an array of [open, close] pairs.')
+        for i, slot in enumerate(slots):
+            if not isinstance(slot, (list, tuple)) or len(slot) != 2:
+                raise serializers.ValidationError(f'{field_name}[{i}] must be a [open, close] pair.')
+            for t in slot:
+                if not isinstance(t, str) or not self._TIME_RE.match(t):
+                    raise serializers.ValidationError(
+                        f'{field_name}[{i}] contains invalid time "{t}". Use HH:MM format.'
+                    )
+
     def validate_status(self, value):
         instance = self.instance
         if instance and instance.status != ContentStatus.PUBLISHED and value == ContentStatus.PUBLISHED:
@@ -281,6 +345,190 @@ class ExperienceSerializer(serializers.ModelSerializer):
         if validated_data.get('status') == ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
+
+
+# ---------------------------------------------------------------------------
+# Event serializers
+# ---------------------------------------------------------------------------
+
+class EventSerializer(serializers.ModelSerializer):
+    """Admin serializer for Event CRUD."""
+    experience = serializers.PrimaryKeyRelatedField(
+        queryset=Experience.objects.all(), required=False, allow_null=True,
+    )
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), required=False, allow_null=True,
+    )
+    photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+
+    class Meta:
+        model = Event
+        fields = [
+            'id', 'hotel', 'experience', 'department',
+            'name', 'slug', 'description', 'photo', 'cover_image',
+            'photo_clear', 'cover_image_clear',
+            'price_display', 'highlights', 'category',
+            'event_start', 'event_end', 'is_all_day',
+            'is_recurring', 'recurrence_rule',
+            'is_featured', 'status', 'is_active', 'published_at',
+            'auto_expire', 'display_order',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'hotel', 'slug', 'is_active', 'published_at',
+            'created_at', 'updated_at',
+        ]
+
+    def validate_experience(self, value):
+        if value is None:
+            return value
+        hotel = self.context.get('hotel')
+        if hotel and value.department.hotel != hotel:
+            raise serializers.ValidationError(
+                'Experience does not belong to this hotel.'
+            )
+        return value
+
+    def validate_department(self, value):
+        if value is None:
+            return value
+        hotel = self.context.get('hotel')
+        if hotel and value.hotel != hotel:
+            raise serializers.ValidationError(
+                'Department does not belong to this hotel.'
+            )
+        if value.is_ops:
+            raise serializers.ValidationError(
+                'Cannot route event requests to an ops department.'
+            )
+        return value
+
+    def validate_photo(self, value):
+        return _clean_image(value)
+
+    def validate_cover_image(self, value):
+        return _clean_image(value)
+
+    def validate_description(self, value):
+        if value:
+            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+        return value
+
+    def validate(self, data):
+        # Cross-field: event_end >= event_start
+        event_start = data.get('event_start', getattr(self.instance, 'event_start', None))
+        event_end = data.get('event_end', getattr(self.instance, 'event_end', None))
+        if event_start and event_end and event_end < event_start:
+            raise serializers.ValidationError(
+                {'event_end': 'End date/time must be on or after start date/time.'}
+            )
+
+        # Cross-field: recurrence
+        is_recurring = data.get('is_recurring', getattr(self.instance, 'is_recurring', False))
+        recurrence_rule = data.get('recurrence_rule', getattr(self.instance, 'recurrence_rule', None))
+        if is_recurring and not recurrence_rule:
+            raise serializers.ValidationError(
+                {'recurrence_rule': 'Recurrence rule is required when is_recurring is True.'}
+            )
+        if is_recurring and recurrence_rule:
+            # Validate schema via model clean()
+            temp = Event(
+                is_recurring=True,
+                recurrence_rule=recurrence_rule,
+                event_start=data.get('event_start', getattr(self.instance, 'event_start', None)),
+            )
+            try:
+                temp.clean()
+            except Exception as e:
+                if hasattr(e, 'message_dict'):
+                    raise serializers.ValidationError(e.message_dict)
+                raise serializers.ValidationError({'recurrence_rule': str(e)})
+        return data
+
+    def _handle_image_clears(self, instance, validated_data):
+        for field in ('photo', 'cover_image'):
+            if validated_data.pop(f'{field}_clear', False):
+                file_field = getattr(instance, field)
+                if file_field:
+                    file_field.delete(save=False)
+                setattr(instance, field, '')
+
+    def update(self, instance, validated_data):
+        new_status = validated_data.get('status')
+        if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        self._handle_image_clears(instance, validated_data)
+        return super().update(instance, validated_data)
+
+    def create(self, validated_data):
+        validated_data.pop('photo_clear', None)
+        validated_data.pop('cover_image_clear', None)
+        if validated_data.get('status') == ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        validated_data['hotel'] = self.context['hotel']
+        return super().create(validated_data)
+
+
+def _get_safe_routing_department(event):
+    """Resolve routing department with safety checks.
+    Returns Department or None. Used by both EventPublicSerializer
+    and ServiceRequestCreateSerializer.
+    """
+    dept = event.get_routing_department()
+    if dept is None:
+        return None
+    if dept.hotel_id != event.hotel_id:
+        return None
+    if dept.is_ops:
+        return None
+    return dept
+
+
+class EventPublicSerializer(serializers.ModelSerializer):
+    """Guest-facing serializer for published events."""
+    next_occurrence = serializers.SerializerMethodField()
+    routing_department_slug = serializers.SerializerMethodField()
+    routing_department_name = serializers.SerializerMethodField()
+    experience_name = serializers.SerializerMethodField()
+    experience_slug = serializers.SerializerMethodField()
+    experience_department_slug = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Event
+        fields = [
+            'id', 'name', 'slug', 'description', 'photo', 'cover_image',
+            'price_display', 'highlights', 'category',
+            'event_start', 'event_end', 'is_all_day',
+            'is_recurring', 'recurrence_rule',
+            'is_featured', 'next_occurrence',
+            'department',
+            'routing_department_slug', 'routing_department_name',
+            'experience_name', 'experience_slug', 'experience_department_slug',
+        ]
+
+    def get_next_occurrence(self, obj):
+        dt = obj.get_next_occurrence()
+        return dt.isoformat() if dt else None
+
+    def get_routing_department_slug(self, obj):
+        dept = _get_safe_routing_department(obj)
+        return dept.slug if dept else None
+
+    def get_routing_department_name(self, obj):
+        dept = _get_safe_routing_department(obj)
+        return dept.name if dept else None
+
+    def get_experience_name(self, obj):
+        return obj.experience.name if obj.experience else None
+
+    def get_experience_slug(self, obj):
+        return obj.experience.slug if obj.experience else None
+
+    def get_experience_department_slug(self, obj):
+        if obj.experience and obj.experience.department:
+            return obj.experience.department.slug
+        return None
 
 
 class HotelMinimalSerializer(serializers.ModelSerializer):
@@ -448,50 +696,124 @@ class RequestActivitySerializer(serializers.ModelSerializer):
 
 class ServiceRequestCreateSerializer(serializers.ModelSerializer):
     guest_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    # department is optional when event is provided (backend resolves via fallback chain)
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), required=False, allow_null=True,
+    )
+    event = serializers.PrimaryKeyRelatedField(
+        queryset=Event.objects.all(), required=False, allow_null=True,
+    )
+    occurrence_date = serializers.DateField(required=False, allow_null=True)
 
     class Meta:
         model = ServiceRequest
         fields = [
-            'experience', 'department', 'request_type',
+            'experience', 'department', 'event', 'occurrence_date',
+            'request_type',
             'guest_name', 'guest_notes', 'guest_date',
             'guest_time', 'guest_count',
         ]
 
     def validate(self, data):
         hotel = self.context.get('hotel')
+        event = data.get('event')
         experience = data.get('experience')
         department = data.get('department')
 
-        if experience:
-            # Validate experience belongs to this hotel
-            if experience.department.hotel != hotel:
+        if event:
+            # --- Event-based request ---
+            if event.hotel != hotel:
                 raise serializers.ValidationError(
-                    {'experience': 'Experience does not belong to this hotel.'}
+                    {'event': 'Event does not belong to this hotel.'}
                 )
-            # Derive department from experience
-            derived_dept = experience.department
-            if derived_dept.is_ops:
+            if event.status != ContentStatus.PUBLISHED:
                 raise serializers.ValidationError(
-                    {'experience': 'This experience is not available for guest requests.'}
+                    {'event': 'This event is not currently published.'}
                 )
-            if department and department != derived_dept:
+            # Freshness guard: reject ended events before hourly expiry runs
+            now = timezone.now()
+            if not event.is_recurring and event.event_end and event.event_end < now:
                 raise serializers.ValidationError(
-                    {'department': 'Department does not match the experience.'}
+                    {'event': 'This event has already ended.'}
                 )
-            data['department'] = derived_dept
-        elif department:
-            if department.hotel != hotel:
+            if event.is_recurring and event.get_next_occurrence() is None:
                 raise serializers.ValidationError(
-                    {'department': 'Department does not belong to this hotel.'}
+                    {'event': 'This recurring event has no upcoming occurrences.'}
                 )
-            if department.is_ops:
+            # Resolve department via fallback chain with safety checks
+            resolved_dept = _get_safe_routing_department(event)
+            if resolved_dept is None:
                 raise serializers.ValidationError(
-                    {'department': 'This department is not available for guest requests.'}
+                    {'event': 'This event cannot accept requests — no valid department configured.'}
                 )
+            data['department'] = resolved_dept
+            # Experience override: always use event's experience
+            if event.experience:
+                data['experience'] = event.experience
+            else:
+                data.pop('experience', None)
+            # Occurrence date validation
+            occurrence_date = data.get('occurrence_date')
+            if event.is_recurring:
+                if not occurrence_date:
+                    raise serializers.ValidationError(
+                        {'occurrence_date': 'Occurrence date is required for recurring events.'}
+                    )
+                import zoneinfo
+                hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone)
+                hotel_now = timezone.now().astimezone(hotel_tz)
+                hotel_today = hotel_now.date()
+                if occurrence_date < hotel_today:
+                    raise serializers.ValidationError(
+                        {'occurrence_date': 'Occurrence date cannot be in the past.'}
+                    )
+                # For non-all-day events, reject today's occurrence if event time has passed
+                if occurrence_date == hotel_today and not event.is_all_day:
+                    event_time = event.event_start.astimezone(hotel_tz).time()
+                    if hotel_now.time() > event_time:
+                        raise serializers.ValidationError(
+                            {'occurrence_date': "Today's occurrence has already passed."}
+                        )
+                if not event.is_valid_occurrence(occurrence_date):
+                    raise serializers.ValidationError(
+                        {'occurrence_date': 'This date does not match the event schedule.'}
+                    )
+            else:
+                # Strip occurrence_date for non-recurring events
+                data.pop('occurrence_date', None)
         else:
-            raise serializers.ValidationError(
-                {'department': 'Either experience or department is required.'}
-            )
+            # --- Non-event request (existing logic) ---
+            data.pop('occurrence_date', None)
+            data.pop('event', None)
+
+            if experience:
+                if experience.department.hotel != hotel:
+                    raise serializers.ValidationError(
+                        {'experience': 'Experience does not belong to this hotel.'}
+                    )
+                derived_dept = experience.department
+                if derived_dept.is_ops:
+                    raise serializers.ValidationError(
+                        {'experience': 'This experience is not available for guest requests.'}
+                    )
+                if department and department != derived_dept:
+                    raise serializers.ValidationError(
+                        {'department': 'Department does not match the experience.'}
+                    )
+                data['department'] = derived_dept
+            elif department:
+                if department.hotel != hotel:
+                    raise serializers.ValidationError(
+                        {'department': 'Department does not belong to this hotel.'}
+                    )
+                if department.is_ops:
+                    raise serializers.ValidationError(
+                        {'department': 'This department is not available for guest requests.'}
+                    )
+            else:
+                raise serializers.ValidationError(
+                    {'department': 'Either experience, event, or department is required.'}
+                )
 
         return data
 
@@ -501,13 +823,14 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
     room_number = serializers.CharField(source='guest_stay.room_number', read_only=True)
     department_name = serializers.CharField(source='department.name', read_only=True)
     experience_name = serializers.SerializerMethodField()
+    event_name = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
         fields = [
             'id', 'public_id', 'status', 'request_type',
             'guest_name', 'room_number', 'department_name',
-            'experience_name', 'guest_notes', 'guest_date',
+            'experience_name', 'event_name', 'guest_notes', 'guest_date',
             'guest_time', 'guest_count', 'after_hours',
             'response_due_at', 'created_at', 'acknowledged_at',
             'confirmed_at',
@@ -521,17 +844,23 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
     def get_experience_name(self, obj):
         return obj.experience.name if obj.experience else None
 
+    def get_event_name(self, obj):
+        return obj.event.name if obj.event else None
+
 
 class ServiceRequestDetailSerializer(ServiceRequestListSerializer):
     activities = RequestActivitySerializer(many=True, read_only=True)
     assigned_to_name = serializers.SerializerMethodField()
     assigned_to_id = serializers.IntegerField(source='assigned_to.id', read_only=True, default=None)
     guest_stay_id = serializers.IntegerField(source='guest_stay.id', read_only=True)
+    event_id = serializers.IntegerField(source='event.id', read_only=True, default=None)
+    occurrence_date = serializers.DateField(read_only=True)
 
     class Meta(ServiceRequestListSerializer.Meta):
         fields = ServiceRequestListSerializer.Meta.fields + [
             'staff_notes', 'confirmation_reason', 'activities',
             'assigned_to_name', 'assigned_to_id', 'guest_stay_id',
+            'event_id', 'occurrence_date',
         ]
 
     def get_assigned_to_name(self, obj):
