@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils import timezone
 
 from .models import (
-    Hotel, HotelMembership, Department, Experience,
+    Hotel, HotelMembership, Department, Experience, Event,
     GuestStay, OTPCode, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode, EscalationHeartbeat,
 )
@@ -35,6 +35,14 @@ class ExperienceAdmin(admin.ModelAdmin):
     list_display = ['name', 'department', 'category', 'status', 'is_active', 'display_order']
     list_filter = ['category', 'status', 'is_active', 'department__hotel']
     search_fields = ['name']
+
+
+@admin.register(Event)
+class EventAdmin(admin.ModelAdmin):
+    list_display = ['name', 'hotel', 'status', 'is_featured', 'event_start', 'event_end', 'is_recurring', 'display_order']
+    list_filter = ['status', 'is_featured', 'is_recurring', 'auto_expire', 'hotel']
+    search_fields = ['name', 'slug']
+    readonly_fields = ['slug', 'is_active', 'created_at', 'updated_at']
 
 
 @admin.register(GuestStay)

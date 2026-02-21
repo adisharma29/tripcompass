@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
@@ -18,7 +19,7 @@ from rest_framework.views import APIView
 from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
-    ContentStatus, Department, Experience, ExperienceImage, GuestStay,
+    ContentStatus, Department, Event, Experience, ExperienceImage, GuestStay,
     Hotel, HotelMembership, Notification, PushSubscription, QRCode,
     ServiceRequest, RequestActivity,
 )
@@ -29,7 +30,8 @@ from .permissions import (
 )
 from .serializers import (
     DashboardStatsSerializer, DepartmentPublicSerializer,
-    DepartmentSerializer, ExperienceImageSerializer,
+    DepartmentSerializer, EventPublicSerializer, EventSerializer,
+    ExperienceImageSerializer,
     ExperiencePublicSerializer, ExperienceSerializer,
     GuestStaySerializer,
     GuestStayUpdateSerializer, HotelPublicSerializer,
@@ -127,6 +129,69 @@ class ExperiencePublicDetail(generics.RetrieveAPIView):
             department__is_ops=False,
             status=ContentStatus.PUBLISHED,
         ).prefetch_related('gallery_images')
+
+
+class EventPublicList(generics.ListAPIView):
+    permission_classes = [AllowAny]
+    serializer_class = EventPublicSerializer
+
+    def get_queryset(self):
+        now = timezone.now()
+        qs = Event.objects.filter(
+            hotel__slug=self.kwargs['hotel_slug'],
+            hotel__is_active=True,
+            status=ContentStatus.PUBLISHED,
+        ).select_related(
+            'department', 'experience__department', 'hotel__fallback_department',
+        )
+
+        if self.request.query_params.get('featured') == 'true':
+            qs = qs.filter(is_featured=True)
+
+        # Default upcoming filter: exclude ended one-time events.
+        # Pass ?all=true to bypass (for past events UI if ever needed).
+        if self.request.query_params.get('all') != 'true':
+            qs = qs.exclude(
+                is_recurring=False,
+                event_end__isnull=False,
+                event_end__lt=now,
+            )
+
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        # Sort by next_occurrence so recurring events that started long ago
+        # appear in chronological order alongside one-time events.
+        far_future = timezone.now() + timedelta(days=3650)
+        events = sorted(
+            queryset,
+            key=lambda e: e.get_next_occurrence() or far_future,
+        )
+
+        page = self.paginate_queryset(events)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(events, many=True)
+        return Response(serializer.data)
+
+
+class EventPublicDetail(generics.RetrieveAPIView):
+    permission_classes = [AllowAny]
+    serializer_class = EventPublicSerializer
+    lookup_field = 'slug'
+    lookup_url_kwarg = 'event_slug'
+
+    def get_queryset(self):
+        return Event.objects.filter(
+            hotel__slug=self.kwargs['hotel_slug'],
+            hotel__is_active=True,
+            status=ContentStatus.PUBLISHED,
+        ).select_related(
+            'department', 'experience__department', 'hotel__fallback_department',
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +315,7 @@ class MyRequestsList(generics.ListAPIView):
         qs = ServiceRequest.objects.filter(
             guest_stay__guest=self.request.user,
         ).select_related(
-            'department', 'experience', 'guest_stay__guest',
+            'department', 'experience', 'event', 'guest_stay__guest',
         ).order_by('-created_at')
         hotel_slug = self.request.query_params.get('hotel')
         if hotel_slug:
@@ -271,7 +336,7 @@ class ServiceRequestList(HotelScopedMixin, generics.ListAPIView):
 
     def get_queryset(self):
         qs = super().get_queryset().select_related(
-            'department', 'experience', 'guest_stay__guest',
+            'department', 'experience', 'event', 'guest_stay__guest',
         )
         membership = getattr(self.request, 'membership', None)
         if membership and membership.role == HotelMembership.Role.STAFF:
@@ -292,7 +357,7 @@ class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveUpdateAPIView):
         return ServiceRequest.objects.filter(
             hotel=self.get_hotel(),
         ).select_related(
-            'department', 'experience', 'guest_stay__guest',
+            'department', 'experience', 'event', 'guest_stay__guest',
         ).prefetch_related('activities__actor')
 
     def retrieve(self, request, *args, **kwargs):
@@ -355,7 +420,7 @@ class ServiceRequestDetailByPublicId(HotelScopedMixin, generics.RetrieveAPIView)
         return ServiceRequest.objects.filter(
             hotel=self.get_hotel(),
         ).select_related(
-            'department', 'experience', 'guest_stay__guest',
+            'department', 'experience', 'event', 'guest_stay__guest',
         ).prefetch_related('activities__actor')
 
 
@@ -556,6 +621,23 @@ class ExperienceViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         ).prefetch_related('gallery_images')
 
 
+class EventAdminViewSet(HotelScopedMixin, viewsets.ModelViewSet):
+    serializer_class = EventSerializer
+    pagination_class = None  # Hotels have few events; avoids reorder/display_order collisions
+
+    def get_permissions(self):
+        if self.action in ('list', 'retrieve'):
+            return [IsStaffOrAbove()]
+        return [IsAdminOrAbove()]
+
+    def get_queryset(self):
+        qs = Event.objects.filter(hotel=self.get_hotel())
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+
 # ---------------------------------------------------------------------------
 # Bulk reorder
 # ---------------------------------------------------------------------------
@@ -627,6 +709,38 @@ class ExperienceBulkReorder(HotelScopedMixin, APIView):
             Experience.objects.bulk_update(exp_map.values(), ['display_order'])
 
         return Response({'detail': f'{len(ordered_ids)} experiences reordered.'})
+
+
+class EventBulkReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            events = Event.objects.filter(hotel=hotel, id__in=ordered_ids)
+            if events.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more IDs do not belong to this hotel.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            event_map = {e.id: e for e in events}
+            for idx, event_id in enumerate(ordered_ids):
+                event_map[event_id].display_order = idx
+            Event.objects.bulk_update(event_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} events reordered.'})
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +1075,7 @@ class MyRequestDetail(generics.RetrieveAPIView):
 
     def get_queryset(self):
         return ServiceRequest.objects.select_related(
-            'department', 'experience', 'guest_stay__guest', 'hotel',
+            'department', 'experience', 'event', 'guest_stay__guest', 'hotel',
         ).prefetch_related('activities__actor')
 
     def retrieve(self, request, *args, **kwargs):

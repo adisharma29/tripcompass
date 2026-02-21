@@ -48,11 +48,12 @@ services:
       target: development
     container_name: tcomp_web
     restart: unless-stopped
+    stop_grace_period: 15s
     command: >
       sh -c "
         python manage.py migrate --noinput &&
         python manage.py collectstatic --noinput &&
-        uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --reload
+        uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --reload --timeout-graceful-shutdown 5
       "
     volumes:
       - ./tcomp:/app
