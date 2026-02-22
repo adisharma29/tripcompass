@@ -122,6 +122,16 @@ class Hotel(models.Model):
     terms_url = models.URLField(blank=True, default='')
     privacy_url = models.URLField(blank=True, default='')
 
+    # --- Booking Window Defaults ---
+    default_booking_opens_hours = models.PositiveIntegerField(
+        default=0,
+        help_text='Default hours before event start when bookings open. 0 = always open.',
+    )
+    default_booking_closes_hours = models.PositiveIntegerField(
+        default=0,
+        help_text='Default hours before event start when bookings close. 0 = no cutoff.',
+    )
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -350,6 +360,16 @@ class Event(models.Model):
     is_recurring = models.BooleanField(default=False)
     recurrence_rule = models.JSONField(null=True, blank=True)
 
+    # Booking window (null = use hotel default)
+    booking_opens_hours = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Hours before event start when bookings open. Null = use hotel default.',
+    )
+    booking_closes_hours = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Hours before event start when bookings close. Null = use hotel default.',
+    )
+
     # Visibility & status
     is_featured = models.BooleanField(default=False)
     status = models.CharField(
@@ -391,7 +411,18 @@ class Event(models.Model):
         super().save(*args, **kwargs)
 
     def clean(self):
-        """Validate recurrence rule schema."""
+        """Validate recurrence rule schema and booking window cross-field constraints."""
+        # Booking window: opens must be >= closes when both non-zero.
+        # Guard: skip when hotel is missing (temp instances from serializer validation).
+        if self.hotel_id:
+            opens = self.get_effective_booking_opens_hours()
+            closes = self.get_effective_booking_closes_hours()
+            if opens > 0 and closes > 0 and opens < closes:
+                raise ValidationError(
+                    'Booking opens window must be >= closes window '
+                    '(e.g. opens 48h before, closes 2h before).'
+                )
+
         if self.is_recurring:
             if not self.recurrence_rule or not isinstance(self.recurrence_rule, dict):
                 raise ValidationError(
@@ -426,6 +457,91 @@ class Event(models.Model):
                     raise ValidationError(
                         {'recurrence_rule': 'until must be a valid ISO date (YYYY-MM-DD).'}
                     )
+
+    def get_effective_booking_opens_hours(self) -> int:
+        """Resolve opens window: event override > hotel default > 0 (no limit)."""
+        if self.booking_opens_hours is not None:
+            return self.booking_opens_hours
+        return self.hotel.default_booking_opens_hours
+
+    def get_effective_booking_closes_hours(self) -> int:
+        """Resolve closes window: event override > hotel default > 0 (no cutoff)."""
+        if self.booking_closes_hours is not None:
+            return self.booking_closes_hours
+        return self.hotel.default_booking_closes_hours
+
+    def get_booking_window_for(self, target_dt):
+        """
+        Returns (opens_at, closes_at) datetimes for a specific occurrence.
+
+        Boundary semantics (canonical, used everywhere):
+          opens_at is inclusive  — now >= opens_at  → bookable
+          closes_at is exclusive — now < closes_at  → bookable
+
+        Args:
+            target_dt: The datetime of the occurrence being booked.
+
+        Returns:
+            (opens_at, closes_at) — both are timezone-aware datetimes.
+            opens_at is None when opens_hours == 0 (always open).
+            closes_at falls back to target_dt when closes_hours == 0.
+        """
+        opens_hours = self.get_effective_booking_opens_hours()
+        closes_hours = self.get_effective_booking_closes_hours()
+
+        opens_at = (target_dt - timedelta(hours=opens_hours)) if opens_hours > 0 else None
+        closes_at = (target_dt - timedelta(hours=closes_hours)) if closes_hours > 0 else target_dt
+
+        return (opens_at, closes_at)
+
+    def is_bookable_for(self, target_dt, now=None):
+        """
+        Check if the event is currently within its booking window for a
+        specific occurrence datetime.
+
+        Returns False if target_dt is None (no valid occurrence).
+        """
+        if target_dt is None:
+            return False
+        now = now or timezone.now()
+        opens_at, closes_at = self.get_booking_window_for(target_dt)
+
+        if opens_at is not None and now < opens_at:
+            return False  # Too early
+        if now >= closes_at:
+            return False  # Too late (or event started)
+        return True
+
+    def resolve_target_datetime(self, occurrence_date=None):
+        """
+        Resolve the target occurrence datetime for booking window checks.
+
+        For one-time events: returns event_start.
+        For recurring events with occurrence_date: combines occurrence_date
+            with event_start time in hotel timezone.
+        For recurring events without occurrence_date: returns next_occurrence.
+        Returns None if no valid target exists.
+
+        DST ambiguity handling:
+            Uses datetime.replace(tzinfo=...) which applies the zone's offset
+            for that date. For "fall back" ambiguous times (e.g. 1:30 AM occurs
+            twice), Python's zoneinfo picks the FIRST (earlier/DST) occurrence
+            (fold=0). For "spring forward" nonexistent times (e.g. 2:30 AM is
+            skipped), zoneinfo folds to the post-transition offset. Tests should
+            use these same semantics for boundary assertions.
+        """
+        if not self.is_recurring:
+            return self.event_start
+
+        if occurrence_date:
+            hotel_tz = zoneinfo.ZoneInfo(self.hotel.timezone or 'UTC')
+            event_local_time = self.event_start.astimezone(hotel_tz).time()
+            from datetime import datetime as dt
+            naive = dt.combine(occurrence_date, event_local_time)
+            # fold=0 → first occurrence for ambiguous times (DST fall-back)
+            return naive.replace(tzinfo=hotel_tz)
+
+        return self.get_next_occurrence()
 
     def get_next_occurrence(self, after=None):
         """Return the next datetime this event occurs, evaluated in hotel timezone.

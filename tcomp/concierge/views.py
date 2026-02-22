@@ -142,7 +142,7 @@ class EventPublicList(generics.ListAPIView):
             hotel__is_active=True,
             status=ContentStatus.PUBLISHED,
         ).select_related(
-            'department', 'experience__department', 'hotel__fallback_department',
+            'hotel', 'department', 'experience__department', 'hotel__fallback_department',
         )
 
         if self.request.query_params.get('featured') == 'true':
@@ -190,7 +190,7 @@ class EventPublicDetail(generics.RetrieveAPIView):
             hotel__is_active=True,
             status=ContentStatus.PUBLISHED,
         ).select_related(
-            'department', 'experience__department', 'hotel__fallback_department',
+            'hotel', 'department', 'experience__department', 'hotel__fallback_department',
         )
 
 

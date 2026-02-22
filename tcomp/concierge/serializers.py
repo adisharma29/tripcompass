@@ -110,6 +110,8 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'escalation_enabled', 'escalation_fallback_channel',
             'oncall_email', 'oncall_phone', 'require_frontdesk_kiosk',
             'escalation_tier_minutes', 'settings_configured',
+            # Booking window defaults
+            'default_booking_opens_hours', 'default_booking_closes_hours',
             # Brand
             'primary_color', 'secondary_color', 'accent_color',
             'heading_font', 'body_font', 'favicon', 'og_image',
@@ -167,6 +169,29 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
                     'Escalation enabled requires either a fallback channel with '
                     'contact info or require_frontdesk_kiosk=True.'
                 )
+
+        # Booking window defaults: upper bounds + opens >= closes
+        opens = data.get(
+            'default_booking_opens_hours',
+            getattr(self.instance, 'default_booking_opens_hours', 0),
+        )
+        closes = data.get(
+            'default_booking_closes_hours',
+            getattr(self.instance, 'default_booking_closes_hours', 0),
+        )
+        if opens > 8760:
+            raise serializers.ValidationError(
+                {'default_booking_opens_hours': 'Cannot exceed 8760 hours (1 year).'}
+            )
+        if closes > 720:
+            raise serializers.ValidationError(
+                {'default_booking_closes_hours': 'Cannot exceed 720 hours (30 days).'}
+            )
+        if opens > 0 and closes > 0 and opens < closes:
+            raise serializers.ValidationError(
+                'Default booking opens must be >= default booking closes.'
+            )
+
         return data
 
 
@@ -351,6 +376,25 @@ class ExperienceSerializer(serializers.ModelSerializer):
 # Event serializers
 # ---------------------------------------------------------------------------
 
+class _NullableIntegerField(serializers.IntegerField):
+    """IntegerField that coerces '' to None — needed for multipart/FormData.
+
+    min_value is enforced here (not via DRF's MinValueValidator) to avoid
+    the validator crashing when the coerced value is None.
+    """
+    def __init__(self, **kwargs):
+        self._min = kwargs.pop('min_value', None)
+        super().__init__(**kwargs)
+
+    def to_internal_value(self, data):
+        if data == '' or data is None:
+            return None
+        value = super().to_internal_value(data)
+        if self._min is not None and value < self._min:
+            self.fail('min_value', min_value=self._min)
+        return value
+
+
 class EventSerializer(serializers.ModelSerializer):
     """Admin serializer for Event CRUD."""
     experience = serializers.PrimaryKeyRelatedField(
@@ -358,6 +402,12 @@ class EventSerializer(serializers.ModelSerializer):
     )
     department = serializers.PrimaryKeyRelatedField(
         queryset=Department.objects.all(), required=False, allow_null=True,
+    )
+    booking_opens_hours = _NullableIntegerField(
+        required=False, allow_null=True, min_value=0,
+    )
+    booking_closes_hours = _NullableIntegerField(
+        required=False, allow_null=True, min_value=0,
     )
     photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
     cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
@@ -371,6 +421,7 @@ class EventSerializer(serializers.ModelSerializer):
             'price_display', 'highlights', 'category',
             'event_start', 'event_end', 'is_all_day',
             'is_recurring', 'recurrence_rule',
+            'booking_opens_hours', 'booking_closes_hours',
             'is_featured', 'status', 'is_active', 'published_at',
             'auto_expire', 'display_order',
             'created_at', 'updated_at',
@@ -444,6 +495,33 @@ class EventSerializer(serializers.ModelSerializer):
                 if hasattr(e, 'message_dict'):
                     raise serializers.ValidationError(e.message_dict)
                 raise serializers.ValidationError({'recurrence_rule': str(e)})
+
+        # Cross-field: booking window opens >= closes
+        opens = data.get('booking_opens_hours')
+        closes = data.get('booking_closes_hours')
+        if opens is not None and opens > 8760:
+            raise serializers.ValidationError(
+                {'booking_opens_hours': 'Cannot exceed 8760 hours (1 year).'}
+            )
+        if closes is not None and closes > 720:
+            raise serializers.ValidationError(
+                {'booking_closes_hours': 'Cannot exceed 720 hours (30 days).'}
+            )
+        # Resolve effective values for cross-field check
+        hotel = self.context.get('hotel') or (self.instance.hotel if self.instance else None)
+        eff_opens = opens if opens is not None else (
+            self.instance.booking_opens_hours if self.instance and self.instance.booking_opens_hours is not None
+            else (hotel.default_booking_opens_hours if hotel else 0)
+        )
+        eff_closes = closes if closes is not None else (
+            self.instance.booking_closes_hours if self.instance and self.instance.booking_closes_hours is not None
+            else (hotel.default_booking_closes_hours if hotel else 0)
+        )
+        if eff_opens > 0 and eff_closes > 0 and eff_opens < eff_closes:
+            raise serializers.ValidationError(
+                'Booking opens window must be >= closes window.'
+            )
+
         return data
 
     def _handle_image_clears(self, instance, validated_data):
@@ -488,6 +566,9 @@ def _get_safe_routing_department(event):
 class EventPublicSerializer(serializers.ModelSerializer):
     """Guest-facing serializer for published events."""
     next_occurrence = serializers.SerializerMethodField()
+    booking_opens_at = serializers.SerializerMethodField()
+    booking_closes_at = serializers.SerializerMethodField()
+    is_bookable = serializers.SerializerMethodField()
     routing_department_slug = serializers.SerializerMethodField()
     routing_department_name = serializers.SerializerMethodField()
     experience_name = serializers.SerializerMethodField()
@@ -502,6 +583,7 @@ class EventPublicSerializer(serializers.ModelSerializer):
             'event_start', 'event_end', 'is_all_day',
             'is_recurring', 'recurrence_rule',
             'is_featured', 'next_occurrence',
+            'booking_opens_at', 'booking_closes_at', 'is_bookable',
             'department',
             'routing_department_slug', 'routing_department_name',
             'experience_name', 'experience_slug', 'experience_department_slug',
@@ -510,6 +592,26 @@ class EventPublicSerializer(serializers.ModelSerializer):
     def get_next_occurrence(self, obj):
         dt = obj.get_next_occurrence()
         return dt.isoformat() if dt else None
+
+    def get_booking_opens_at(self, obj):
+        """Window for next_occurrence (display default). Frontend uses this for CTA state."""
+        target = obj.resolve_target_datetime()
+        if target is None:
+            return None
+        opens_at, _ = obj.get_booking_window_for(target)
+        return opens_at.isoformat() if opens_at else None
+
+    def get_booking_closes_at(self, obj):
+        target = obj.resolve_target_datetime()
+        if target is None:
+            return None
+        _, closes_at = obj.get_booking_window_for(target)
+        return closes_at.isoformat() if closes_at else None
+
+    def get_is_bookable(self, obj):
+        """Bookable right now for the next occurrence."""
+        target = obj.resolve_target_datetime()
+        return obj.is_bookable_for(target)
 
     def get_routing_department_slug(self, obj):
         dept = _get_safe_routing_department(obj)
@@ -778,7 +880,29 @@ class ServiceRequestCreateSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {'occurrence_date': 'This date does not match the event schedule.'}
                     )
+
+            # --- Booking window enforcement ---
+            if event.is_recurring and occurrence_date:
+                target_dt = event.resolve_target_datetime(occurrence_date=occurrence_date)
             else:
+                target_dt = event.resolve_target_datetime()
+
+            if target_dt is not None and not event.is_bookable_for(target_dt):
+                import zoneinfo
+                hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone or 'UTC')
+                opens_at, closes_at = event.get_booking_window_for(target_dt)
+                bw_now = timezone.now()
+                if opens_at is not None and bw_now < opens_at:
+                    opens_local = opens_at.astimezone(hotel_tz)
+                    raise serializers.ValidationError(
+                        {'event': f"Bookings for this event open on {opens_local.strftime('%b %d at %I:%M %p')}."}
+                    )
+                closes_local = closes_at.astimezone(hotel_tz)
+                raise serializers.ValidationError(
+                    {'event': f"Bookings for this event closed on {closes_local.strftime('%b %d at %I:%M %p')}."}
+                )
+
+            if not event.is_recurring:
                 # Strip occurrence_date for non-recurring events
                 data.pop('occurrence_date', None)
         else:
