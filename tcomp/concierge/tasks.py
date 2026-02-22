@@ -200,3 +200,44 @@ def daily_digest_task():
                 ),
                 notification_type=Notification.NotificationType.DAILY_DIGEST,
             )
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def send_staff_invite_notification_task(self, user_id, hotel_id, role, resolved_channels=None):
+    """Send WhatsApp/email invitation to newly added staff member (background).
+
+    Tracks resolved channels (succeeded OR permanently failed) so retries
+    skip them — avoiding duplicate sends and pointless permanent-failure retries.
+    """
+    from django.contrib.auth import get_user_model
+    from .models import Hotel
+    User = get_user_model()
+    try:
+        user = User.objects.get(id=user_id)
+        hotel = Hotel.objects.get(id=hotel_id)
+    except (User.DoesNotExist, Hotel.DoesNotExist):
+        return
+
+    skip = set(resolved_channels or [])
+
+    from .services import send_staff_invite_notification
+    try:
+        send_staff_invite_notification(user, hotel, role, skip_channels=skip)
+    except Exception as exc:
+        # Merge any newly resolved channels (sent or permanently rejected)
+        skip = skip | getattr(exc, '_resolved_channels', set())
+        logger.warning(
+            'Staff invite notification partially failed (attempt %d/%d, resolved=%s): %s',
+            self.request.retries + 1, self.max_retries + 1, skip, exc,
+        )
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                'Staff invite notification exhausted retries for user=%s hotel=%s. '
+                'Resolved: %s. Manual follow-up may be needed.',
+                user_id, hotel_id, skip,
+            )
+            return
+        raise self.retry(exc=exc, kwargs={
+            'user_id': user_id, 'hotel_id': hotel_id,
+            'role': role, 'resolved_channels': list(skip),
+        })

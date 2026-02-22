@@ -955,6 +955,16 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Send invitation notifications (background, best-effort)
+        from django.db import transaction as db_transaction
+        def _enqueue_invite():
+            try:
+                from .tasks import send_staff_invite_notification_task
+                send_staff_invite_notification_task.delay(user.id, hotel.id, data['role'])
+            except Exception:
+                logger.warning('Failed to enqueue staff invite notification (broker down?)', exc_info=True)
+        db_transaction.on_commit(_enqueue_invite)
+
         return Response(
             MemberSerializer(membership).data,
             status=status.HTTP_201_CREATED,

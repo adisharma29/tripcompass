@@ -84,6 +84,9 @@ services:
       - GUPSHUP_WA_SOURCE_PHONE=${GUPSHUP_WA_SOURCE_PHONE}
       - GUPSHUP_WA_APP_NAME=${GUPSHUP_WA_APP_NAME}
       - GUPSHUP_WA_OTP_TEMPLATE_ID=${GUPSHUP_WA_OTP_TEMPLATE_ID}
+      - GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID=${GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID}
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL:-Refuje <notifications@notifications.refuje.com>}
     depends_on:
       db:
         condition: service_healthy
@@ -122,6 +125,12 @@ services:
       - VAPID_PRIVATE_KEY=${VAPID_PRIVATE_KEY}
       - VAPID_PUBLIC_KEY=${VAPID_PUBLIC_KEY}
       - VAPID_ADMIN_EMAIL=${VAPID_ADMIN_EMAIL:-admin@refuje.com}
+      - GUPSHUP_WA_API_KEY=${GUPSHUP_WA_API_KEY}
+      - GUPSHUP_WA_SOURCE_PHONE=${GUPSHUP_WA_SOURCE_PHONE}
+      - GUPSHUP_WA_APP_NAME=${GUPSHUP_WA_APP_NAME}
+      - GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID=${GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID}
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL:-Refuje <notifications@notifications.refuje.com>}
     depends_on:
       db:
         condition: service_healthy

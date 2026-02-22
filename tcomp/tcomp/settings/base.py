@@ -175,6 +175,11 @@ GUPSHUP_WA_APP_NAME = config('GUPSHUP_WA_APP_NAME', default='Refuje')
 GUPSHUP_WA_OTP_TEMPLATE_ID = config('GUPSHUP_WA_OTP_TEMPLATE_ID', default='')
 GUPSHUP_WA_WEBHOOK_SECRET = config('GUPSHUP_WA_WEBHOOK_SECRET', default='')
 GUPSHUP_WA_FALLBACK_TIMEOUT_SECONDS = 10
+GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID = config('GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID', default='')
+
+# --- Resend Email API ---
+RESEND_API_KEY = config('RESEND_API_KEY', default='')
+RESEND_FROM_EMAIL = config('RESEND_FROM_EMAIL', default='Refuje <notifications@notifications.refuje.com>')
 
 # --- Gupshup Enterprise SMS API (fallback OTP + escalation SMS) ---
 GUPSHUP_SMS_USERID = config('GUPSHUP_SMS_USERID', default='')
