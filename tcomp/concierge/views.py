@@ -20,8 +20,8 @@ from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
     ContentStatus, Department, Event, Experience, ExperienceImage, GuestStay,
-    Hotel, HotelMembership, Notification, PushSubscription, QRCode,
-    ServiceRequest, RequestActivity,
+    Hotel, HotelInfoSection, HotelMembership, Notification, PushSubscription,
+    QRCode, ServiceRequest, RequestActivity,
 )
 from .permissions import (
     CanAccessRequestObject, CanAccessRequestObjectByLookup,
@@ -34,7 +34,8 @@ from .serializers import (
     ExperienceImageSerializer,
     ExperiencePublicSerializer, ExperienceSerializer, TopDealSerializer,
     GuestStaySerializer,
-    GuestStayUpdateSerializer, HotelPublicSerializer,
+    GuestStayUpdateSerializer, HotelInfoSectionSerializer,
+    HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
     MemberSerializer, NotificationSerializer,
     PushSubscriptionSerializer, QRCodeSerializer,
@@ -72,6 +73,10 @@ class HotelPublicDetail(generics.RetrieveAPIView):
             queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
         ),
         'departments__experiences__gallery_images',
+        Prefetch(
+            'info_sections',
+            queryset=HotelInfoSection.objects.filter(is_visible=True).order_by('display_order', 'id'),
+        ),
     )
 
 
@@ -766,6 +771,65 @@ class EventBulkReorder(HotelScopedMixin, APIView):
             Event.objects.bulk_update(event_map.values(), ['display_order'])
 
         return Response({'detail': f'{len(ordered_ids)} events reordered.'})
+
+
+# ---------------------------------------------------------------------------
+# Hotel info sections
+# ---------------------------------------------------------------------------
+
+class HotelInfoSectionViewSet(HotelScopedMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = HotelInfoSectionSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        return HotelInfoSection.objects.filter(hotel=self.get_hotel())
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        max_order = HotelInfoSection.objects.filter(
+            hotel=hotel,
+        ).aggregate(m=Max('display_order'))['m']
+        serializer.save(hotel=hotel, display_order=(max_order or 0) + 1)
+
+
+class InfoSectionBulkReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            sections = HotelInfoSection.objects.filter(hotel=hotel)
+            total_count = sections.count()
+            if len(ordered_ids) != total_count:
+                return Response(
+                    {'detail': 'order must include all info section IDs for this hotel.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            matched = sections.filter(id__in=ordered_ids)
+            if matched.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more IDs do not belong to this hotel.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            section_map = {s.id: s for s in matched}
+            for idx, section_id in enumerate(ordered_ids):
+                section_map[section_id].display_order = idx
+            HotelInfoSection.objects.bulk_update(section_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} info sections reordered.'})
 
 
 # ---------------------------------------------------------------------------

@@ -8,14 +8,17 @@ from rest_framework import serializers
 from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
     ExperienceImage, Event, GuestStay, ServiceRequest, RequestActivity,
-    Notification, PushSubscription, QRCode,
+    Notification, PushSubscription, QRCode, HotelInfoSection,
 )
 from .validators import validate_image_upload
 
 ALLOWED_HTML_TAGS = [
-    'p', 'br', 'strong', 'em', 's', 'h2', 'h3',
-    'ul', 'ol', 'li', 'blockquote', 'hr',
+    'p', 'br', 'strong', 'em', 'u', 's', 'h2', 'h3',
+    'ul', 'ol', 'li', 'blockquote', 'hr', 'a',
 ]
+ALLOWED_HTML_ATTRIBUTES = {
+    'a': ['href'],
+}
 
 
 def _clean_image(file):
@@ -94,8 +97,40 @@ class DepartmentPublicSerializer(serializers.ModelSerializer):
         ]
 
 
+class HotelInfoSectionPublicSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = HotelInfoSection
+        fields = ['id', 'title', 'body', 'icon', 'display_order']
+
+
+class HotelInfoSectionSerializer(serializers.ModelSerializer):
+    """Admin serializer — full CRUD with validation."""
+    ALLOWED_ICONS = HotelInfoSection.ALLOWED_ICONS
+
+    class Meta:
+        model = HotelInfoSection
+        fields = [
+            'id', 'title', 'body', 'icon', 'display_order', 'is_visible',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_icon(self, value):
+        if value and value not in self.ALLOWED_ICONS:
+            raise serializers.ValidationError(
+                f'Invalid icon key. Allowed: {sorted(self.ALLOWED_ICONS)}'
+            )
+        return value
+
+    def validate_body(self, value):
+        if value:
+            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
+        return value
+
+
 class HotelPublicSerializer(serializers.ModelSerializer):
     departments = DepartmentPublicSerializer(many=True, read_only=True)
+    info_sections = HotelInfoSectionPublicSerializer(many=True, read_only=True)
 
     class Meta:
         model = Hotel
@@ -110,7 +145,7 @@ class HotelPublicSerializer(serializers.ModelSerializer):
             # Footer & Legal
             'footer_text', 'terms_url', 'privacy_url',
             # Relations
-            'departments',
+            'departments', 'info_sections',
         ]
 
 
@@ -263,7 +298,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
         return value
 
     _VALID_DAY_KEYS = frozenset([
@@ -398,7 +433,7 @@ class ExperienceSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
         return value
 
     def validate_deal_ends_at(self, value):
@@ -535,7 +570,7 @@ class EventSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
         return value
 
     def validate(self, data):

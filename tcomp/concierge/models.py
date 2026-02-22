@@ -1025,3 +1025,31 @@ class EscalationHeartbeat(models.Model):
 
     def __str__(self):
         return f'{self.task_name}: {self.status} ({self.last_run})'
+
+
+class HotelInfoSection(models.Model):
+    ALLOWED_ICONS = frozenset({
+        'wifi', 'clock', 'utensils', 'phone', 'car', 'map-pin', 'shield',
+        'info', 'coffee', 'dumbbell', 'waves', 'luggage', 'credit-card',
+        'calendar', 'key', 'shirt', 'baby', 'dog', 'cigarette', 'heart',
+    })
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='info_sections',
+    )
+    title = models.CharField(max_length=200)
+    body = models.TextField(blank=True)
+    icon = models.CharField(max_length=50, blank=True)
+    display_order = models.IntegerField(default=0)
+    is_visible = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['display_order', 'id']
+        indexes = [
+            models.Index(fields=['hotel', 'display_order']),
+        ]
+
+    def __str__(self):
+        return f'{self.title} ({self.hotel.name})'
