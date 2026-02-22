@@ -278,6 +278,12 @@ class Experience(models.Model):
     )
     published_at = models.DateTimeField(null=True, blank=True)
     display_order = models.IntegerField(default=0)
+
+    # --- Top Deals ---
+    is_top_deal = models.BooleanField(default=False)
+    deal_price_display = models.CharField(max_length=100, blank=True, default='')
+    deal_ends_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -298,6 +304,9 @@ class Experience(models.Model):
     class Meta:
         unique_together = ('department', 'slug')
         ordering = ['display_order', 'name']
+        indexes = [
+            models.Index(fields=['is_top_deal', 'deal_ends_at']),
+        ]
 
     def __str__(self):
         return f'{self.name} ({self.department.name})'

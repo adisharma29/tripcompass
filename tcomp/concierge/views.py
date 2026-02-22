@@ -5,7 +5,7 @@ import logging
 from datetime import timedelta
 
 from django.conf import settings
-from django.db import transaction
+from django.db import models, transaction
 from django.db.models import Count, Max, Prefetch
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
@@ -32,7 +32,7 @@ from .serializers import (
     DashboardStatsSerializer, DepartmentPublicSerializer,
     DepartmentSerializer, EventPublicSerializer, EventSerializer,
     ExperienceImageSerializer,
-    ExperiencePublicSerializer, ExperienceSerializer,
+    ExperiencePublicSerializer, ExperienceSerializer, TopDealSerializer,
     GuestStaySerializer,
     GuestStayUpdateSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
@@ -191,6 +191,31 @@ class EventPublicDetail(generics.RetrieveAPIView):
             status=ContentStatus.PUBLISHED,
         ).select_related(
             'hotel', 'department', 'experience__department', 'hotel__fallback_department',
+        )
+
+
+class TopDealsList(generics.ListAPIView):
+    permission_classes = [AllowAny]
+    serializer_class = TopDealSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        now = timezone.now()
+        return Experience.objects.filter(
+            department__hotel__slug=self.kwargs['hotel_slug'],
+            department__hotel__is_active=True,
+            status=ContentStatus.PUBLISHED,
+            is_top_deal=True,
+            department__status=ContentStatus.PUBLISHED,
+            department__is_ops=False,
+        ).filter(
+            models.Q(deal_ends_at__isnull=True) | models.Q(deal_ends_at__gt=now),
+        ).select_related(
+            'department',
+        ).prefetch_related(
+            'gallery_images',
+        ).order_by(
+            models.F('deal_ends_at').asc(nulls_last=True), 'name',
         )
 
 

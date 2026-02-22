@@ -12,6 +12,8 @@ urlpatterns = [
          views.DepartmentPublicDetail.as_view(), name='department-public-detail'),
     path('hotels/<slug:hotel_slug>/departments/<slug:dept_slug>/experiences/<slug:exp_slug>/',
          views.ExperiencePublicDetail.as_view(), name='experience-public-detail'),
+    path('hotels/<slug:hotel_slug>/top-deals/',
+         views.TopDealsList.as_view(), name='top-deals-list'),
     path('hotels/<slug:hotel_slug>/events/',
          views.EventPublicList.as_view(), name='event-public-list'),
     path('hotels/<slug:hotel_slug>/events/<slug:event_slug>/',

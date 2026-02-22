@@ -52,6 +52,7 @@ class ExperienceImageSerializer(serializers.ModelSerializer):
 
 class ExperiencePublicSerializer(serializers.ModelSerializer):
     gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+    is_deal_active = serializers.SerializerMethodField()
 
     class Meta:
         model = Experience
@@ -59,6 +60,26 @@ class ExperiencePublicSerializer(serializers.ModelSerializer):
             'id', 'name', 'slug', 'description', 'photo', 'cover_image',
             'price_display', 'category', 'timing', 'duration', 'capacity',
             'highlights', 'display_order', 'gallery_images',
+            'is_top_deal', 'deal_price_display', 'deal_ends_at',
+            'is_deal_active',
+        ]
+
+    def get_is_deal_active(self, obj):
+        if not obj.is_top_deal:
+            return False
+        if obj.deal_ends_at is None:
+            return True
+        return obj.deal_ends_at > timezone.now()
+
+
+class TopDealSerializer(ExperiencePublicSerializer):
+    """Extended public serializer for /top-deals/ endpoint with routing fields."""
+    department_slug = serializers.CharField(source='department.slug', read_only=True)
+    department_name = serializers.CharField(source='department.name', read_only=True)
+
+    class Meta(ExperiencePublicSerializer.Meta):
+        fields = ExperiencePublicSerializer.Meta.fields + [
+            'department_slug', 'department_name',
         ]
 
 
@@ -199,6 +220,7 @@ class _ExperienceNestedSerializer(serializers.ModelSerializer):
     """Lightweight serializer for experiences nested inside admin DepartmentSerializer.
     Includes status/is_active fields that ExperiencePublicSerializer omits."""
     gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+    is_deal_active = serializers.SerializerMethodField()
 
     class Meta:
         model = Experience
@@ -207,7 +229,16 @@ class _ExperienceNestedSerializer(serializers.ModelSerializer):
             'price', 'price_display', 'category', 'timing', 'duration',
             'capacity', 'highlights', 'display_order', 'gallery_images',
             'is_active', 'status', 'published_at', 'created_at', 'updated_at',
+            'is_top_deal', 'deal_price_display', 'deal_ends_at',
+            'is_deal_active',
         ]
+
+    def get_is_deal_active(self, obj):
+        if not obj.is_top_deal:
+            return False
+        if obj.deal_ends_at is None:
+            return True
+        return obj.deal_ends_at > timezone.now()
 
 
 class DepartmentSerializer(serializers.ModelSerializer):
@@ -328,6 +359,7 @@ class ExperienceSerializer(serializers.ModelSerializer):
         queryset=Department.objects.all(),
     )
     gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+    is_deal_active = serializers.SerializerMethodField()
 
     class Meta:
         model = Experience
@@ -337,9 +369,18 @@ class ExperienceSerializer(serializers.ModelSerializer):
             'category', 'timing', 'duration', 'capacity',
             'highlights', 'is_active', 'display_order',
             'status', 'published_at',
+            'is_top_deal', 'deal_price_display', 'deal_ends_at',
+            'is_deal_active',
             'gallery_images', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at', 'is_deal_active']
+
+    def get_is_deal_active(self, obj):
+        if not obj.is_top_deal:
+            return False
+        if obj.deal_ends_at is None:
+            return True
+        return obj.deal_ends_at > timezone.now()
 
     def validate_department(self, value):
         hotel = self.context.get('hotel')
@@ -359,6 +400,37 @@ class ExperienceSerializer(serializers.ModelSerializer):
         if value:
             return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
         return value
+
+    def validate_deal_ends_at(self, value):
+        # Coerce FormData empty string to None
+        if value == '' or value is None:
+            return None
+        return value
+
+    def validate(self, data):
+        is_top_deal = data.get('is_top_deal', getattr(self.instance, 'is_top_deal', False))
+
+        if is_top_deal:
+            deal_price = data.get(
+                'deal_price_display',
+                getattr(self.instance, 'deal_price_display', ''),
+            )
+            if not deal_price or not deal_price.strip():
+                raise serializers.ValidationError(
+                    {'deal_price_display': 'Deal price is required when marking as a top deal.'}
+                )
+            # Only enforce future check when deal_ends_at is explicitly in this request
+            if 'deal_ends_at' in data and data['deal_ends_at'] is not None:
+                if data['deal_ends_at'] <= timezone.now():
+                    raise serializers.ValidationError(
+                        {'deal_ends_at': 'Deal end time must be in the future.'}
+                    )
+        else:
+            # Auto-clear deal fields when toggled off
+            data['deal_price_display'] = ''
+            data['deal_ends_at'] = None
+
+        return data
 
     def update(self, instance, validated_data):
         new_status = validated_data.get('status')

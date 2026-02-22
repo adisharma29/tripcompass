@@ -99,6 +99,20 @@ def otp_wa_fallback_sweep_task():
 
 
 @shared_task
+def expire_top_deals_task():
+    """Runs every 5 minutes. Clears is_top_deal when deal_ends_at has passed."""
+    from .models import Experience
+    now = timezone.now()
+    expired = Experience.objects.filter(
+        is_top_deal=True,
+        deal_ends_at__isnull=False,
+        deal_ends_at__lt=now,
+    ).update(is_top_deal=False, deal_price_display='', deal_ends_at=None)
+    if expired:
+        logger.info('Cleared %d expired top deals', expired)
+
+
+@shared_task
 def expire_events_task():
     """Runs hourly. Auto-unpublishes published events whose event_end has passed."""
     from .models import ContentStatus, Event

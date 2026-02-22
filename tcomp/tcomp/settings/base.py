@@ -246,6 +246,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'concierge.tasks.expire_events_task',
         'schedule': 60 * 60,  # every hour
     },
+    'expire-top-deals': {
+        'task': 'concierge.tasks.expire_top_deals_task',
+        'schedule': 5 * 60,  # every 5 minutes
+    },
 }
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_REJECT_ON_WORKER_LOST = True
