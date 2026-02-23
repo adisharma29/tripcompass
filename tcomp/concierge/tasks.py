@@ -1,6 +1,8 @@
 import logging
+import re
 import zoneinfo
 from datetime import date, timedelta
+from urllib.parse import urlparse
 
 from celery import shared_task
 from django.conf import settings
@@ -241,3 +243,132 @@ def send_staff_invite_notification_task(self, user_id, hotel_id, role, resolved_
             'user_id': user_id, 'hotel_id': hotel_id,
             'role': role, 'resolved_channels': list(skip),
         })
+
+
+# ---------------------------------------------------------------------------
+# Orphaned content-image cleanup
+# ---------------------------------------------------------------------------
+
+_IMG_SRC_RE = re.compile(r'<img\b[^>]*\bsrc=["\']([^"\']*)["\']', re.IGNORECASE)
+
+
+def _list_storage_files(storage, prefix):
+    """Recursively list all file paths under *prefix* in *storage*."""
+    try:
+        dirs, files = storage.listdir(prefix)
+    except (FileNotFoundError, OSError):
+        return []
+    result = [f'{prefix}/{f}' for f in files if f]
+    for d in dirs:
+        if d:
+            result.extend(_list_storage_files(storage, f'{prefix}/{d}'))
+    return result
+
+
+def _url_to_content_path(url):
+    """Extract the ``content/…`` storage path from an image URL.
+
+    Works for both local (``/media/content/…``) and CDN
+    (``https://cdn.example.com/content/…``) URLs.
+    """
+    try:
+        path = urlparse(url).path
+    except Exception:
+        path = url
+    marker = 'content/'
+    idx = path.find(marker)
+    if idx == -1:
+        return None
+    return path[idx:]
+
+
+def cleanup_orphaned_content_images(min_age_hours=24, dry_run=False):
+    """Delete ``content/*`` files not referenced in any model HTML field.
+
+    Args:
+        min_age_hours: Skip files younger than this (avoids racing with
+            editors that upload before saving the form).
+        dry_run: If True, log what *would* be deleted but don't touch storage.
+
+    Returns:
+        ``(deleted_count, total_scanned)`` tuple.
+    """
+    from django.core.files.storage import default_storage
+
+    from .models import Department, Event, Experience, Hotel, HotelInfoSection
+
+    # 1. List every file under content/
+    stored = _list_storage_files(default_storage, 'content')
+    if not stored:
+        return (0, 0)
+
+    # 2. Filter to files older than min_age_hours
+    cutoff = timezone.now() - timedelta(hours=min_age_hours)
+    candidates = []
+    for path in stored:
+        try:
+            modified = default_storage.get_modified_time(path)
+            if timezone.is_naive(modified):
+                modified = timezone.make_aware(modified)
+            if modified < cutoff:
+                candidates.append(path)
+        except Exception:
+            # Can't determine age → don't delete
+            continue
+
+    if not candidates:
+        return (0, len(stored))
+
+    # 3. Collect every content/* path referenced in HTML fields
+    referenced = set()
+    html_sources = [
+        Hotel.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        Department.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        Experience.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        Event.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        HotelInfoSection.objects.filter(body__contains='<img').values_list(
+            'body', flat=True,
+        ),
+    ]
+    for qs in html_sources:
+        for html in qs.iterator():
+            if not html:
+                continue
+            for m in _IMG_SRC_RE.finditer(html):
+                sp = _url_to_content_path(m.group(1))
+                if sp:
+                    referenced.add(sp)
+
+    # 4. Delete orphans
+    orphaned = [p for p in candidates if p not in referenced]
+    deleted = 0
+    for path in orphaned:
+        if dry_run:
+            logger.info('[DRY RUN] Would delete: %s', path)
+        else:
+            try:
+                default_storage.delete(path)
+                deleted += 1
+            except Exception:
+                logger.warning('Failed to delete orphaned content image: %s', path)
+
+    return (len(orphaned) if dry_run else deleted, len(stored))
+
+
+@shared_task
+def cleanup_orphaned_content_images_task():
+    """Runs weekly. Deletes content/* images not referenced in any HTML field."""
+    deleted, total = cleanup_orphaned_content_images(min_age_hours=24)
+    if deleted:
+        logger.info(
+            'Deleted %d orphaned content images (%d total scanned)',
+            deleted, total,
+        )

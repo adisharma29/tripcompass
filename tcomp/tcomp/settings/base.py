@@ -255,6 +255,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'concierge.tasks.expire_top_deals_task',
         'schedule': 5 * 60,  # every 5 minutes
     },
+    'cleanup-orphaned-content-images': {
+        'task': 'concierge.tasks.cleanup_orphaned_content_images_task',
+        'schedule': 7 * 24 * 60 * 60,  # weekly
+    },
 }
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_REJECT_ON_WORKER_LOST = True

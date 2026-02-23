@@ -116,6 +116,9 @@ urlpatterns = [
     path('hotels/<slug:hotel_slug>/admin/info-sections/<int:pk>/',
          views.HotelInfoSectionViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'delete': 'destroy'}),
          name='admin-info-section-detail'),
+    path('hotels/<slug:hotel_slug>/admin/content-images/',
+         views.ContentImageUpload.as_view(),
+         name='admin-content-image-upload'),
 
     path('hotels/<slug:hotel_slug>/admin/qr-codes/',
          views.QRCodeViewSet.as_view({'get': 'list', 'post': 'create'}),

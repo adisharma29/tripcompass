@@ -14,11 +14,53 @@ from .validators import validate_image_upload
 
 ALLOWED_HTML_TAGS = [
     'p', 'br', 'strong', 'em', 'u', 's', 'h2', 'h3',
-    'ul', 'ol', 'li', 'blockquote', 'hr', 'a',
+    'ul', 'ol', 'li', 'blockquote', 'hr', 'a', 'img',
 ]
 ALLOWED_HTML_ATTRIBUTES = {
     'a': ['href'],
+    'img': ['src', 'alt', 'width', 'height'],
 }
+
+
+def _get_allowed_img_hosts():
+    """Build the set of hostnames that guest-page CSP img-src allows."""
+    from urllib.parse import urlparse
+    from django.conf import settings
+    hosts = set()
+    # The storage backend's own domain (R2 CDN in prod, localhost in dev)
+    media_url = getattr(settings, 'MEDIA_URL', '')
+    parsed = urlparse(media_url)
+    if parsed.hostname:
+        hosts.add(parsed.hostname)
+    # Explicit R2 public bucket
+    custom = getattr(settings, 'AWS_S3_CUSTOM_DOMAIN', None)
+    if custom:
+        hosts.add(custom)
+    # API's own domain serves /media/ in dev
+    for allowed in getattr(settings, 'ALLOWED_HOSTS', []):
+        if allowed and allowed != '*':
+            hosts.add(allowed.lstrip('.'))
+    return hosts
+
+
+def _sanitize_img_src(html):
+    """Remove <img> tags whose src is not from an allowed host (matches guest CSP img-src)."""
+    allowed = _get_allowed_img_hosts()
+
+    def _check(match):
+        from urllib.parse import urlparse
+        src_match = re.search(r'src=["\']([^"\']*)["\']', match.group(0))
+        if not src_match:
+            return ''
+        src = src_match.group(1)
+        if not src.lower().startswith(('https://', 'http://')):
+            return ''
+        host = urlparse(src).hostname or ''
+        if not any(host == h or host.endswith('.' + h) for h in allowed):
+            return ''
+        return match.group(0)
+
+    return re.sub(r'<img\b[^>]*/?>', _check, html)
 
 
 def _clean_image(file):
@@ -124,7 +166,7 @@ class HotelInfoSectionSerializer(serializers.ModelSerializer):
 
     def validate_body(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
         return value
 
 
@@ -298,7 +340,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
         return value
 
     _VALID_DAY_KEYS = frozenset([
@@ -433,7 +475,7 @@ class ExperienceSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
         return value
 
     def validate_deal_ends_at(self, value):
@@ -570,7 +612,7 @@ class EventSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True)
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
         return value
 
     def validate(self, data):

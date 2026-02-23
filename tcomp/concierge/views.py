@@ -833,6 +833,47 @@ class InfoSectionBulkReorder(HotelScopedMixin, APIView):
 
 
 # ---------------------------------------------------------------------------
+# Content image upload (for rich text editors — model-less)
+# Files are not reference-tracked in DB. Orphaned images are cleaned up
+# weekly by cleanup_orphaned_content_images_task (see tasks.py).
+# ---------------------------------------------------------------------------
+
+class ContentImageUpload(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, **kwargs):
+        import uuid
+        from django.core.files.base import ContentFile
+        from django.core.files.storage import default_storage
+
+        file = request.FILES.get('image')
+        if not file:
+            return Response(
+                {'detail': 'No image provided.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            from .validators import validate_image_upload
+            buf, fmt = validate_image_upload(file)
+        except Exception as e:
+            return Response(
+                {'detail': str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ext = 'png' if fmt == 'png' else 'jpg'
+        filename = f'{uuid.uuid4().hex[:12]}.{ext}'
+        hotel = self.get_hotel()
+        path = default_storage.save(
+            f'content/{hotel.slug}/{filename}',
+            ContentFile(buf.getvalue()),
+        )
+        image_url = default_storage.url(path)
+        if image_url.startswith('/'):
+            image_url = request.build_absolute_uri(image_url)
+        return Response({'url': image_url})
+
+
+# ---------------------------------------------------------------------------
 # Experience gallery images
 # ---------------------------------------------------------------------------
 
