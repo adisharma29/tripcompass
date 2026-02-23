@@ -5,12 +5,12 @@ import logging
 from datetime import timedelta
 
 from django.conf import settings
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.db.models import Count, Max, Prefetch
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import generics, status, viewsets
+from rest_framework import generics, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -19,9 +19,9 @@ from rest_framework.views import APIView
 from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
-    ContentStatus, Department, Event, Experience, ExperienceImage, GuestStay,
-    Hotel, HotelInfoSection, HotelMembership, Notification, PushSubscription,
-    QRCode, ServiceRequest, RequestActivity,
+    BookingEmailTemplate, ContentStatus, Department, Event, Experience,
+    ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
+    Notification, PushSubscription, QRCode, ServiceRequest, RequestActivity,
 )
 from .permissions import (
     CanAccessRequestObject, CanAccessRequestObjectByLookup,
@@ -29,13 +29,12 @@ from .permissions import (
     IsStayOwner, IsSuperAdmin,
 )
 from .serializers import (
-    DashboardStatsSerializer, DepartmentPublicSerializer,
-    DepartmentSerializer, EventPublicSerializer, EventSerializer,
-    ExperienceImageSerializer,
+    BookingEmailTemplateSerializer, DashboardStatsSerializer,
+    DepartmentPublicSerializer, DepartmentSerializer,
+    EventPublicSerializer, EventSerializer, ExperienceImageSerializer,
     ExperiencePublicSerializer, ExperienceSerializer, TopDealSerializer,
-    GuestStaySerializer,
-    GuestStayUpdateSerializer, HotelInfoSectionSerializer,
-    HotelPublicSerializer,
+    GuestStaySerializer, GuestStayUpdateSerializer,
+    HotelInfoSectionSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
     MemberSerializer, NotificationSerializer,
     PushSubscriptionSerializer, QRCodeSerializer,
@@ -952,7 +951,14 @@ class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
             stay_count=Count('guest_stays'),
         )
 
+    def _reject_booking_placement(self, serializer):
+        if serializer.validated_data.get('placement') == 'BOOKING':
+            raise serializers.ValidationError(
+                {'placement': 'BOOKING QR codes are managed from the Booking Email page.'}
+            )
+
     def perform_create(self, serializer):
+        self._reject_booking_placement(serializer)
         hotel = self.get_hotel()
         qr = generate_qr(
             hotel=hotel,
@@ -962,6 +968,80 @@ class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
             created_by=self.request.user,
         )
         serializer.instance = qr
+
+    def perform_update(self, serializer):
+        self._reject_booking_placement(serializer)
+        # Also block editing existing BOOKING QR codes via generic endpoint
+        if serializer.instance.placement == 'BOOKING':
+            raise serializers.ValidationError(
+                {'placement': 'BOOKING QR codes are managed from the Booking Email page.'}
+            )
+        serializer.save()
+
+
+class BookingEmailTemplateView(HotelScopedMixin, APIView):
+    """GET: auto-create template + BOOKING QR. PATCH: update template fields."""
+    permission_classes = [IsAdminOrAbove]
+
+    def _get_or_create_template(self, hotel, user):
+        """Atomic auto-create of template + BOOKING QR. Idempotent."""
+        with transaction.atomic():
+            template, _created = BookingEmailTemplate.objects.select_for_update().get_or_create(
+                hotel=hotel,
+                defaults={
+                    'subject': f'Welcome to {hotel.name} \u2014 Your Digital Concierge',
+                    'heading': 'Your Digital Concierge Awaits',
+                    'body': (
+                        "We're excited to welcome you! Scan the QR code below "
+                        "or tap the button to explore everything we have to offer "
+                        "\u2014 from dining and spa experiences to room service requests."
+                    ),
+                    'features': [
+                        'Browse curated experiences',
+                        'Make service requests',
+                        'Get real-time updates',
+                    ],
+                    'cta_text': 'Explore Our Services',
+                    'footer_text': '',
+                },
+            )
+            if not template.qr_code:
+                existing_qr = QRCode.objects.filter(
+                    hotel=hotel, placement='BOOKING',
+                ).first()
+                if existing_qr:
+                    template.qr_code = existing_qr
+                else:
+                    try:
+                        template.qr_code = generate_qr(
+                            hotel=hotel,
+                            label='Booking Email',
+                            placement='BOOKING',
+                            department=None,
+                            created_by=user,
+                        )
+                    except IntegrityError:
+                        template.qr_code = QRCode.objects.get(
+                            hotel=hotel, placement='BOOKING',
+                        )
+                template.save(update_fields=['qr_code'])
+        return template
+
+    def get(self, request, hotel_slug):
+        hotel = self.get_hotel()
+        template = self._get_or_create_template(hotel, request.user)
+        serializer = BookingEmailTemplateSerializer(template, context={'request': request})
+        return Response(serializer.data)
+
+    def patch(self, request, hotel_slug):
+        hotel = self.get_hotel()
+        template = self._get_or_create_template(hotel, request.user)
+        serializer = BookingEmailTemplateSerializer(
+            template, data=request.data, partial=True, context={'request': request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
 
 # ---------------------------------------------------------------------------

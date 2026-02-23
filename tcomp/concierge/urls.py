@@ -126,6 +126,9 @@ urlpatterns = [
     path('hotels/<slug:hotel_slug>/admin/qr-codes/<int:pk>/',
          views.QRCodeViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'delete': 'destroy'}),
          name='admin-qr-detail'),
+    path('hotels/<slug:hotel_slug>/admin/booking-email/',
+         views.BookingEmailTemplateView.as_view(),
+         name='admin-booking-email'),
 
     # --- SuperAdmin ---
     path('hotels/<slug:hotel_slug>/admin/members/',

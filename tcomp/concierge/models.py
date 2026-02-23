@@ -8,6 +8,7 @@ from django.contrib.gis.db import models as gis_models
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -979,6 +980,7 @@ class QRCode(models.Model):
         BAR = 'BAR', 'Bar'
         GYM = 'GYM', 'Gym'
         GARDEN = 'GARDEN', 'Garden'
+        BOOKING = 'BOOKING', 'Booking Email'
         OTHER = 'OTHER', 'Other'
 
     hotel = models.ForeignKey(
@@ -1001,6 +1003,15 @@ class QRCode(models.Model):
         null=True, related_name='created_qr_codes',
     )
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['hotel'],
+                condition=Q(placement='BOOKING'),
+                name='unique_booking_qr_per_hotel',
+            ),
+        ]
 
     def save(self, *args, **kwargs):
         if not self.code:
@@ -1053,3 +1064,75 @@ class HotelInfoSection(models.Model):
 
     def __str__(self):
         return f'{self.title} ({self.hotel.name})'
+
+
+def _hex_color_validator(value):
+    """Allow empty string or valid #RRGGBB hex color."""
+    import re
+    from django.core.exceptions import ValidationError
+    if value and not re.match(r'^#[0-9a-fA-F]{6}$', value):
+        raise ValidationError('Must be a valid hex color (e.g. #FF5733) or empty.')
+
+
+class BookingEmailTemplate(models.Model):
+    """One per hotel. Stores customizable text for the post-booking welcome email."""
+    hotel = models.OneToOneField(
+        Hotel, on_delete=models.CASCADE, related_name='booking_email_template',
+    )
+    qr_code = models.ForeignKey(
+        QRCode, on_delete=models.SET_NULL, null=True, blank=True,
+        help_text='Auto-created BOOKING QR code. Links to hotel landing page.',
+    )
+    subject = models.CharField(max_length=200, blank=True)
+    heading = models.CharField(max_length=200, blank=True)
+    body = models.TextField(blank=True, help_text='Welcome message paragraph(s)')
+    features = models.JSONField(default=list, blank=True, help_text='List of feature highlight strings')
+    cta_text = models.CharField(max_length=100, blank=True)
+    footer_text = models.CharField(max_length=500, blank=True)
+    primary_color = models.CharField(
+        max_length=7, blank=True, default='',
+        validators=[_hex_color_validator],
+        help_text='Override hotel primary color for this email. Empty = use hotel default.',
+    )
+    accent_color = models.CharField(
+        max_length=7, blank=True, default='',
+        validators=[_hex_color_validator],
+        help_text='Override hotel accent color for this email. Empty = use hotel default.',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Booking Email Template'
+
+    def clean(self):
+        import re
+        from django.core.exceptions import ValidationError
+        if self.qr_code_id:
+            qr = self.qr_code
+            if qr.hotel_id != self.hotel_id:
+                raise ValidationError({'qr_code': 'QR code must belong to the same hotel.'})
+            if qr.placement != 'BOOKING':
+                raise ValidationError({'qr_code': 'Only BOOKING QR codes can be linked.'})
+        errors = {}
+        for field in ('primary_color', 'accent_color'):
+            val = getattr(self, field)
+            if val and not re.match(r'^#[0-9a-fA-F]{6}$', val):
+                errors[field] = 'Must be a valid hex color (e.g. #FF5733) or empty.'
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        import re
+        from django.core.exceptions import ValidationError
+        errors = {}
+        for field in ('primary_color', 'accent_color'):
+            val = getattr(self, field)
+            if val and not re.match(r'^#[0-9a-fA-F]{6}$', val):
+                errors[field] = 'Must be a valid hex color (e.g. #FF5733) or empty.'
+        if errors:
+            raise ValidationError(errors)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'Booking email — {self.hotel.name}'

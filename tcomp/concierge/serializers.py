@@ -9,6 +9,7 @@ from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
     ExperienceImage, Event, GuestStay, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode, HotelInfoSection,
+    BookingEmailTemplate,
 )
 from .validators import validate_image_upload
 
@@ -1250,3 +1251,53 @@ class DashboardStatsSerializer(serializers.Serializer):
     conversion_rate = serializers.FloatField()
     by_department = serializers.ListField()
     setup = SetupFlagsSerializer()
+
+
+class BookingEmailTemplateSerializer(serializers.ModelSerializer):
+    qr_code = QRCodeSerializer(read_only=True)
+    hotel_context = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BookingEmailTemplate
+        fields = [
+            'id', 'subject', 'heading', 'body', 'features',
+            'cta_text', 'footer_text', 'primary_color', 'accent_color',
+            'qr_code', 'hotel_context', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'qr_code', 'hotel_context', 'created_at', 'updated_at']
+
+    def get_hotel_context(self, obj):
+        hotel = obj.hotel
+        request = self.context.get('request')
+        logo_url = None
+        if hotel.logo:
+            logo_url = request.build_absolute_uri(hotel.logo.url) if request else hotel.logo.url
+        return {
+            'name': hotel.name,
+            'logo': logo_url,
+            'primary_color': hotel.primary_color,
+            'secondary_color': hotel.secondary_color,
+            'accent_color': hotel.accent_color,
+        }
+
+    def validate_features(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError('Must be a list.')
+        if len(value) > 6:
+            raise serializers.ValidationError('Maximum 6 features allowed.')
+        for item in value:
+            if not isinstance(item, str):
+                raise serializers.ValidationError('Each feature must be a string.')
+        return value
+
+    def _validate_hex_color(self, value):
+        import re
+        if value and not re.match(r'^#[0-9a-fA-F]{6}$', value):
+            raise serializers.ValidationError('Must be a valid hex color (e.g. #FF5733) or empty.')
+        return value
+
+    def validate_primary_color(self, value):
+        return self._validate_hex_color(value)
+
+    def validate_accent_color(self, value):
+        return self._validate_hex_color(value)
