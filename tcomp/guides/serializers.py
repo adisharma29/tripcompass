@@ -40,6 +40,7 @@ class DestinationListSerializer(serializers.ModelSerializer):
 
 class DestinationDetailSerializer(serializers.ModelSerializer):
     moods = MoodSerializer(many=True, read_only=True)
+    linked_hotels = serializers.SerializerMethodField()
 
     class Meta:
         model = Destination
@@ -50,7 +51,14 @@ class DestinationDetailSerializer(serializers.ModelSerializer):
             'bounds_sw_lng', 'bounds_sw_lat',
             'bounds_ne_lng', 'bounds_ne_lat',
             'background_color', 'text_color',
-            'moods',
+            'moods', 'linked_hotels',
+        ]
+
+    def get_linked_hotels(self, obj):
+        return [
+            {'slug': slug, 'name': name}
+            for slug, name in obj.hotels.filter(is_active=True)
+                .values_list('slug', 'name').order_by('name')
         ]
 
 

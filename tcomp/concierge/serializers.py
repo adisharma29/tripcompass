@@ -174,6 +174,9 @@ class HotelInfoSectionSerializer(serializers.ModelSerializer):
 class HotelPublicSerializer(serializers.ModelSerializer):
     departments = DepartmentPublicSerializer(many=True, read_only=True)
     info_sections = HotelInfoSectionPublicSerializer(many=True, read_only=True)
+    destination_slug = serializers.SlugRelatedField(
+        source='destination', slug_field='slug', read_only=True,
+    )
 
     class Meta:
         model = Hotel
@@ -187,9 +190,26 @@ class HotelPublicSerializer(serializers.ModelSerializer):
             'instagram_url', 'facebook_url', 'twitter_url', 'whatsapp_number',
             # Footer & Legal
             'footer_text', 'terms_url', 'privacy_url',
+            # Explore tab
+            'destination_slug',
             # Relations
             'departments', 'info_sections',
         ]
+
+
+class _DestinationSlugField(serializers.SlugRelatedField):
+    """Lazy-loaded queryset to avoid circular import with guides app.
+    Includes the hotel's current destination even if unpublished,
+    so unrelated settings edits don't 400."""
+    def get_queryset(self):
+        from guides.models import Destination
+        qs = Destination.objects.filter(is_published=True)
+        # If updating an existing hotel, also allow its current destination
+        if self.parent and self.parent.instance:
+            current = self.parent.instance.destination_id
+            if current:
+                qs = qs | Destination.objects.filter(pk=current)
+        return qs.distinct()
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +220,10 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
     # Write-only flags to clear image fields via multipart or JSON
     favicon_clear = serializers.BooleanField(write_only=True, required=False, default=False)
     og_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    destination_slug = _DestinationSlugField(
+        source='destination', slug_field='slug',
+        required=False, allow_null=True,
+    )
 
     class Meta:
         model = Hotel
@@ -219,6 +243,8 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'instagram_url', 'facebook_url', 'twitter_url', 'whatsapp_number',
             # Footer & Legal
             'footer_text', 'terms_url', 'privacy_url',
+            # Explore tab
+            'destination_slug',
         ]
         read_only_fields = ['settings_configured']
 

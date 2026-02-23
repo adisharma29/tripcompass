@@ -133,6 +133,13 @@ class Hotel(models.Model):
         help_text='Default hours before event start when bookings close. 0 = no cutoff.',
     )
 
+    # --- Explore Tab (fieldguide destination link) ---
+    destination = models.ForeignKey(
+        'guides.Destination', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='hotels',
+        help_text='Linked fieldguide destination for Explore tab',
+    )
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -218,6 +225,20 @@ class Department(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # Slugs reserved for frontend route segments
+    RESERVED_SLUGS = frozenset({
+        'explore', 'events', 'request', 'requests',
+        'confirmation', 'verify', 'api', 'manifest-json',
+    })
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        super().clean()
+        if self.slug and self.slug.lower() in self.RESERVED_SLUGS:
+            raise ValidationError(
+                {'slug': f'"{self.slug}" is a reserved word and cannot be used as a department slug.'}
+            )
+
     def save(self, *args, **kwargs):
         # Keep is_active in sync with status (dual-write)
         self.is_active = self.status == ContentStatus.PUBLISHED
@@ -225,7 +246,10 @@ class Department(models.Model):
             base = slugify(self.name) or 'department'
             slug = base[:100]
             counter = 1
-            while Department.objects.filter(hotel=self.hotel, slug=slug).exclude(pk=self.pk).exists():
+            while (
+                slug.lower() in self.RESERVED_SLUGS
+                or Department.objects.filter(hotel=self.hotel, slug=slug).exclude(pk=self.pk).exists()
+            ):
                 suffix = f'-{counter}'
                 slug = f'{base[:100 - len(suffix)]}{suffix}'
                 counter += 1
