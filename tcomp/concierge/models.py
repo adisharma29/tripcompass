@@ -65,11 +65,11 @@ class Hotel(models.Model):
     class EscalationChannel(models.TextChoices):
         NONE = 'NONE', 'None'
         EMAIL = 'EMAIL', 'Email'
-        SMS = 'SMS', 'SMS'
-        EMAIL_SMS = 'EMAIL_SMS', 'Email + SMS'
+        WHATSAPP = 'WHATSAPP', 'WhatsApp'
+        EMAIL_WHATSAPP = 'EMAIL_WHATSAPP', 'Email + WhatsApp'
 
     escalation_fallback_channel = models.CharField(
-        max_length=10,
+        max_length=14,
         choices=EscalationChannel.choices,
         default=EscalationChannel.NONE,
     )
@@ -209,7 +209,37 @@ class Department(models.Model):
     slug = models.SlugField(max_length=100)
     description = models.TextField(blank=True)
     photo = models.ImageField(upload_to='department_photos/', blank=True)
-    icon = models.ImageField(upload_to='department_icons/', blank=True)
+    ALLOWED_DEPARTMENT_ICONS = frozenset({
+        # Dining
+        'utensils-crossed', 'coffee', 'wine', 'beer', 'pizza', 'cake',
+        'chef-hat', 'cup-soda', 'ice-cream-cone', 'salad', 'soup',
+        # Wellness / Spa
+        'waves', 'droplets', 'flower-2', 'heart-pulse', 'bath', 'flame',
+        # Activities / Tours
+        'mountain', 'bike', 'tent', 'compass', 'map', 'camera',
+        'binoculars', 'footprints', 'trees', 'sailboat', 'fish',
+        # Transport
+        'car', 'bus', 'plane', 'ship', 'train-front',
+        # Fitness
+        'dumbbell', 'trophy',
+        # Accommodation
+        'bed-double', 'key', 'door-open', 'lamp',
+        # Services
+        'concierge-bell', 'phone', 'mail', 'printer', 'shirt', 'scissors',
+        'briefcase', 'gift', 'ticket', 'calendar-days', 'clock',
+        # Entertainment
+        'music', 'tv', 'gamepad-2', 'palette', 'book-open',
+        # Shopping
+        'shopping-bag', 'store', 'gem',
+        # Kids / Family
+        'baby', 'dog', 'puzzle',
+        # Nature
+        'sun', 'moon', 'leaf', 'flower',
+        # General
+        'shield-check', 'info', 'map-pin', 'wifi', 'credit-card',
+        'luggage', 'cigarette-off', 'heart', 'star', 'sparkles',
+    })
+    icon = models.CharField(max_length=50, blank=True)
     display_order = models.IntegerField(default=0)
     schedule = models.JSONField(
         default=dict,
@@ -356,6 +386,23 @@ class ExperienceImage(models.Model):
 
     def __str__(self):
         return f'Image {self.id} for {self.experience.name}'
+
+
+class DepartmentImage(models.Model):
+    """Gallery images for a department."""
+    department = models.ForeignKey(
+        Department, on_delete=models.CASCADE, related_name='gallery_images',
+    )
+    image = models.ImageField(upload_to='department_gallery/')
+    alt_text = models.CharField(max_length=255, blank=True)
+    display_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['display_order', 'created_at']
+
+    def __str__(self):
+        return f'Image {self.id} for dept {self.department.name}'
 
 
 class Event(models.Model):
@@ -718,6 +765,23 @@ class Event(models.Model):
 
     def __str__(self):
         return f'{self.name} ({self.hotel.name})'
+
+
+class EventImage(models.Model):
+    """Gallery images for an event."""
+    event = models.ForeignKey(
+        Event, on_delete=models.CASCADE, related_name='gallery_images',
+    )
+    image = models.ImageField(upload_to='event_gallery/')
+    alt_text = models.CharField(max_length=255, blank=True)
+    display_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['display_order', 'created_at']
+
+    def __str__(self):
+        return f'Image {self.id} for event {self.event.name}'
 
 
 class GuestStay(models.Model):

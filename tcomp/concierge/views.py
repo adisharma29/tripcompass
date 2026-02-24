@@ -20,7 +20,8 @@ from rest_framework.views import APIView
 from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
-    BookingEmailTemplate, ContentStatus, Department, Event, Experience,
+    BookingEmailTemplate, ContentStatus, Department, DepartmentImage,
+    Event, EventImage, Experience,
     ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
     Notification, NotificationRoute, PushSubscription, QRCode,
     ServiceRequest, RequestActivity,
@@ -32,8 +33,9 @@ from .permissions import (
 )
 from .serializers import (
     BookingEmailTemplateSerializer, DashboardStatsSerializer,
-    DepartmentPublicSerializer, DepartmentSerializer,
-    EventPublicSerializer, EventSerializer, ExperienceImageSerializer,
+    DepartmentImageSerializer, DepartmentPublicSerializer, DepartmentSerializer,
+    EventImageSerializer, EventPublicSerializer, EventSerializer,
+    ExperienceImageSerializer,
     ExperiencePublicSerializer, ExperienceSerializer, TopDealSerializer,
     GuestStaySerializer, GuestStayUpdateSerializer,
     HotelInfoSectionSerializer, HotelPublicSerializer,
@@ -74,6 +76,7 @@ class HotelPublicDetail(generics.RetrieveAPIView):
             queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
         ),
         'departments__experiences__gallery_images',
+        'departments__gallery_images',
         Prefetch(
             'info_sections',
             queryset=HotelInfoSection.objects.filter(is_visible=True).order_by('display_order', 'id'),
@@ -97,6 +100,7 @@ class DepartmentPublicList(generics.ListAPIView):
                 queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
             ),
             'experiences__gallery_images',
+            'gallery_images',
         )
 
 
@@ -118,6 +122,7 @@ class DepartmentPublicDetail(generics.RetrieveAPIView):
                 queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
             ),
             'experiences__gallery_images',
+            'gallery_images',
         )
 
 
@@ -149,7 +154,7 @@ class EventPublicList(generics.ListAPIView):
             status=ContentStatus.PUBLISHED,
         ).select_related(
             'hotel', 'department', 'experience__department', 'hotel__fallback_department',
-        )
+        ).prefetch_related('gallery_images')
 
         if self.request.query_params.get('featured') == 'true':
             qs = qs.filter(is_featured=True)
@@ -167,11 +172,15 @@ class EventPublicList(generics.ListAPIView):
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
+
         # Sort by next_occurrence so recurring events that started long ago
         # appear in chronological order alongside one-time events.
+        # get_next_occurrence() requires Python-side rrule evaluation — can't be
+        # done in SQL. Cap the working set to prevent abuse on large event lists.
+        MAX_EVENTS = 200
         far_future = timezone.now() + timedelta(days=3650)
         events = sorted(
-            queryset,
+            queryset[:MAX_EVENTS],
             key=lambda e: e.get_next_occurrence() or far_future,
         )
 
@@ -197,7 +206,7 @@ class EventPublicDetail(generics.RetrieveAPIView):
             status=ContentStatus.PUBLISHED,
         ).select_related(
             'hotel', 'department', 'experience__department', 'hotel__fallback_department',
-        )
+        ).prefetch_related('gallery_images')
 
 
 class TopDealsList(generics.ListAPIView):
@@ -611,7 +620,8 @@ class DashboardStats(HotelScopedMixin, APIView):
             department = membership.department
 
         stats = get_dashboard_stats(hotel, department)
-        return Response(stats)
+        serializer = DashboardStatsSerializer(stats)
+        return Response(serializer.data)
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +661,7 @@ class DepartmentViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         return Department.objects.filter(
             hotel=self.get_hotel(),
-        ).prefetch_related('experiences')
+        ).prefetch_related('experiences', 'gallery_images')
 
 
 class ExperienceViewSet(HotelScopedMixin, viewsets.ModelViewSet):
@@ -675,7 +685,7 @@ class EventAdminViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         return [IsAdminOrAbove()]
 
     def get_queryset(self):
-        qs = Event.objects.filter(hotel=self.get_hotel())
+        qs = Event.objects.filter(hotel=self.get_hotel()).prefetch_related('gallery_images')
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -950,6 +960,134 @@ class ExperienceImageReorder(HotelScopedMixin, APIView):
             for idx, img_id in enumerate(ordered_ids):
                 img_map[img_id].display_order = idx
             ExperienceImage.objects.bulk_update(img_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} images reordered.'})
+
+
+# ---------------------------------------------------------------------------
+# Department gallery images
+# ---------------------------------------------------------------------------
+
+class DepartmentImageUpload(HotelScopedMixin, generics.CreateAPIView):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = DepartmentImageSerializer
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        dept = get_object_or_404(
+            Department,
+            hotel=hotel,
+            slug=self.kwargs['dept_slug'],
+        )
+        max_order = dept.gallery_images.aggregate(m=Max('display_order'))['m'] or 0
+        serializer.save(department=dept, display_order=max_order + 1)
+
+
+class DepartmentImageDelete(HotelScopedMixin, generics.DestroyAPIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get_queryset(self):
+        return DepartmentImage.objects.filter(
+            department__hotel=self.get_hotel(),
+        )
+
+
+class DepartmentImageReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            images = DepartmentImage.objects.filter(
+                department__hotel=hotel,
+                department__slug=self.kwargs['dept_slug'],
+                id__in=ordered_ids,
+            )
+            if images.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more image IDs are invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            img_map = {img.id: img for img in images}
+            for idx, img_id in enumerate(ordered_ids):
+                img_map[img_id].display_order = idx
+            DepartmentImage.objects.bulk_update(img_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} images reordered.'})
+
+
+# ---------------------------------------------------------------------------
+# Event gallery images
+# ---------------------------------------------------------------------------
+
+class EventImageUpload(HotelScopedMixin, generics.CreateAPIView):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = EventImageSerializer
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        event = get_object_or_404(
+            Event,
+            pk=self.kwargs['event_id'],
+            hotel=hotel,
+        )
+        max_order = event.gallery_images.aggregate(m=Max('display_order'))['m'] or 0
+        serializer.save(event=event, display_order=max_order + 1)
+
+
+class EventImageDelete(HotelScopedMixin, generics.DestroyAPIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get_queryset(self):
+        return EventImage.objects.filter(
+            event__hotel=self.get_hotel(),
+        )
+
+
+class EventImageReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            images = EventImage.objects.filter(
+                event__hotel=hotel,
+                event__pk=self.kwargs['event_id'],
+                id__in=ordered_ids,
+            )
+            if images.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more image IDs are invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            img_map = {img.id: img for img in images}
+            for idx, img_id in enumerate(ordered_ids):
+                img_map[img_id].display_order = idx
+            EventImage.objects.bulk_update(img_map.values(), ['display_order'])
 
         return Response({'detail': f'{len(ordered_ids)} images reordered.'})
 

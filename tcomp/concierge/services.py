@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import io
 import json
@@ -6,6 +7,7 @@ import random
 import re
 import secrets
 import string
+import zoneinfo
 from datetime import timedelta
 
 import redis as redis_lib
@@ -897,9 +899,15 @@ def get_dashboard_stats(hotel, department=None):
     if department:
         qs = qs.filter(department=department)
 
-    now = timezone.now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_qs = qs.filter(created_at__gte=today_start)
+    # Compute "today" in the hotel's configured timezone (fallback to UTC)
+    try:
+        hotel_tz = zoneinfo.ZoneInfo(hotel.timezone) if hotel.timezone else zoneinfo.ZoneInfo('UTC')
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        hotel_tz = zoneinfo.ZoneInfo('UTC')
+    now_local = timezone.now().astimezone(hotel_tz)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + datetime.timedelta(days=1)
+    today_qs = qs.filter(created_at__gte=today_start, created_at__lt=tomorrow_start)
 
     total = today_qs.count()
     pending = today_qs.filter(status=ServiceRequest.Status.CREATED).count()
@@ -916,6 +924,10 @@ def get_dashboard_stats(hotel, department=None):
 
     setup = {
         'settings_configured': hotel.settings_configured,
+        'settings_partial': bool(
+            hotel.settings_configured
+            and not (hotel.timezone and hotel.whatsapp_number)
+        ),
         'has_departments': hotel.departments.exists(),
         'has_experiences': Experience.objects.filter(department__hotel=hotel).exists(),
         'has_photos': (
@@ -927,6 +939,7 @@ def get_dashboard_stats(hotel, department=None):
         'has_published': hotel.departments.filter(status=ContentStatus.PUBLISHED).exists(),
     }
 
+    # %-d is Linux/macOS only; backend is always Docker Linux.
     return {
         'total_requests': total,
         'pending': pending,
@@ -935,6 +948,10 @@ def get_dashboard_stats(hotel, department=None):
         'conversion_rate': round(conversion_rate, 1),
         'by_department': by_department,
         'setup': setup,
+        'period_label': 'Today',
+        'period_date_display': now_local.strftime('%a, %-d %b'),
+        'period_date': now_local.strftime('%Y-%m-%d'),
+        'period_timezone': str(hotel_tz),
     }
 
 

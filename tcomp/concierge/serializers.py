@@ -7,7 +7,8 @@ from rest_framework import serializers
 
 from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
-    ExperienceImage, Event, GuestStay, ServiceRequest, RequestActivity,
+    ExperienceImage, DepartmentImage, Event, EventImage,
+    GuestStay, ServiceRequest, RequestActivity,
     Notification, NotificationRoute, PushSubscription, QRCode, HotelInfoSection,
     BookingEmailTemplate,
 )
@@ -92,6 +93,26 @@ class ExperienceImageSerializer(serializers.ModelSerializer):
         return _clean_image(value)
 
 
+class DepartmentImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DepartmentImage
+        fields = ['id', 'image', 'alt_text', 'display_order', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def validate_image(self, value):
+        return _clean_image(value)
+
+
+class EventImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EventImage
+        fields = ['id', 'image', 'alt_text', 'display_order', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def validate_image(self, value):
+        return _clean_image(value)
+
+
 # ---------------------------------------------------------------------------
 # Public serializers
 # ---------------------------------------------------------------------------
@@ -131,12 +152,14 @@ class TopDealSerializer(ExperiencePublicSerializer):
 
 class DepartmentPublicSerializer(serializers.ModelSerializer):
     experiences = ExperiencePublicSerializer(many=True, read_only=True)
+    gallery_images = DepartmentImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Department
         fields = [
             'id', 'name', 'slug', 'description', 'photo', 'icon',
             'display_order', 'schedule', 'is_ops', 'experiences',
+            'gallery_images',
         ]
 
 
@@ -250,6 +273,14 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['settings_configured']
 
+    def validate_room_number_pattern(self, value):
+        if value:
+            try:
+                re.compile(value)
+            except re.error:
+                raise serializers.ValidationError('Invalid regex pattern.')
+        return value
+
     def validate_favicon(self, value):
         return _clean_image(value)
 
@@ -349,15 +380,15 @@ class _ExperienceNestedSerializer(serializers.ModelSerializer):
 
 class DepartmentSerializer(serializers.ModelSerializer):
     experiences = _ExperienceNestedSerializer(many=True, read_only=True)
-    icon_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    gallery_images = DepartmentImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Department
         fields = [
-            'id', 'name', 'slug', 'description', 'photo', 'icon', 'icon_clear',
+            'id', 'name', 'slug', 'description', 'photo', 'icon',
             'display_order', 'schedule', 'is_ops', 'is_active',
             'status', 'published_at',
-            'experiences', 'created_at', 'updated_at',
+            'experiences', 'gallery_images', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at']
 
@@ -365,7 +396,9 @@ class DepartmentSerializer(serializers.ModelSerializer):
         return _clean_image(value)
 
     def validate_icon(self, value):
-        return _clean_image(value)
+        if value and value not in Department.ALLOWED_DEPARTMENT_ICONS:
+            raise serializers.ValidationError('Invalid icon key.')
+        return value
 
     def validate_description(self, value):
         if value:
@@ -447,14 +480,9 @@ class DepartmentSerializer(serializers.ModelSerializer):
         new_status = validated_data.get('status')
         if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
-        if validated_data.pop('icon_clear', False):
-            if instance.icon:
-                instance.icon.delete(save=False)
-            setattr(instance, 'icon', '')
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
-        validated_data.pop('icon_clear', None)
         if validated_data.get('status') == ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
@@ -466,12 +494,15 @@ class ExperienceSerializer(serializers.ModelSerializer):
     )
     gallery_images = ExperienceImageSerializer(many=True, read_only=True)
     is_deal_active = serializers.SerializerMethodField()
+    photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
 
     class Meta:
         model = Experience
         fields = [
             'id', 'department', 'name', 'slug', 'description',
-            'photo', 'cover_image', 'price', 'price_display',
+            'photo', 'cover_image', 'photo_clear', 'cover_image_clear',
+            'price', 'price_display',
             'category', 'timing', 'duration', 'capacity',
             'highlights', 'is_active', 'display_order',
             'status', 'published_at',
@@ -542,9 +573,18 @@ class ExperienceSerializer(serializers.ModelSerializer):
         new_status = validated_data.get('status')
         if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
+        # Handle image field clearing
+        for field in ('photo', 'cover_image'):
+            if validated_data.pop(f'{field}_clear', False):
+                file_field = getattr(instance, field)
+                if file_field:
+                    file_field.delete(save=False)
+                setattr(instance, field, '')
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
+        validated_data.pop('photo_clear', None)
+        validated_data.pop('cover_image_clear', None)
         if validated_data.get('status') == ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
@@ -589,6 +629,7 @@ class EventSerializer(serializers.ModelSerializer):
     )
     photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
     cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    gallery_images = EventImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Event
@@ -602,7 +643,7 @@ class EventSerializer(serializers.ModelSerializer):
             'booking_opens_hours', 'booking_closes_hours',
             'is_featured', 'status', 'is_active', 'published_at',
             'auto_expire', 'display_order',
-            'created_at', 'updated_at',
+            'gallery_images', 'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'hotel', 'slug', 'is_active', 'published_at',
@@ -752,6 +793,7 @@ class EventPublicSerializer(serializers.ModelSerializer):
     experience_name = serializers.SerializerMethodField()
     experience_slug = serializers.SerializerMethodField()
     experience_department_slug = serializers.SerializerMethodField()
+    gallery_images = EventImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Event
@@ -765,6 +807,7 @@ class EventPublicSerializer(serializers.ModelSerializer):
             'department',
             'routing_department_slug', 'routing_department_name',
             'experience_name', 'experience_slug', 'experience_department_slug',
+            'gallery_images',
         ]
 
     def get_next_occurrence(self, obj):
@@ -1273,6 +1316,7 @@ class PushSubscriptionSerializer(serializers.ModelSerializer):
 
 class SetupFlagsSerializer(serializers.Serializer):
     settings_configured = serializers.BooleanField()
+    settings_partial = serializers.BooleanField()
     has_departments = serializers.BooleanField()
     has_experiences = serializers.BooleanField()
     has_photos = serializers.BooleanField()
@@ -1289,6 +1333,10 @@ class DashboardStatsSerializer(serializers.Serializer):
     conversion_rate = serializers.FloatField()
     by_department = serializers.ListField()
     setup = SetupFlagsSerializer()
+    period_label = serializers.CharField()
+    period_date_display = serializers.CharField()
+    period_date = serializers.CharField()
+    period_timezone = serializers.CharField()
 
 
 class BookingEmailTemplateSerializer(serializers.ModelSerializer):
