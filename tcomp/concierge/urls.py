@@ -18,6 +18,8 @@ urlpatterns = [
          views.EventPublicList.as_view(), name='event-public-list'),
     path('hotels/<slug:hotel_slug>/events/<slug:event_slug>/',
          views.EventPublicDetail.as_view(), name='event-public-detail'),
+    path('hotels/<slug:hotel_slug>/qr-scan/',
+         views.QRScanView.as_view(), name='qr-scan'),
 
     # --- Guest ---
     path('hotels/<slug:hotel_slug>/requests/',

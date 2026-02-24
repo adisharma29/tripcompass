@@ -3,18 +3,22 @@ import hmac
 import json
 import logging
 import re
+import zoneinfo
 from datetime import timedelta
 
 from django.conf import settings
+from django.core.cache import cache
 from django.db import IntegrityError, models, transaction
-from django.db.models import Count, Max, Prefetch
+from django.db.models import Count, F, Max, Prefetch
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, JSONParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 
 from .filters import ServiceRequestFilter
@@ -23,7 +27,7 @@ from .models import (
     BookingEmailTemplate, ContentStatus, Department, DepartmentImage,
     Event, EventImage, Experience,
     ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
-    Notification, NotificationRoute, PushSubscription, QRCode,
+    Notification, NotificationRoute, PushSubscription, QRCode, QRScanDaily,
     ServiceRequest, RequestActivity,
 )
 from .permissions import (
@@ -231,6 +235,103 @@ class TopDealsList(generics.ListAPIView):
             'gallery_images',
         ).order_by(
             models.F('deal_ends_at').asc(nulls_last=True), 'name',
+        )
+
+
+# ---------------------------------------------------------------------------
+# QR scan tracking (public, pre-auth)
+# ---------------------------------------------------------------------------
+
+def _get_hotel_tz(hotel):
+    """Return the hotel's ZoneInfo, falling back to UTC on bad/empty values."""
+    try:
+        return zoneinfo.ZoneInfo(hotel.timezone) if hotel.timezone else zoneinfo.ZoneInfo('UTC')
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        return zoneinfo.ZoneInfo('UTC')
+
+
+def _record_scan(qr, vid, hotel):
+    """Dedup via Redis and atomically increment the daily aggregate row."""
+    hotel_tz = _get_hotel_tz(hotel)
+    now_local = timezone.now().astimezone(hotel_tz)
+    today = now_local.date()
+    hour = now_local.hour
+
+    hour_key = f'qrscan:{qr.id}:{vid}:{today}:{hour}'
+    day_key = f'qrscan:uv:{qr.id}:{vid}:{today}'
+
+    is_new_visitor = True
+    try:
+        if cache.get(hour_key):
+            return
+        cache.set(hour_key, 1, timeout=3600)
+
+        is_new_visitor = not cache.get(day_key)
+        if is_new_visitor:
+            cache.set(day_key, 1, timeout=86400)
+    except Exception:
+        # Redis down — fall through to DB write without dedup.
+        is_new_visitor = True
+
+    try:
+        obj, _created = QRScanDaily.objects.get_or_create(
+            qr_code=qr, date=today,
+        )
+    except IntegrityError:
+        obj = QRScanDaily.objects.get(qr_code=qr, date=today)
+
+    QRScanDaily.objects.filter(pk=obj.pk).update(
+        scan_count=F('scan_count') + 1,
+        unique_visitors=F('unique_visitors') + (1 if is_new_visitor else 0),
+    )
+
+
+class QRScanThrottle(AnonRateThrottle):
+    rate = '300/min'
+    scope = 'qr_scan'
+
+
+class QRScanSerializer(serializers.Serializer):
+    """Accepts both JSON and form-encoded bodies from sendBeacon."""
+    code = serializers.CharField(max_length=40)
+    vid = serializers.CharField(max_length=64, required=False, default='')
+
+
+class QRScanView(APIView):
+    """Record a raw QR code scan. Public, rate-limited, best-effort."""
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [QRScanThrottle]
+    parser_classes = [JSONParser, FormParser]
+
+    def post(self, request, hotel_slug):
+        ser = QRScanSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        code = ser.validated_data['code'].strip()
+        vid = ser.validated_data['vid'].strip()
+        if not code:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        if not vid:
+            vid = f'ip:{self._get_client_ip(request)}'
+
+        try:
+            qr = QRCode.objects.select_related('hotel').get(
+                code=code, hotel__slug=hotel_slug, is_active=True,
+            )
+        except QRCode.DoesNotExist:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        _record_scan(qr, vid, qr.hotel)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @staticmethod
+    def _get_client_ip(request):
+        return (
+            request.META.get('HTTP_CF_CONNECTING_IP')
+            or request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip()
+            or request.META.get('REMOTE_ADDR', '')
         )
 
 

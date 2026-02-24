@@ -13,6 +13,7 @@ from django.db.models import (
     Count,
     F,
     Q,
+    Sum,
     When,
 )
 from django.db.models.functions import (
@@ -26,6 +27,7 @@ from .models import (
     Department,
     ContentStatus,
     GuestStay,
+    QRScanDaily,
     RequestActivity,
     ServiceRequest,
 )
@@ -404,17 +406,17 @@ def get_heatmap_data(hotel, start_dt, end_dt, department=None):
 def get_qr_placement_stats(hotel, start_dt, end_dt):
     """QR code performance by placement (lobby, room, pool, etc.).
 
-    Counts guest sessions (GuestStay) per QR placement, plus
-    how many of those sessions generated at least one request.
+    Merges two data sources:
+    - QRScanDaily: raw scans (pre-verification)
+    - GuestStay: verified sessions + request conversion
     """
-    qs = GuestStay.objects.filter(
-        hotel=hotel,
-        created_at__range=(start_dt, end_dt),
-        qr_code__isnull=False,
-    )
-
-    rows = (
-        qs
+    # Verified sessions from GuestStay
+    verified_rows = (
+        GuestStay.objects.filter(
+            hotel=hotel,
+            created_at__range=(start_dt, end_dt),
+            qr_code__isnull=False,
+        )
         .values('qr_code__placement')
         .annotate(
             sessions=Count('id'),
@@ -427,15 +429,46 @@ def get_qr_placement_stats(hotel, start_dt, end_dt):
         .order_by('-sessions')
     )
 
-    result = []
-    for row in rows:
+    result_map = {}
+    for row in verified_rows:
+        placement = row['qr_code__placement']
         sessions = row['sessions']
         with_req = row['with_requests']
-        result.append({
-            'placement': row['qr_code__placement'],
+        result_map[placement] = {
+            'placement': placement,
             'sessions': sessions,
             'with_requests': with_req,
             'conversion_pct': round(with_req / sessions * 100, 1) if sessions > 0 else 0,
-        })
+            'scans': 0,
+            'unique_visitors': 0,
+        }
 
-    return result
+    # Raw scans from QRScanDaily
+    scan_rows = (
+        QRScanDaily.objects.filter(
+            qr_code__hotel=hotel,
+            date__range=(start_dt.date(), end_dt.date()),
+        )
+        .values('qr_code__placement')
+        .annotate(
+            total_scans=Sum('scan_count'),
+            total_unique=Sum('unique_visitors'),
+        )
+    )
+
+    for row in scan_rows:
+        placement = row['qr_code__placement']
+        if placement in result_map:
+            result_map[placement]['scans'] = row['total_scans']
+            result_map[placement]['unique_visitors'] = row['total_unique']
+        else:
+            result_map[placement] = {
+                'placement': placement,
+                'sessions': 0,
+                'with_requests': 0,
+                'conversion_pct': 0,
+                'scans': row['total_scans'],
+                'unique_visitors': row['total_unique'],
+            }
+
+    return sorted(result_map.values(), key=lambda r: r['scans'], reverse=True)

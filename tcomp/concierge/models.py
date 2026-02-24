@@ -1121,6 +1121,23 @@ class QRCode(models.Model):
         return f'QR {self.code} ({self.hotel.name} - {self.placement})'
 
 
+class QRScanDaily(models.Model):
+    """Daily aggregate of raw QR code scans (pre-verification)."""
+    qr_code = models.ForeignKey(QRCode, on_delete=models.CASCADE, related_name='daily_scans')
+    date = models.DateField()  # Hotel-local date (not UTC)
+    scan_count = models.PositiveIntegerField(default=0)
+    unique_visitors = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        unique_together = ('qr_code', 'date')
+        indexes = [
+            models.Index(fields=['date', 'qr_code']),
+        ]
+
+    def __str__(self):
+        return f'QR {self.qr_code.code} on {self.date}: {self.scan_count} scans'
+
+
 class EscalationHeartbeat(models.Model):
     class HeartbeatStatus(models.TextChoices):
         OK = 'OK', 'OK'
