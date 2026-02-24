@@ -8,7 +8,7 @@ from rest_framework import serializers
 from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
     ExperienceImage, Event, GuestStay, ServiceRequest, RequestActivity,
-    Notification, PushSubscription, QRCode, HotelInfoSection,
+    Notification, NotificationRoute, PushSubscription, QRCode, HotelInfoSection,
     BookingEmailTemplate,
 )
 from .validators import validate_image_upload
@@ -245,6 +245,8 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'footer_text', 'terms_url', 'privacy_url',
             # Explore tab
             'destination_slug',
+            # Notification channels
+            'whatsapp_notifications_enabled', 'email_notifications_enabled',
         ]
         read_only_fields = ['settings_configured']
 
@@ -1327,3 +1329,93 @@ class BookingEmailTemplateSerializer(serializers.ModelSerializer):
 
     def validate_accent_color(self, value):
         return self._validate_hex_color(value)
+
+
+# ---------------------------------------------------------------------------
+# Notification Routes
+# ---------------------------------------------------------------------------
+
+class NotificationRouteSerializer(serializers.ModelSerializer):
+    member_name = serializers.SerializerMethodField()
+    department_name = serializers.SerializerMethodField()
+    experience_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NotificationRoute
+        fields = [
+            'id', 'department', 'experience', 'channel', 'member',
+            'target', 'label', 'is_active',
+            'member_name', 'department_name', 'experience_name',
+            'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']
+
+    def get_member_name(self, obj):
+        if obj.member_id:
+            return obj.member.user.get_full_name() or obj.member.user.phone
+        return None
+
+    def get_department_name(self, obj):
+        return obj.department.name if obj.department_id else None
+
+    def get_experience_name(self, obj):
+        return obj.experience.name if obj.experience_id else None
+
+    def validate_target(self, value):
+        return value.strip()
+
+    def validate(self, data):
+        hotel = self.context['hotel']
+
+        # Department must belong to this hotel
+        department = data.get('department') or (self.instance.department if self.instance else None)
+        if department and department.hotel_id != hotel.id:
+            raise serializers.ValidationError({'department': 'Department must belong to this hotel.'})
+
+        # Experience must belong to the department
+        experience = data.get('experience')
+        if experience is not None and department and experience.department_id != department.id:
+            raise serializers.ValidationError({'experience': 'Experience must belong to the selected department.'})
+
+        # Member must belong to this hotel
+        member = data.get('member')
+        if member and member.hotel_id != hotel.id:
+            raise serializers.ValidationError({'member': 'Team member must belong to this hotel.'})
+
+        # Auto-fill target from member contact info
+        if member:
+            channel = data.get('channel') or (self.instance.channel if self.instance else None)
+            if channel == NotificationRoute.Channel.WHATSAPP:
+                if not member.user.phone:
+                    raise serializers.ValidationError({'member': 'Selected team member has no phone number.'})
+                data['target'] = member.user.phone
+            elif channel == NotificationRoute.Channel.EMAIL:
+                if not member.user.email:
+                    raise serializers.ValidationError({'member': 'Selected team member has no email address.'})
+                data['target'] = member.user.email
+            if not data.get('label'):
+                data['label'] = member.user.get_full_name() or ''
+
+        # Target is required
+        target = data.get('target') or (self.instance.target if self.instance else '')
+        if not target:
+            raise serializers.ValidationError({'target': 'Contact info is required.'})
+
+        # Channel-specific format validation
+        channel = data.get('channel') or (self.instance.channel if self.instance else None)
+        if channel == NotificationRoute.Channel.WHATSAPP:
+            import re
+            digits = re.sub(r'\D', '', target)
+            if len(digits) < 10 or len(digits) > 15:
+                raise serializers.ValidationError(
+                    {'target': 'WhatsApp number must be 10-15 digits (with country code).'}
+                )
+        elif channel == NotificationRoute.Channel.EMAIL:
+            from django.core.validators import validate_email
+            from django.core.exceptions import ValidationError as DjangoValidationError
+            try:
+                validate_email(target)
+            except DjangoValidationError:
+                raise serializers.ValidationError({'target': 'Enter a valid email address.'})
+
+        return data

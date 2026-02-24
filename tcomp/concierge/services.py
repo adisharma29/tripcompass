@@ -730,7 +730,15 @@ def _fire_escalation(request_obj, tier, hotel):
 
     # Step 3: Send notification
     try:
-        notify_department_staff(request_obj.department, request_obj)
+        from .notifications import NotificationEvent, dispatch_notification
+        dispatch_notification(NotificationEvent(
+            event_type='escalation',
+            hotel=hotel,
+            department=request_obj.department,
+            request=request_obj,
+            event_obj=request_obj.event,
+            escalation_tier=tier,
+        ))
         activity.notified_at = timezone.now()
         activity.save(update_fields=['notified_at'])
     except Exception:
@@ -764,8 +772,15 @@ def send_response_due_reminders():
         reminder_sent_at__isnull=True,
     ).select_related('department', 'hotel', 'guest_stay')
 
+    from .notifications import NotificationEvent, dispatch_notification
     for req in overdue:
-        notify_department_staff(req.department, req)
+        dispatch_notification(NotificationEvent(
+            event_type='response_due',
+            hotel=req.hotel,
+            department=req.department,
+            request=req,
+            event_obj=req.event,
+        ))
         req.reminder_sent_at = now
         req.save(update_fields=['reminder_sent_at'])
 

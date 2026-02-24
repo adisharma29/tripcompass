@@ -21,7 +21,8 @@ from .mixins import HotelScopedMixin
 from .models import (
     BookingEmailTemplate, ContentStatus, Department, Event, Experience,
     ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
-    Notification, PushSubscription, QRCode, ServiceRequest, RequestActivity,
+    Notification, NotificationRoute, PushSubscription, QRCode,
+    ServiceRequest, RequestActivity,
 )
 from .permissions import (
     CanAccessRequestObject, CanAccessRequestObjectByLookup,
@@ -36,17 +37,17 @@ from .serializers import (
     GuestStaySerializer, GuestStayUpdateSerializer,
     HotelInfoSectionSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
-    MemberSerializer, NotificationSerializer,
+    MemberSerializer, NotificationRouteSerializer, NotificationSerializer,
     PushSubscriptionSerializer, QRCodeSerializer,
     ServiceRequestCreateSerializer, ServiceRequestDetailSerializer,
     ServiceRequestListSerializer, ServiceRequestUpdateSerializer,
 )
+from .notifications import NotificationEvent, dispatch_notification
 from .services import (
     check_room_rate_limit, check_stay_rate_limit,
     compute_response_due_at, generate_qr,
     get_dashboard_stats, handle_wa_delivery_event,
     is_department_after_hours,
-    notify_after_hours_fallback, notify_department_staff,
     publish_request_event, stream_request_events,
 )
 
@@ -298,14 +299,27 @@ class ServiceRequestCreate(HotelScopedMixin, generics.CreateAPIView):
         )
 
         # Notifications
-        notify_department_staff(req.department, req)
+        dispatch_notification(NotificationEvent(
+            event_type='request.created',
+            hotel=hotel,
+            department=req.department,
+            request=req,
+            event_obj=req.event,
+        ))
 
         # SSE
         publish_request_event(hotel, 'request.created', req)
 
         # After-hours handling
         if req.after_hours and hotel.fallback_department:
-            notify_after_hours_fallback(req)
+            dispatch_notification(NotificationEvent(
+                event_type='after_hours_fallback',
+                hotel=hotel,
+                department=hotel.fallback_department,
+                request=req,
+                event_obj=req.event,
+                extra={'original_department_name': req.department.name},
+            ))
 
         detail_serializer = ServiceRequestDetailSerializer(req)
         return Response(detail_serializer.data, status=status.HTTP_201_CREATED)
@@ -979,6 +993,37 @@ class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         serializer.save()
 
 
+class NotificationRouteViewSet(HotelScopedMixin, viewsets.ModelViewSet):
+    """CRUD for notification routing rules (WhatsApp/Email contacts per department)."""
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = NotificationRouteSerializer
+    pagination_class = None  # Small set per hotel, no pagination needed
+    http_method_names = ['get', 'post', 'patch', 'delete']
+
+    def get_queryset(self):
+        qs = NotificationRoute.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related('department', 'experience', 'member__user').order_by('department__name', 'channel', 'id')
+        dept_id = self.request.query_params.get('department')
+        if dept_id:
+            try:
+                qs = qs.filter(department_id=int(dept_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
+        return qs
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx['hotel'] = self.get_hotel()
+        return ctx
+
+    def perform_create(self, serializer):
+        serializer.save(
+            hotel=self.get_hotel(),
+            created_by=self.request.user,
+        )
+
+
 class BookingEmailTemplateView(HotelScopedMixin, APIView):
     """GET: auto-create template + BOOKING QR. PATCH: update template fields."""
     permission_classes = [IsAdminOrAbove]
@@ -1314,25 +1359,34 @@ class GupshupWAWebhookView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        # Validate HMAC signature
+        # Validate shared-secret header (Gupshup "Include Headers" key-value pair)
         secret = settings.GUPSHUP_WA_WEBHOOK_SECRET
         if not secret:
             logger.error('GUPSHUP_WA_WEBHOOK_SECRET not configured; rejecting webhook')
             return Response(status=status.HTTP_403_FORBIDDEN)
 
-        signature = request.headers.get('X-Gupshup-Signature', '')
-        body = request.body
-        expected = hmac.new(
-            secret.encode(), body, hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(signature, expected):
-            logger.warning('Invalid Gupshup webhook signature')
+        token = request.headers.get('X-Webhook-Secret', '')
+        if not hmac.compare_digest(token, secret):
+            logger.warning('Invalid Gupshup webhook secret header')
             return Response(status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data
+
+        # 1. Existing OTP delivery tracking (matches by gupshup_message_id on OTPCode)
         try:
             handle_wa_delivery_event(payload)
         except Exception:
-            logger.exception('Error processing Gupshup webhook')
+            logger.exception('Error processing Gupshup webhook (OTP handler)')
+
+        # 2. Notification channel handlers (inbound messages + delivery status)
+        from .notifications.webhook import handle_inbound_message, handle_message_event
+        event_type = payload.get('type', '')
+        try:
+            if event_type == 'message':
+                handle_inbound_message(payload)
+            elif event_type == 'message-event':
+                handle_message_event(payload)
+        except Exception:
+            logger.exception('Error processing Gupshup webhook (notification handler)')
 
         return Response(status=status.HTTP_200_OK)

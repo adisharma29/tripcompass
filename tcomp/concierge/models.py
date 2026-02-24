@@ -58,6 +58,10 @@ class Hotel(models.Model):
 
     escalation_enabled = models.BooleanField(default=False)
 
+    # --- Notification channel toggles ---
+    whatsapp_notifications_enabled = models.BooleanField(default=False)
+    email_notifications_enabled = models.BooleanField(default=False)
+
     class EscalationChannel(models.TextChoices):
         NONE = 'NONE', 'None'
         EMAIL = 'EMAIL', 'Email'
@@ -881,6 +885,7 @@ class RequestActivity(models.Model):
     ALLOWED_DETAIL_KEYS = {
         'status_from', 'status_to', 'note_length',
         'assigned_to_id', 'department_id',
+        'channel', 'phone',  # For WhatsApp ack activities
     }
 
     request = models.ForeignKey(
@@ -1160,3 +1165,193 @@ class BookingEmailTemplate(models.Model):
 
     def __str__(self):
         return f'Booking email — {self.hotel.name}'
+
+
+class NotificationRoute(models.Model):
+    """Routes external notifications (WhatsApp, Email) to specific contacts per department/experience."""
+
+    class Channel(models.TextChoices):
+        WHATSAPP = 'WHATSAPP'
+        EMAIL = 'EMAIL'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='notification_routes',
+    )
+    department = models.ForeignKey(
+        Department, on_delete=models.CASCADE, related_name='notification_routes',
+    )
+    experience = models.ForeignKey(
+        Experience, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+        help_text='If set, route only fires for this experience. If null, fires for all requests in the department.',
+    )
+    channel = models.CharField(max_length=20, choices=Channel.choices)
+
+    # Target contact — either linked to a team member or free-text for external contacts
+    member = models.ForeignKey(
+        HotelMembership, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+        help_text='Link to an existing team member. When set, target is auto-derived from member contact info.',
+    )
+    target = models.CharField(
+        max_length=255,
+        help_text='Phone (E.164) or email. Auto-filled from member if linked, or manually entered for external contacts.',
+    )
+    label = models.CharField(max_length=100, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Experience-specific routes: one per (dept, exp, channel, target)
+            models.UniqueConstraint(
+                fields=['department', 'experience', 'channel', 'target'],
+                condition=Q(experience__isnull=False),
+                name='unique_route_with_experience',
+            ),
+            # Department-wide routes: one per (dept, channel, target) where experience IS NULL
+            models.UniqueConstraint(
+                fields=['department', 'channel', 'target'],
+                condition=Q(experience__isnull=True),
+                name='unique_route_dept_wide',
+            ),
+        ]
+
+    def clean(self):
+        """Cross-hotel FK consistency validation."""
+        from django.core.exceptions import ValidationError
+        errors = {}
+        if self.department_id and self.department.hotel_id != self.hotel_id:
+            errors['department'] = 'Department must belong to this hotel.'
+        if self.experience_id and self.experience.department_id != self.department_id:
+            errors['experience'] = 'Experience must belong to the selected department.'
+        if self.member_id and self.member.hotel_id != self.hotel_id:
+            errors['member'] = 'Team member must belong to this hotel.'
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        import re
+        # Normalize phone to digits-only on write (canonical E.164 without +)
+        if self.channel == self.Channel.WHATSAPP:
+            self.target = re.sub(r'\D', '', self.target)
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.channel} → {self.target} ({self.department.name})'
+
+
+class DeliveryRecord(models.Model):
+    """Audit log for channel deliveries (WhatsApp, Email). Push uses existing Notification model."""
+
+    class Status(models.TextChoices):
+        QUEUED = 'QUEUED'
+        SENT = 'SENT'
+        DELIVERED = 'DELIVERED'
+        FAILED = 'FAILED'
+        SKIPPED = 'SKIPPED'
+
+    class MessageType(models.TextChoices):
+        TEMPLATE = 'TEMPLATE'
+        SESSION = 'SESSION'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, db_index=True,
+        help_text='Denormalized for efficient per-hotel log queries without joining through nullable route.',
+    )
+    route = models.ForeignKey(
+        'NotificationRoute', on_delete=models.SET_NULL, null=True,
+    )
+    request = models.ForeignKey(
+        ServiceRequest, on_delete=models.CASCADE, null=True,
+    )
+    channel = models.CharField(max_length=20, choices=NotificationRoute.Channel.choices)
+    target = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=50)
+    message_type = models.CharField(
+        max_length=20, choices=MessageType.choices, default=MessageType.TEMPLATE,
+        help_text='TEMPLATE = paid utility template, SESSION = free session message',
+    )
+    idempotency_key = models.CharField(
+        max_length=200, unique=True, null=True, blank=True,
+        help_text="'{event_type}:{public_id}:{escalation_tier}:{route_id}' — prevents duplicate sends on retries.",
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.QUEUED)
+    provider_message_id = models.CharField(max_length=100, blank=True)
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    acknowledged_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='When recipient tapped a quick-reply button (ack/esc_ack/view).',
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['channel', 'status', '-created_at']),
+            models.Index(
+                fields=['channel', 'provider_message_id'],
+                name='idx_dlvr_chan_provmsg',
+                condition=Q(provider_message_id__gt=''),
+            ),
+            models.Index(
+                fields=['hotel', '-created_at'],
+                name='idx_dlvr_hotel_created',
+            ),
+            models.Index(
+                fields=['hotel', 'channel', 'status', '-created_at'],
+                name='idx_dlvr_hotel_filtered',
+            ),
+            models.Index(
+                fields=['channel', 'target', 'request'],
+                name='idx_dlvr_ack_lookup',
+                condition=Q(acknowledged_at__isnull=True),
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['channel', 'provider_message_id'],
+                name='uniq_chan_provider_msg',
+                condition=Q(provider_message_id__gt=''),
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.channel} → {self.target} [{self.status}]'
+
+
+class WhatsAppServiceWindow(models.Model):
+    """Tracks 24-hour WhatsApp service windows per phone number per hotel.
+
+    A window opens when a staff member sends ANY inbound message to our
+    WhatsApp Business number (including tapping a quick-reply button on
+    a template). While the window is active, we can send free session
+    messages instead of paid utility templates — reducing costs by ~92%.
+    """
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='wa_service_windows',
+    )
+    phone = models.CharField(max_length=20, help_text='Digits-only E.164 without +')
+    last_inbound_at = models.DateTimeField(
+        help_text='When we last received an inbound message from this phone',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('hotel', 'phone')]
+        indexes = [
+            models.Index(fields=['phone', 'last_inbound_at']),
+        ]
+
+    @property
+    def is_active(self):
+        """True if the 24h window is still open (with 5-minute safety margin)."""
+        from datetime import timedelta
+        return self.last_inbound_at > timezone.now() - timedelta(hours=23, minutes=55)
+
+    def __str__(self):
+        return f'WA window: {self.phone} @ {self.hotel.name}'

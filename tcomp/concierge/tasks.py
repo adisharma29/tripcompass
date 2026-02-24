@@ -173,8 +173,14 @@ def cleanup_expired_otps_task():
 
 @shared_task
 def daily_digest_task():
-    """Runs daily. Sends digest notification per hotel."""
-    from .models import Hotel, Notification
+    """Runs daily. Sends digest notification per hotel.
+
+    Routes through dispatch_notification() so PushAdapter creates
+    in-app Notification records (no web push for daily_digest).
+    WhatsApp/Email adapters skip daily_digest events.
+    """
+    from .models import Hotel
+    from .notifications import NotificationEvent, dispatch_notification
     from .services import get_dashboard_stats
 
     for hotel in Hotel.objects.filter(is_active=True):
@@ -182,26 +188,15 @@ def daily_digest_task():
         if stats['total_requests'] == 0:
             continue
 
-        # Notify all admins/superadmins
-        from .models import HotelMembership
-        admins = HotelMembership.objects.filter(
+        dispatch_notification(NotificationEvent(
+            event_type='daily_digest',
             hotel=hotel,
-            is_active=True,
-            role__in=[HotelMembership.Role.ADMIN, HotelMembership.Role.SUPERADMIN],
-        ).select_related('user')
-
-        for m in admins:
-            Notification.objects.create(
-                user=m.user,
-                hotel=hotel,
-                title='Daily Summary',
-                body=(
-                    f"{stats['total_requests']} requests today — "
-                    f"{stats['confirmed']} confirmed, "
-                    f"{stats['pending']} pending"
-                ),
-                notification_type=Notification.NotificationType.DAILY_DIGEST,
-            )
+            extra={
+                'total_requests': stats['total_requests'],
+                'confirmed': stats['confirmed'],
+                'pending': stats['pending'],
+            },
+        ))
 
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=30)
