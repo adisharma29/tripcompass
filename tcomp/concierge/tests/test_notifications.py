@@ -4,6 +4,7 @@ Covers:
 - Dispatcher: fan-out to adapters, per-adapter/per-recipient error isolation
 - PushAdapter: recipient selection, title/body builders, daily_digest, after_hours_fallback
 - WhatsAppAdapter: enabled check, routing, deduplication, service window two-path, idempotency
+- EmailAdapter: enabled check, routing, deduplication, idempotency, Celery task
 - Webhook: ack/esc_ack/view postback handling, delivery status updates, service window open
 - Celery tasks: template send, session send with fallback, response validation, retry logic
 - NotificationRoute API: CRUD, pagination=None, channel-specific target validation
@@ -31,6 +32,7 @@ from concierge.models import (
 )
 from concierge.notifications.base import NotificationEvent
 from concierge.notifications.dispatcher import dispatch_notification
+from concierge.notifications.email import EmailAdapter
 from concierge.notifications.push import PushAdapter
 from concierge.notifications.whatsapp import WhatsAppAdapter
 from users.models import User
@@ -1043,3 +1045,387 @@ class WhatsAppTaskHTTPStatusTest(NotificationSetupMixin, TestCase):
         self.assertEqual(record.status, 'FAILED')
         self.assertEqual(record.message_type, 'SESSION')  # NOT changed to TEMPLATE
         self.assertIn('401', record.error_message)
+
+
+# ---------------------------------------------------------------------------
+# EmailAdapter — enabled check
+# ---------------------------------------------------------------------------
+
+@override_settings(RESEND_API_KEY='test-resend-key')
+class EmailAdapterEnabledTest(NotificationSetupMixin, TestCase):
+
+    def setUp(self):
+        self.adapter = EmailAdapter()
+        self.hotel.email_notifications_enabled = True
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+
+    def tearDown(self):
+        self.hotel.email_notifications_enabled = False
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+
+    def test_enabled_when_hotel_flag_and_api_key(self):
+        self.assertTrue(self.adapter.is_enabled(self.hotel))
+
+    def test_disabled_when_hotel_flag_off(self):
+        self.hotel.email_notifications_enabled = False
+        self.assertFalse(self.adapter.is_enabled(self.hotel))
+
+    @override_settings(RESEND_API_KEY='')
+    def test_disabled_when_no_api_key(self):
+        self.assertFalse(self.adapter.is_enabled(self.hotel))
+
+    def test_skips_non_request_events(self):
+        event = NotificationEvent(
+            event_type='daily_digest', hotel=self.hotel,
+            extra={'total_requests': 5, 'confirmed': 3, 'pending': 2},
+        )
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(recipients, [])
+
+
+# ---------------------------------------------------------------------------
+# EmailAdapter — routing
+# ---------------------------------------------------------------------------
+
+@override_settings(RESEND_API_KEY='test-resend-key')
+class EmailAdapterRoutingTest(NotificationSetupMixin, TestCase):
+
+    def setUp(self):
+        self.adapter = EmailAdapter()
+        self.hotel.email_notifications_enabled = True
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+        self.route = NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='EMAIL', target='staff@hotel.com',
+            label='Staff Email', created_by=self.admin_user,
+        )
+
+    def tearDown(self):
+        self.hotel.email_notifications_enabled = False
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+
+    def test_routes_to_department_wide_route(self):
+        event = self._make_event()
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(len(recipients), 1)
+        self.assertEqual(recipients[0].target, 'staff@hotel.com')
+
+    def test_includes_experience_specific_routes(self):
+        NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            experience=self.experience,
+            channel='EMAIL', target='spa-specialist@hotel.com',
+            label='Spa Specialist', created_by=self.admin_user,
+        )
+        req = self._make_request(experience=self.experience)
+        event = self._make_event(request=req)
+        recipients = self.adapter.get_recipients(event)
+        targets = {r.target for r in recipients}
+        self.assertIn('staff@hotel.com', targets)
+        self.assertIn('spa-specialist@hotel.com', targets)
+
+    def test_deduplicates_same_target(self):
+        """Two routes to the same email → only one recipient."""
+        NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            experience=self.experience,
+            channel='EMAIL', target='staff@hotel.com',
+            label='Same email, different route',
+            created_by=self.admin_user,
+        )
+        req = self._make_request(experience=self.experience)
+        event = self._make_event(request=req)
+        recipients = self.adapter.get_recipients(event)
+        targets = [r.target for r in recipients]
+        self.assertEqual(targets.count('staff@hotel.com'), 1)
+
+    def test_inactive_routes_excluded(self):
+        self.route.is_active = False
+        self.route.save()
+        event = self._make_event()
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(len(recipients), 0)
+        self.route.is_active = True
+        self.route.save()
+
+    def test_ignores_whatsapp_routes(self):
+        """EMAIL adapter should not pick up WHATSAPP routes."""
+        NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='WHATSAPP', target='919876543210',
+            label='WA Route', created_by=self.admin_user,
+        )
+        event = self._make_event()
+        recipients = self.adapter.get_recipients(event)
+        # Only the EMAIL route, not the WA one
+        self.assertEqual(len(recipients), 1)
+        self.assertEqual(recipients[0].channel, 'EMAIL')
+
+
+# ---------------------------------------------------------------------------
+# EmailAdapter — send + idempotency
+# ---------------------------------------------------------------------------
+
+@override_settings(
+    RESEND_API_KEY='test-resend-key',
+    FRONTEND_ORIGIN='http://localhost:6001',
+)
+class EmailAdapterSendTest(NotificationSetupMixin, TestCase):
+
+    def setUp(self):
+        self.adapter = EmailAdapter()
+        self.hotel.email_notifications_enabled = True
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+        self.route = NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='EMAIL', target='staff@hotel.com',
+            label='Staff Email', created_by=self.admin_user,
+        )
+
+    def tearDown(self):
+        self.hotel.email_notifications_enabled = False
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_send_creates_delivery_record_and_queues_task(self, mock_delay):
+        event = self._make_event()
+        record = self.adapter.send(self.route, event)
+
+        self.assertIsInstance(record, DeliveryRecord)
+        self.assertEqual(record.channel, 'EMAIL')
+        self.assertEqual(record.target, 'staff@hotel.com')
+        self.assertEqual(record.status, 'QUEUED')
+        mock_delay.assert_called_once()
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_idempotency_prevents_duplicate(self, mock_delay):
+        event = self._make_event()
+        record1 = self.adapter.send(self.route, event)
+        record2 = self.adapter.send(self.route, event)
+
+        self.assertEqual(record1.id, record2.id)
+        # Task queued only once
+        self.assertEqual(mock_delay.call_count, 1)
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_params_include_hotel_and_request_info(self, mock_delay):
+        event = self._make_event()
+        self.adapter.send(self.route, event)
+
+        call_args = mock_delay.call_args
+        params = call_args[0][1]  # Second positional arg
+        self.assertEqual(params['hotel_name'], 'Test Hotel')
+        self.assertEqual(params['guest_name'], 'Guest User')
+        self.assertEqual(params['room_number'], '101')
+        self.assertEqual(params['department'], 'Spa')
+        self.assertEqual(params['event_type'], 'request.created')
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_after_hours_uses_original_dept_name(self, mock_delay):
+        event = self._make_event(
+            event_type='after_hours_fallback',
+            extra={'original_department_name': 'Pool Bar'},
+        )
+        self.adapter.send(self.route, event)
+
+        params = mock_delay.call_args[0][1]
+        self.assertEqual(params['department'], 'Pool Bar')
+
+
+# ---------------------------------------------------------------------------
+# Cross-channel idempotency
+# ---------------------------------------------------------------------------
+
+@override_settings(
+    GUPSHUP_WA_API_KEY='test-key',
+    GUPSHUP_WA_SOURCE_PHONE='919187551736',
+    GUPSHUP_WA_APP_NAME='refuje',
+    GUPSHUP_WA_STAFF_REQUEST_TEMPLATE_ID='tmpl-req',
+    RESEND_API_KEY='test-resend-key',
+)
+class CrossChannelIdempotencyTest(NotificationSetupMixin, TestCase):
+    """Ensure WA and Email adapters never suppress each other via key collision."""
+
+    def setUp(self):
+        self.hotel.whatsapp_notifications_enabled = True
+        self.hotel.email_notifications_enabled = True
+        self.hotel.save(update_fields=['whatsapp_notifications_enabled', 'email_notifications_enabled'])
+
+    def tearDown(self):
+        self.hotel.email_notifications_enabled = False
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    @patch('concierge.notifications.tasks.send_whatsapp_template_notification.delay')
+    def test_same_route_id_different_channels_both_create_records(
+        self, mock_wa_delay, mock_email_delay,
+    ):
+        """Even if a WA route and EMAIL route have the same DB id,
+        both adapters must create independent DeliveryRecords."""
+        wa_route = NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='WHATSAPP', target='919876543210',
+            label='WA', created_by=self.admin_user,
+        )
+        email_route = NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='EMAIL', target='staff@hotel.com',
+            label='Email', created_by=self.admin_user,
+        )
+
+        event = self._make_event()
+
+        wa_adapter = WhatsAppAdapter()
+        email_adapter = EmailAdapter()
+
+        wa_record = wa_adapter.send(wa_route, event)
+        email_record = email_adapter.send(email_route, event)
+
+        # Both records exist and are distinct
+        self.assertNotEqual(wa_record.id, email_record.id)
+        self.assertEqual(wa_record.channel, 'WHATSAPP')
+        self.assertEqual(email_record.channel, 'EMAIL')
+        self.assertNotEqual(wa_record.idempotency_key, email_record.idempotency_key)
+
+        # Both tasks were queued
+        mock_wa_delay.assert_called_once()
+        mock_email_delay.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Email Celery task
+# ---------------------------------------------------------------------------
+
+@override_settings(
+    RESEND_API_KEY='test-resend-key',
+    RESEND_FROM_EMAIL='Refuje <test@notifications.refuje.com>',
+    FRONTEND_ORIGIN='http://localhost:6001',
+)
+class EmailTaskTest(NotificationSetupMixin, TestCase):
+
+    def _make_record(self):
+        req = self._make_request()
+        return DeliveryRecord.objects.create(
+            hotel=self.hotel,
+            request=req,
+            channel='EMAIL',
+            target='staff@hotel.com',
+            event_type='request.created',
+            status='QUEUED',
+            message_type='TEMPLATE',
+            idempotency_key=f'email:request.created:{req.public_id}:0:test-{uuid.uuid4().hex[:8]}',
+        )
+
+    def _params(self):
+        return {
+            'hotel_name': 'Test Hotel',
+            'primary_color': '#1a1a1a',
+            'guest_name': 'Guest User',
+            'room_number': '101',
+            'department': 'Spa',
+            'subject': 'Deep Tissue Massage',
+            'request_type': 'Booking',
+            'public_id': str(uuid.uuid4()),
+            'event_type': 'request.created',
+            'escalation_tier': None,
+        }
+
+    @patch('resend.Emails.send')
+    def test_send_success(self, mock_send):
+        mock_send.return_value = {'id': 'email-abc-123'}
+
+        record = self._make_record()
+        from concierge.notifications.tasks import send_email_notification
+        send_email_notification(record.id, self._params())
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, 'SENT')
+        self.assertEqual(record.provider_message_id, 'email-abc-123')
+        mock_send.assert_called_once()
+
+        # Verify email params
+        call_kwargs = mock_send.call_args[0][0]
+        self.assertEqual(call_kwargs['to'], ['staff@hotel.com'])
+        self.assertIn('New Request', call_kwargs['subject'])
+
+    @patch('resend.Emails.send')
+    def test_permanent_validation_error_no_retry(self, mock_send):
+        from resend.exceptions import ValidationError
+        mock_send.side_effect = ValidationError('invalid email', 400, 'validation_error')
+
+        record = self._make_record()
+        from concierge.notifications.tasks import send_email_notification
+        # Should NOT raise — permanent errors are caught
+        send_email_notification(record.id, self._params())
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, 'FAILED')
+        self.assertIn('invalid email', record.error_message)
+
+    @patch('resend.Emails.send')
+    def test_permanent_missing_api_key_no_retry(self, mock_send):
+        from resend.exceptions import MissingApiKeyError
+        mock_send.side_effect = MissingApiKeyError('missing key', 401, 'missing_api_key')
+
+        record = self._make_record()
+        from concierge.notifications.tasks import send_email_notification
+        send_email_notification(record.id, self._params())
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, 'FAILED')
+
+    @patch('resend.Emails.send')
+    def test_rate_limit_retries(self, mock_send):
+        from resend.exceptions import RateLimitError
+        mock_send.side_effect = RateLimitError('rate limited', 429, 'rate_limit_exceeded')
+
+        record = self._make_record()
+        from concierge.notifications.tasks import send_email_notification
+
+        with self.assertRaises(RateLimitError):
+            send_email_notification(record.id, self._params())
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, 'FAILED')
+
+    @patch('resend.Emails.send')
+    def test_application_error_retries(self, mock_send):
+        from resend.exceptions import ApplicationError
+        mock_send.side_effect = ApplicationError('server error', 500, 'application_error')
+
+        record = self._make_record()
+        from concierge.notifications.tasks import send_email_notification
+
+        with self.assertRaises(ApplicationError):
+            send_email_notification(record.id, self._params())
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, 'FAILED')
+
+    @patch('resend.Emails.send')
+    def test_escalation_email_subject(self, mock_send):
+        mock_send.return_value = {'id': 'email-esc-123'}
+
+        record = self._make_record()
+        params = self._params()
+        params['event_type'] = 'escalation'
+        params['escalation_tier'] = 2
+
+        from concierge.notifications.tasks import send_email_notification
+        send_email_notification(record.id, params)
+
+        call_kwargs = mock_send.call_args[0][0]
+        self.assertIn('Escalation', call_kwargs['subject'])
+
+    @patch('resend.Emails.send')
+    def test_email_html_contains_dashboard_link(self, mock_send):
+        mock_send.return_value = {'id': 'email-link-123'}
+
+        record = self._make_record()
+        params = self._params()
+
+        from concierge.notifications.tasks import send_email_notification
+        send_email_notification(record.id, params)
+
+        call_kwargs = mock_send.call_args[0][0]
+        self.assertIn(f'/dashboard/requests/{params["public_id"]}', call_kwargs['html'])

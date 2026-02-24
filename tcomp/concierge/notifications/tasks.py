@@ -252,3 +252,129 @@ def send_whatsapp_session_notification(self, delivery_record_id, params):
         record.save(update_fields=["status", "error_message"])
         if isinstance(exc, _TRANSIENT_ERRORS):
             raise self.retry(exc=exc)
+
+
+# ---------------------------------------------------------------------------
+# Email — via Resend API
+# ---------------------------------------------------------------------------
+
+def _build_email_html(params):
+    """Build HTML email body for staff notification."""
+    from html import escape as esc
+
+    hotel_name = esc(params["hotel_name"])
+    color = esc(params["primary_color"])
+    guest = esc(params["guest_name"])
+    room = esc(params["room_number"])
+    dept = esc(params["department"])
+    subject = esc(params["subject"])
+    public_id = esc(params["public_id"])
+    event_type = params["event_type"]
+    tier = params.get("escalation_tier")
+
+    if event_type == "escalation":
+        title = f"Escalation Alert &mdash; {dept}"
+        body = (
+            f"<strong>{guest}</strong> (Room {room}) needs attention.<br/>"
+            f"Department: {dept}<br/>"
+            f"Subject: {subject}<br/>"
+            f"Escalation: Tier {tier or 1}"
+        )
+    elif event_type == "response_due":
+        title = f"Reminder &mdash; {dept}"
+        body = (
+            f"Request from <strong>{guest}</strong> (Room {room}) "
+            f"is awaiting response.<br/>"
+            f"Department: {dept}<br/>"
+            f"Subject: {subject}"
+        )
+    elif event_type == "after_hours_fallback":
+        title = f"After-hours request &mdash; {dept}"
+        body = (
+            f"<strong>{guest}</strong> (Room {room})<br/>"
+            f"Department: {dept}<br/>"
+            f"Subject: {subject}"
+        )
+    else:
+        title = f"New Request &mdash; {dept}"
+        body = (
+            f"<strong>{guest}</strong> (Room {room})<br/>"
+            f"Department: {dept}<br/>"
+            f"Subject: {subject}"
+        )
+
+    dashboard_url = f"{settings.FRONTEND_ORIGIN}/dashboard/requests/{public_id}"
+
+    return f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
+      <h2 style="color: {color}; font-size: 20px; margin-bottom: 8px;">{title}</h2>
+      <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 20px;">
+        {body}
+      </p>
+      <a href="{dashboard_url}"
+         style="display: inline-block; background: {color}; color: #ffffff; text-decoration: none;
+                padding: 12px 28px; border-radius: 6px; font-size: 15px; font-weight: 500;">
+        View Request
+      </a>
+      <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
+      <p style="color: #aaa; font-size: 12px;">Sent by {hotel_name} via Refuje</p>
+    </div>
+    """
+
+
+def _email_subject(params):
+    """Build email subject line."""
+    event_type = params["event_type"]
+    dept = params["department"]
+    hotel = params["hotel_name"]
+    if event_type == "escalation":
+        return f"[{hotel}] Escalation — {dept}"
+    if event_type == "response_due":
+        return f"[{hotel}] Reminder — {dept}"
+    if event_type == "after_hours_fallback":
+        return f"[{hotel}] After-hours — {dept}"
+    return f"[{hotel}] New Request — {dept}"
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def send_email_notification(self, delivery_record_id, params):
+    """Send a staff notification email via Resend API."""
+    import resend
+    from resend.exceptions import (
+        ValidationError, MissingRequiredFieldsError,
+        MissingApiKeyError, InvalidApiKeyError,
+    )
+
+    record = DeliveryRecord.objects.get(id=delivery_record_id)
+
+    resend.api_key = settings.RESEND_API_KEY
+    html = _build_email_html(params)
+    subject_line = _email_subject(params)
+
+    # Known-permanent Resend errors — don't retry.
+    _PERMANENT = (ValidationError, MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError)
+
+    try:
+        response = resend.Emails.send({
+            'from': settings.RESEND_FROM_EMAIL,
+            'to': [record.target],
+            'subject': subject_line,
+            'html': html,
+            'tags': [
+                {'name': 'type', 'value': 'staff_notification'},
+                {'name': 'event', 'value': record.event_type},
+            ],
+        })
+        record.provider_message_id = response.get('id', '')
+        record.status = DeliveryRecord.Status.SENT
+        record.save(update_fields=["provider_message_id", "status"])
+    except _PERMANENT as exc:
+        record.status = DeliveryRecord.Status.FAILED
+        record.error_message = str(exc)[:500]
+        record.save(update_fields=["status", "error_message"])
+    except Exception as exc:
+        record.status = DeliveryRecord.Status.FAILED
+        record.error_message = str(exc)[:500]
+        record.save(update_fields=["status", "error_message"])
+        # Transient (RateLimitError, ApplicationError, network) → retry
+        raise self.retry(exc=exc)

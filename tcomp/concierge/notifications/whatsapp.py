@@ -67,9 +67,9 @@ class WhatsAppAdapter(ChannelAdapter):
             send_whatsapp_template_notification,
         )
 
-        # Idempotency: one delivery per (request, escalation_tier, route)
+        # Idempotency: one delivery per (channel, request, escalation_tier, route)
         idempotency_key = (
-            f"{event.event_type}:{event.request.public_id}"
+            f"wa:{event.event_type}:{event.request.public_id}"
             f":{event.escalation_tier or 0}:{route.id}"
         )
 

@@ -1,16 +1,17 @@
 import logging
 
 from .base import NotificationEvent
+from .email import EmailAdapter
 from .push import PushAdapter
 from .whatsapp import WhatsAppAdapter
 
 logger = logging.getLogger(__name__)
 
 # Registry of all adapters (order = dispatch order).
-# EmailAdapter will be added here once implemented.
 ADAPTERS = [
     PushAdapter(),
     WhatsAppAdapter(),
+    EmailAdapter(),
 ]
 
 

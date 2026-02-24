@@ -1094,7 +1094,12 @@ class BookingEmailTemplateView(HotelScopedMixin, APIView):
 # ---------------------------------------------------------------------------
 
 class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
-    permission_classes = [IsSuperAdmin]
+    # Admin can list members (for member picker in notification routing).
+    # Only SuperAdmin can create (invite) new members.
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAdminOrAbove()]
+        return [IsSuperAdmin()]
 
     def get_serializer_class(self):
         if self.request.method == 'POST':
