@@ -862,6 +862,16 @@ class MemberCreateSerializer(serializers.Serializer):
         queryset=Department.objects.all(), required=False, allow_null=True,
     )
 
+    def validate_phone(self, value):
+        if not value:
+            return value
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
+
     def validate_department(self, value):
         hotel = self.context.get('hotel')
         if value and hotel and value.hotel != hotel:

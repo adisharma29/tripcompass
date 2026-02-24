@@ -297,28 +297,31 @@ def verify_otp(phone, code, hotel=None, qr_code_str=None):
         if not otp:
             raise ValidationError('Invalid or expired OTP.')
 
-        # Check if phone belongs to existing staff user
-        try:
-            user = User.objects.get(phone=phone, user_type='STAFF')
+        # Check if phone belongs to existing staff user.
+        # Try normalized (digits-only) first, fall back to +prefixed
+        # for pre-backfill compatibility.
+        user = (
+            User.objects.filter(phone=phone, user_type='STAFF').first()
+            or User.objects.filter(phone=f'+{phone}', user_type='STAFF').first()
+        )
+        if user:
             if not user.is_active:
                 raise ValidationError('Account is disabled.')
             otp.is_used = True
             otp.save(update_fields=['is_used'])
             return user, None
-        except User.DoesNotExist:
-            pass
 
         # Guest flow — hotel is required (validate before consuming the OTP)
         if not hotel:
             raise ValidationError('hotel_slug is required for non-staff users.')
 
         # Check if existing guest is disabled before consuming the OTP
-        try:
-            existing_guest = User.objects.get(phone=phone, user_type='GUEST')
-            if not existing_guest.is_active:
-                raise ValidationError('Account is disabled.')
-        except User.DoesNotExist:
-            existing_guest = None
+        existing_guest = (
+            User.objects.filter(phone=phone, user_type='GUEST').first()
+            or User.objects.filter(phone=f'+{phone}', user_type='GUEST').first()
+        )
+        if existing_guest and not existing_guest.is_active:
+            raise ValidationError('Account is disabled.')
 
         # Mark as used atomically — concurrent requests block on select_for_update
         # and will see is_used=True when they acquire the lock.
@@ -334,7 +337,10 @@ def verify_otp(phone, code, hotel=None, qr_code_str=None):
             user = User.objects.create_guest_user(phone=phone)
         except IntegrityError:
             # Another request created the user between our get() and create()
-            user = User.objects.get(phone=phone, user_type='GUEST')
+            user = (
+                User.objects.filter(phone=phone, user_type='GUEST').first()
+                or User.objects.get(phone=f'+{phone}', user_type='GUEST')
+            )
 
     # Resolve QR code
     qr = None

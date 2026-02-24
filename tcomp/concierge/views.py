@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 from datetime import timedelta
 
 from django.conf import settings
@@ -1133,10 +1134,15 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
 
         # Fall back to phone lookup (guest accounts have email='')
         if user is None and data['phone']:
+            normalized = re.sub(r'\D', '', data['phone'])
             try:
-                user = User.objects.get(phone=data['phone'])
+                user = User.objects.get(phone=normalized)
             except User.DoesNotExist:
-                pass
+                # Pre-backfill compatibility: try +prefixed format
+                try:
+                    user = User.objects.get(phone=f'+{normalized}')
+                except User.DoesNotExist:
+                    pass
 
         if user is not None:
             # Promote to staff and backfill missing fields

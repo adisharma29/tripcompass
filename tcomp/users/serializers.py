@@ -1,3 +1,6 @@
+import re
+
+from django.db import models
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
@@ -69,12 +72,19 @@ class AuthProfileUpdateSerializer(serializers.ModelSerializer):
     def validate_phone(self, value):
         if not value:
             return value
-        # Check uniqueness (partial unique index allows blank)
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        # Check uniqueness against normalized value (+ pre-backfill +prefixed)
         user = self.instance
-        qs = User.objects.filter(phone=value).exclude(pk=user.pk).exclude(phone='')
+        qs = User.objects.filter(
+            models.Q(phone=digits) | models.Q(phone=f'+{digits}')
+        ).exclude(pk=user.pk).exclude(phone='')
         if qs.exists():
             raise serializers.ValidationError('This phone number is already in use.')
-        return value
+        return digits
 
 
 class OTPSendSerializer(serializers.Serializer):
@@ -82,11 +92,12 @@ class OTPSendSerializer(serializers.Serializer):
     hotel_slug = serializers.CharField(required=False, allow_blank=True, default='')
 
     def validate_phone(self, value):
-        # Basic phone validation
-        cleaned = value.strip().replace(' ', '')
-        if not cleaned:
-            raise serializers.ValidationError('Phone number is required.')
-        return cleaned
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
 
 
 class OTPVerifySerializer(serializers.Serializer):
@@ -94,3 +105,11 @@ class OTPVerifySerializer(serializers.Serializer):
     code = serializers.CharField(max_length=10, write_only=True)
     hotel_slug = serializers.CharField(required=False, allow_blank=True, default='')
     qr_code = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_phone(self, value):
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
