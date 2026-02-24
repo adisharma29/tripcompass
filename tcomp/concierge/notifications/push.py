@@ -29,10 +29,15 @@ class PushAdapter(ChannelAdapter):
                 role__in=[HotelMembership.Role.ADMIN, HotelMembership.Role.SUPERADMIN]
             ).select_related("user")
 
+        admin_q = Q(role__in=[HotelMembership.Role.ADMIN, HotelMembership.Role.SUPERADMIN])
+
+        # If event has notify_department=False, only admins get push (no dept staff)
+        if event.event_obj and not event.event_obj.notify_department:
+            return base.filter(admin_q).select_related("user")
+
         # Standard: STAFF in dept + ADMIN/SUPERADMIN
         return base.filter(
-            Q(department=event.department)
-            | Q(role__in=[HotelMembership.Role.ADMIN, HotelMembership.Role.SUPERADMIN])
+            Q(department=event.department) | admin_q
         ).select_related("user")
 
     def send(self, membership, event):

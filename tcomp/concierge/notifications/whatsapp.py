@@ -36,21 +36,32 @@ class WhatsAppAdapter(ChannelAdapter):
         if not event.is_request_event:
             return []  # WhatsApp only fires for request events, not daily_digest
 
-        # Two-level routing: dept-wide + experience-specific, deduplicated by target
         experience = event.request.experience if event.request else None
+        scope_q = Q()
+
+        # Department routes: only if no event or event.notify_department is True
+        if event.event_obj is None or event.event_obj.notify_department:
+            dept_q = Q(department=event.department, event__isnull=True)
+            if experience:
+                dept_q = dept_q & (Q(experience__isnull=True) | Q(experience=experience))
+            else:
+                dept_q = dept_q & Q(experience__isnull=True)
+            scope_q = scope_q | dept_q
+
+        # Event-specific routes
+        if event.event_obj:
+            scope_q = scope_q | Q(event=event.event_obj, department__isnull=True)
+
+        if not scope_q:
+            return []
+
         routes = NotificationRoute.objects.filter(
-            department=event.department,
+            scope_q,
             channel=NotificationRoute.Channel.WHATSAPP,
             is_active=True,
-        ).filter(
-            Q(experience__isnull=True)
-            | Q(experience=experience)
         ).order_by("target", "id")
 
-        # DB-level dedupe: deterministic ordering (target ASC, id ASC) then
-        # Distinct on target — keeps the lowest-ID route per phone number.
-        # On PostgreSQL this uses .distinct("target"); on SQLite (tests) we
-        # fall back to Python-side dedupe with the same deterministic order.
+        # Dedupe by target
         if connection.vendor == "postgresql":
             return list(routes.distinct("target"))
         seen = set()

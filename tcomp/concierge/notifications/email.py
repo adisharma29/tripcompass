@@ -29,13 +29,28 @@ class EmailAdapter(ChannelAdapter):
             return []  # Email only fires for request events
 
         experience = event.request.experience if event.request else None
+        scope_q = Q()
+
+        # Department routes: only if no event or event.notify_department is True
+        if event.event_obj is None or event.event_obj.notify_department:
+            dept_q = Q(department=event.department, event__isnull=True)
+            if experience:
+                dept_q = dept_q & (Q(experience__isnull=True) | Q(experience=experience))
+            else:
+                dept_q = dept_q & Q(experience__isnull=True)
+            scope_q = scope_q | dept_q
+
+        # Event-specific routes
+        if event.event_obj:
+            scope_q = scope_q | Q(event=event.event_obj, department__isnull=True)
+
+        if not scope_q:
+            return []
+
         routes = NotificationRoute.objects.filter(
-            department=event.department,
+            scope_q,
             channel=NotificationRoute.Channel.EMAIL,
             is_active=True,
-        ).filter(
-            Q(experience__isnull=True)
-            | Q(experience=experience)
         ).order_by("target", "id")
 
         # Dedupe by target (same pattern as WhatsApp)

@@ -1142,11 +1142,20 @@ class NotificationRouteViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         qs = NotificationRoute.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('department', 'experience', 'member__user').order_by('department__name', 'channel', 'id')
+        ).select_related('department', 'experience', 'event', 'member__user').order_by('channel', 'id')
         dept_id = self.request.query_params.get('department')
+        event_id = self.request.query_params.get('event')
+        # Mutual exclusion: cannot filter by both
+        if dept_id and event_id:
+            raise serializers.ValidationError('Cannot filter by both department and event.')
         if dept_id:
             try:
                 qs = qs.filter(department_id=int(dept_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
+        if event_id:
+            try:
+                qs = qs.filter(event_id=int(event_id))
             except (ValueError, TypeError):
                 qs = qs.none()
         return qs
@@ -1157,10 +1166,33 @@ class NotificationRouteViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         return ctx
 
     def perform_create(self, serializer):
-        serializer.save(
+        self._save_with_conflict_handling(
+            serializer,
             hotel=self.get_hotel(),
             created_by=self.request.user,
         )
+
+    def perform_update(self, serializer):
+        self._save_with_conflict_handling(serializer)
+
+    def _save_with_conflict_handling(self, serializer, **kwargs):
+        """Save, converting model ValidationError / IntegrityError to DRF 400.
+
+        With Meta.validators = [] on the serializer, uniqueness is enforced
+        at the DB level.  Model.save() → full_clean() raises Django
+        ValidationError; a race or constraint violation raises IntegrityError.
+        """
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            serializer.save(**kwargs)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, 'message_dict') else exc.messages,
+            )
+        except IntegrityError:
+            raise serializers.ValidationError(
+                'A route with this target, channel, and scope already exists.',
+            )
 
 
 class BookingEmailTemplateView(HotelScopedMixin, APIView):

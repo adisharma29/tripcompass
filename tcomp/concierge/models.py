@@ -455,6 +455,12 @@ class Event(models.Model):
         help_text='Hours before event start when bookings close. Null = use hotel default.',
     )
 
+    # Notification routing
+    notify_department = models.BooleanField(
+        default=True,
+        help_text='When True, also notify the resolved department contacts for requests on this event.',
+    )
+
     # Visibility & status
     is_featured = models.BooleanField(default=False)
     status = models.CharField(
@@ -1242,7 +1248,12 @@ class NotificationRoute(models.Model):
         Hotel, on_delete=models.CASCADE, related_name='notification_routes',
     )
     department = models.ForeignKey(
-        Department, on_delete=models.CASCADE, related_name='notification_routes',
+        Department, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+    )
+    event = models.ForeignKey(
+        Event, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
     )
     experience = models.ForeignKey(
         Experience, on_delete=models.CASCADE, null=True, blank=True,
@@ -1270,6 +1281,7 @@ class NotificationRoute(models.Model):
 
     class Meta:
         constraints = [
+            # --- Department-scoped routes (existing) ---
             # Experience-specific routes: one per (dept, exp, channel, target)
             models.UniqueConstraint(
                 fields=['department', 'experience', 'channel', 'target'],
@@ -1279,17 +1291,47 @@ class NotificationRoute(models.Model):
             # Department-wide routes: one per (dept, channel, target) where experience IS NULL
             models.UniqueConstraint(
                 fields=['department', 'channel', 'target'],
-                condition=Q(experience__isnull=True),
+                condition=Q(experience__isnull=True, event__isnull=True),
                 name='unique_route_dept_wide',
+            ),
+            # --- Event-scoped routes (new) ---
+            # Event routes: one per (event, channel, target)
+            models.UniqueConstraint(
+                fields=['event', 'channel', 'target'],
+                condition=Q(event__isnull=False),
+                name='unique_event_channel_target',
+            ),
+            # --- Scope exclusivity ---
+            # Exactly one scope: department XOR event
+            models.CheckConstraint(
+                check=(
+                    Q(department__isnull=False, event__isnull=True)
+                    | Q(department__isnull=True, event__isnull=False)
+                ),
+                name='route_scope_dept_xor_event',
+            ),
+            # Experience only valid on department-scoped routes
+            models.CheckConstraint(
+                check=Q(event__isnull=True) | Q(experience__isnull=True),
+                name='route_no_experience_on_event_scope',
             ),
         ]
 
     def clean(self):
-        """Cross-hotel FK consistency validation."""
+        """Cross-hotel FK consistency and scope validation."""
         from django.core.exceptions import ValidationError
         errors = {}
-        if self.department_id and self.department.hotel_id != self.hotel_id:
+        # Scope: exactly one of department or event
+        has_dept = self.department_id is not None
+        has_event = self.event_id is not None
+        if has_dept == has_event:
+            errors['__all__'] = 'Exactly one of department or event must be set.'
+        if has_dept and self.department.hotel_id != self.hotel_id:
             errors['department'] = 'Department must belong to this hotel.'
+        if has_event and self.event.hotel_id != self.hotel_id:
+            errors['event'] = 'Event must belong to this hotel.'
+        if has_event and self.experience_id:
+            errors['experience'] = 'Experience cannot be set on event-scoped routes.'
         if self.experience_id and self.experience.department_id != self.department_id:
             errors['experience'] = 'Experience must belong to the selected department.'
         if self.member_id and self.member.hotel_id != self.hotel_id:
@@ -1306,7 +1348,8 @@ class NotificationRoute(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f'{self.channel} → {self.target} ({self.department.name})'
+        scope = self.event.name if self.event_id else self.department.name if self.department_id else '?'
+        return f'{self.channel} → {self.target} ({scope})'
 
 
 class DeliveryRecord(models.Model):

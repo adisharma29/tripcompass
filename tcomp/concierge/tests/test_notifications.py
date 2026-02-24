@@ -20,6 +20,7 @@ from rest_framework.test import APIClient
 from concierge.models import (
     Department,
     DeliveryRecord,
+    Event,
     Experience,
     GuestStay,
     Hotel,
@@ -944,6 +945,21 @@ class NotificationRouteAPITest(NotificationSetupMixin, TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), [])
 
+    def test_duplicate_route_returns_400(self):
+        """Duplicate (dept, channel, target) must return 400, not 500."""
+        NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='WHATSAPP', target='919876543210',
+            created_by=self.admin_user,
+        )
+        resp = self.client.post(self.base_url, {
+            'department': self.dept.id,
+            'channel': 'WHATSAPP',
+            'target': '919876543210',
+            'label': 'Dup',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
 
 # ---------------------------------------------------------------------------
 # Task HTTP status handling
@@ -1429,3 +1445,277 @@ class EmailTaskTest(NotificationSetupMixin, TestCase):
 
         call_kwargs = mock_send.call_args[0][0]
         self.assertIn(f'/dashboard/requests/{params["public_id"]}', call_kwargs['html'])
+
+
+# ---------------------------------------------------------------------------
+# Event-scoped notification routing
+# ---------------------------------------------------------------------------
+
+class EventRoutingSetupMixin(NotificationSetupMixin):
+    """Extends shared setup with an Event + event-scoped routes."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.event = Event.objects.create(
+            hotel=cls.hotel,
+            department=cls.dept,
+            name='Wine Tasting',
+            event_start=timezone.now() + timedelta(days=1),
+            status='PUBLISHED',
+        )
+
+
+class EventRouteAPITest(EventRoutingSetupMixin, TestCase):
+    """CRUD and filtering for event-scoped notification routes."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.admin_user)
+        self.base_url = '/api/v1/hotels/test-hotel/admin/notification-routes/'
+
+    def test_create_event_route(self):
+        resp = self.client.post(self.base_url, {
+            'event': self.event.id,
+            'channel': 'EMAIL',
+            'target': 'sommelier@hotel.com',
+            'label': 'Sommelier',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201)
+        route = NotificationRoute.objects.get(id=resp.json()['id'])
+        self.assertEqual(route.event_id, self.event.id)
+        self.assertIsNone(route.department_id)
+
+    def test_create_dept_route_still_works(self):
+        resp = self.client.post(self.base_url, {
+            'department': self.dept.id,
+            'channel': 'WHATSAPP',
+            'target': '919876543210',
+            'label': 'Dept Staff',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201)
+        route = NotificationRoute.objects.get(id=resp.json()['id'])
+        self.assertIsNone(route.event_id)
+        self.assertEqual(route.department_id, self.dept.id)
+
+    def test_create_rejects_both_scope(self):
+        resp = self.client.post(self.base_url, {
+            'department': self.dept.id,
+            'event': self.event.id,
+            'channel': 'EMAIL',
+            'target': 'both@hotel.com',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_rejects_neither_scope(self):
+        resp = self.client.post(self.base_url, {
+            'channel': 'EMAIL',
+            'target': 'neither@hotel.com',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_event_route_rejects_experience(self):
+        resp = self.client.post(self.base_url, {
+            'event': self.event.id,
+            'experience': self.experience.id,
+            'channel': 'EMAIL',
+            'target': 'bad@hotel.com',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('experience', resp.json())
+
+    def test_filter_by_event(self):
+        NotificationRoute.objects.create(
+            hotel=self.hotel, event=self.event,
+            channel='EMAIL', target='evt@hotel.com',
+            created_by=self.admin_user,
+        )
+        NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='EMAIL', target='dept@hotel.com',
+            created_by=self.admin_user,
+        )
+        resp = self.client.get(f'{self.base_url}?event={self.event.id}')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]['event'], self.event.id)
+
+    def test_filter_both_params_rejected(self):
+        resp = self.client.get(
+            f'{self.base_url}?department={self.dept.id}&event={self.event.id}'
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_filter_event_invalid_returns_empty(self):
+        NotificationRoute.objects.create(
+            hotel=self.hotel, event=self.event,
+            channel='EMAIL', target='evt@hotel.com',
+            created_by=self.admin_user,
+        )
+        resp = self.client.get(f'{self.base_url}?event=abc')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), [])
+
+    def test_duplicate_dept_route_returns_400(self):
+        """Duplicate (dept, channel, target) must return 400, not 500."""
+        NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='EMAIL', target='dup@hotel.com',
+            created_by=self.admin_user,
+        )
+        resp = self.client.post(self.base_url, {
+            'department': self.dept.id,
+            'channel': 'EMAIL',
+            'target': 'dup@hotel.com',
+            'label': 'Dup',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_duplicate_event_route_returns_400(self):
+        """Duplicate (event, channel, target) must return 400, not 500."""
+        NotificationRoute.objects.create(
+            hotel=self.hotel, event=self.event,
+            channel='WHATSAPP', target='919876543210',
+            created_by=self.admin_user,
+        )
+        resp = self.client.post(self.base_url, {
+            'event': self.event.id,
+            'channel': 'WHATSAPP',
+            'target': '919876543210',
+            'label': 'Dup',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+
+class EventRoutePushTest(EventRoutingSetupMixin, TestCase):
+    """PushAdapter respects notify_department toggle."""
+
+    def setUp(self):
+        self.adapter = PushAdapter()
+
+    def test_notify_dept_true_includes_dept_staff(self):
+        """Default notify_department=True → dept staff + admins."""
+        self.event.notify_department = True
+        self.event.save(update_fields=['notify_department'])
+        req = self._make_request(event=self.event)
+        event = self._make_event(request=req, event_obj=self.event)
+        recipients = self.adapter.get_recipients(event)
+        user_ids = {m.user_id for m in recipients}
+        self.assertIn(self.staff_user.id, user_ids)
+        self.assertIn(self.admin_user.id, user_ids)
+        self.assertIn(self.superadmin_user.id, user_ids)
+
+    def test_notify_dept_false_excludes_dept_staff(self):
+        """notify_department=False → admins only, no dept staff."""
+        self.event.notify_department = False
+        self.event.save(update_fields=['notify_department'])
+        req = self._make_request(event=self.event)
+        event = self._make_event(request=req, event_obj=self.event)
+        recipients = self.adapter.get_recipients(event)
+        user_ids = {m.user_id for m in recipients}
+        self.assertNotIn(self.staff_user.id, user_ids)
+        self.assertIn(self.admin_user.id, user_ids)
+        self.assertIn(self.superadmin_user.id, user_ids)
+
+
+class EventRouteWhatsAppTest(EventRoutingSetupMixin, TestCase):
+    """WhatsAppAdapter routes with event-scoped + dept-scoped routes."""
+
+    def setUp(self):
+        self.adapter = WhatsAppAdapter()
+        # Department-wide WA route
+        self.dept_route = NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='WHATSAPP', target='919876543210',
+            label='Dept Staff', created_by=self.admin_user,
+        )
+        # Event-specific WA route
+        self.event_route = NotificationRoute.objects.create(
+            hotel=self.hotel, event=self.event,
+            channel='WHATSAPP', target='919111222333',
+            label='Sommelier', created_by=self.admin_user,
+        )
+
+    def test_both_routes_when_notify_dept_true(self):
+        self.event.notify_department = True
+        self.event.save(update_fields=['notify_department'])
+        req = self._make_request(event=self.event)
+        event = self._make_event(request=req, event_obj=self.event)
+        recipients = self.adapter.get_recipients(event)
+        targets = {r.target for r in recipients}
+        self.assertIn('919876543210', targets)
+        self.assertIn('919111222333', targets)
+
+    def test_only_event_routes_when_notify_dept_false(self):
+        self.event.notify_department = False
+        self.event.save(update_fields=['notify_department'])
+        req = self._make_request(event=self.event)
+        event = self._make_event(request=req, event_obj=self.event)
+        recipients = self.adapter.get_recipients(event)
+        targets = {r.target for r in recipients}
+        self.assertNotIn('919876543210', targets)
+        self.assertIn('919111222333', targets)
+
+    def test_dedup_same_target_across_scopes(self):
+        """Same phone in dept route + event route → single recipient."""
+        self.event_route.target = '919876543210'
+        self.event_route.save()
+        self.event.notify_department = True
+        self.event.save(update_fields=['notify_department'])
+        req = self._make_request(event=self.event)
+        event = self._make_event(request=req, event_obj=self.event)
+        recipients = self.adapter.get_recipients(event)
+        targets = [r.target for r in recipients]
+        self.assertEqual(targets.count('919876543210'), 1)
+
+
+@override_settings(RESEND_API_KEY='re_test')
+class EventRouteEmailTest(EventRoutingSetupMixin, TestCase):
+    """EmailAdapter routes with event-scoped + dept-scoped routes."""
+
+    def setUp(self):
+        self.adapter = EmailAdapter()
+        self.hotel.email_notifications_enabled = True
+        self.hotel.save(update_fields=['email_notifications_enabled'])
+        # Department-wide email route
+        self.dept_route = NotificationRoute.objects.create(
+            hotel=self.hotel, department=self.dept,
+            channel='EMAIL', target='dept@hotel.com',
+            label='Dept Manager', created_by=self.admin_user,
+        )
+        # Event-specific email route
+        self.event_route = NotificationRoute.objects.create(
+            hotel=self.hotel, event=self.event,
+            channel='EMAIL', target='event@hotel.com',
+            label='Event Coord', created_by=self.admin_user,
+        )
+
+    def test_both_routes_when_notify_dept_true(self):
+        self.event.notify_department = True
+        self.event.save(update_fields=['notify_department'])
+        req = self._make_request(event=self.event)
+        event = self._make_event(request=req, event_obj=self.event)
+        recipients = self.adapter.get_recipients(event)
+        targets = {r.target for r in recipients}
+        self.assertIn('dept@hotel.com', targets)
+        self.assertIn('event@hotel.com', targets)
+
+    def test_only_event_routes_when_notify_dept_false(self):
+        self.event.notify_department = False
+        self.event.save(update_fields=['notify_department'])
+        req = self._make_request(event=self.event)
+        event = self._make_event(request=req, event_obj=self.event)
+        recipients = self.adapter.get_recipients(event)
+        targets = {r.target for r in recipients}
+        self.assertNotIn('dept@hotel.com', targets)
+        self.assertIn('event@hotel.com', targets)
+
+    def test_no_event_obj_uses_dept_routes_only(self):
+        """Regular dept request (no event_obj) → only dept routes."""
+        req = self._make_request()
+        event = self._make_event(request=req)
+        recipients = self.adapter.get_recipients(event)
+        targets = {r.target for r in recipients}
+        self.assertIn('dept@hotel.com', targets)
+        self.assertNotIn('event@hotel.com', targets)

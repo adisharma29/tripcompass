@@ -630,6 +630,7 @@ class EventSerializer(serializers.ModelSerializer):
     photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
     cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
     gallery_images = EventImageSerializer(many=True, read_only=True)
+    resolved_department_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
@@ -641,13 +642,14 @@ class EventSerializer(serializers.ModelSerializer):
             'event_start', 'event_end', 'is_all_day',
             'is_recurring', 'recurrence_rule',
             'booking_opens_hours', 'booking_closes_hours',
+            'notify_department', 'resolved_department_name',
             'is_featured', 'status', 'is_active', 'published_at',
             'auto_expire', 'display_order',
             'gallery_images', 'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'hotel', 'slug', 'is_active', 'published_at',
-            'created_at', 'updated_at',
+            'created_at', 'updated_at', 'resolved_department_name',
         ]
 
     def validate_experience(self, value):
@@ -673,6 +675,10 @@ class EventSerializer(serializers.ModelSerializer):
                 'Cannot route event requests to an ops department.'
             )
         return value
+
+    def get_resolved_department_name(self, obj):
+        dept = obj.get_routing_department()
+        return dept.name if dept else None
 
     def validate_photo(self, value):
         return _clean_image(value)
@@ -1394,19 +1400,30 @@ class BookingEmailTemplateSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 
 class NotificationRouteSerializer(serializers.ModelSerializer):
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), required=False, allow_null=True,
+    )
+    event = serializers.PrimaryKeyRelatedField(
+        queryset=Event.objects.all(), required=False, allow_null=True,
+    )
     member_name = serializers.SerializerMethodField()
     department_name = serializers.SerializerMethodField()
     experience_name = serializers.SerializerMethodField()
+    event_name = serializers.SerializerMethodField()
 
     class Meta:
         model = NotificationRoute
         fields = [
-            'id', 'department', 'experience', 'channel', 'member',
+            'id', 'department', 'event', 'experience', 'channel', 'member',
             'target', 'label', 'is_active',
-            'member_name', 'department_name', 'experience_name',
+            'member_name', 'department_name', 'experience_name', 'event_name',
             'created_at',
         ]
         read_only_fields = ['id', 'created_at']
+        # Suppress DRF auto-generated UniqueTogetherValidators from conditional
+        # UniqueConstraints — they make nullable scope fields required.
+        # DB constraints handle uniqueness; our validate() handles scope logic.
+        validators = []
 
     def get_member_name(self, obj):
         if obj.member_id:
@@ -1419,20 +1436,40 @@ class NotificationRouteSerializer(serializers.ModelSerializer):
     def get_experience_name(self, obj):
         return obj.experience.name if obj.experience_id else None
 
+    def get_event_name(self, obj):
+        return obj.event.name if obj.event_id else None
+
     def validate_target(self, value):
         return value.strip()
 
     def validate(self, data):
         hotel = self.context['hotel']
 
+        # Scope: exactly one of department or event
+        department = data.get('department', self.instance.department if self.instance else None)
+        event = data.get('event', self.instance.event if self.instance else None)
+        has_dept = department is not None
+        has_event = event is not None
+        if has_dept == has_event:
+            raise serializers.ValidationError(
+                'Exactly one of department or event must be set.'
+            )
+
         # Department must belong to this hotel
-        department = data.get('department') or (self.instance.department if self.instance else None)
-        if department and department.hotel_id != hotel.id:
+        if has_dept and department.hotel_id != hotel.id:
             raise serializers.ValidationError({'department': 'Department must belong to this hotel.'})
 
-        # Experience must belong to the department
+        # Event must belong to this hotel
+        if has_event and event.hotel_id != hotel.id:
+            raise serializers.ValidationError({'event': 'Event must belong to this hotel.'})
+
+        # Experience only valid on department-scoped routes
         experience = data.get('experience')
-        if experience is not None and department and experience.department_id != department.id:
+        if has_event and experience is not None:
+            raise serializers.ValidationError({'experience': 'Experience cannot be set on event-scoped routes.'})
+
+        # Experience must belong to the department
+        if experience is not None and has_dept and experience.department_id != department.id:
             raise serializers.ValidationError({'experience': 'Experience must belong to the selected department.'})
 
         # Member must belong to this hotel
