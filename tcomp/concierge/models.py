@@ -192,6 +192,7 @@ class HotelMembership(models.Model):
         null=True, blank=True, related_name='staff_memberships',
     )
     is_active = models.BooleanField(default=True)
+    last_invite_sent_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -951,11 +952,13 @@ class RequestActivity(models.Model):
         NOTE_ADDED = 'NOTE_ADDED', 'Note Added'
         OWNERSHIP_TAKEN = 'OWNERSHIP_TAKEN', 'Ownership Taken'
         EXPIRED = 'EXPIRED', 'Expired'
+        REASSIGNED = 'REASSIGNED', 'Reassigned'
 
     ALLOWED_DETAIL_KEYS = {
         'status_from', 'status_to', 'note_length',
         'assigned_to_id', 'department_id',
         'channel', 'phone',  # For WhatsApp ack activities
+        'from_user_id', 'from_name', 'to_user_id', 'to_name', 'reason',
     }
 
     request = models.ForeignKey(

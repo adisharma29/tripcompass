@@ -869,19 +869,41 @@ class HotelMinimalSerializer(serializers.ModelSerializer):
 
 
 class MemberSerializer(serializers.ModelSerializer):
-    email = serializers.EmailField(source='user.email', read_only=True)
-    first_name = serializers.CharField(source='user.first_name', read_only=True)
-    last_name = serializers.CharField(source='user.last_name', read_only=True)
-    phone = serializers.CharField(source='user.phone', read_only=True)
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    email = serializers.EmailField(
+        source='user.email', required=False, allow_blank=True, default='',
+    )
+    first_name = serializers.CharField(
+        source='user.first_name', required=False, allow_blank=True, default='',
+    )
+    last_name = serializers.CharField(
+        source='user.last_name', required=False, allow_blank=True, default='',
+    )
+    phone = serializers.CharField(
+        source='user.phone', required=False, allow_blank=True, default='',
+    )
     hotel = HotelMinimalSerializer(read_only=True)
+    route_count = serializers.IntegerField(read_only=True, default=0)
+    assignment_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = HotelMembership
         fields = [
-            'id', 'hotel', 'email', 'first_name', 'last_name', 'phone',
+            'id', 'user_id', 'hotel', 'email', 'first_name', 'last_name', 'phone',
             'role', 'department', 'is_active', 'created_at',
+            'route_count', 'assignment_count',
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'user_id', 'created_at', 'route_count', 'assignment_count']
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
 
     def validate_department(self, value):
         hotel = self.context.get('hotel')
@@ -891,6 +913,21 @@ class MemberSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def _validate_user_field_uniqueness(self, field_name, value):
+        """Check that email/phone is unique across User table (excluding current member's user)."""
+        if not value:
+            return
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        qs = User.objects.filter(**{field_name: value})
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.user_id)
+        if qs.exists():
+            raise serializers.ValidationError({
+                field_name: f'This {field_name} is already associated with another account. '
+                            'Use Merge to combine records.',
+            })
+
     def validate(self, data):
         role = data.get('role', getattr(self.instance, 'role', None))
         department = data.get('department', getattr(self.instance, 'department', None))
@@ -898,6 +935,186 @@ class MemberSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {'department': 'Department is required for STAFF role.'}
             )
+        # Validate user field uniqueness
+        user_data = data.get('user', {})
+        if 'email' in user_data:
+            self._validate_user_field_uniqueness('email', user_data['email'])
+        if 'phone' in user_data:
+            self._validate_user_field_uniqueness('phone', user_data['phone'])
+        # Ensure at least one contact method remains after update
+        if self.instance:
+            effective_email = user_data.get('email', self.instance.user.email)
+            effective_phone = user_data.get('phone', self.instance.user.phone)
+            if not effective_email and not effective_phone:
+                raise serializers.ValidationError(
+                    'At least one contact method (email or phone) is required.'
+                )
+        return data
+
+    def update(self, instance, validated_data):
+        from django.db import IntegrityError
+        from django.db import transaction
+        user_data = validated_data.pop('user', {})
+        try:
+            with transaction.atomic():
+                # Update membership fields (role, department, is_active)
+                instance = super().update(instance, validated_data)
+                # Write-through user fields
+                if user_data:
+                    user = instance.user
+                    for field, value in user_data.items():
+                        setattr(user, field, value)
+                    user.save(update_fields=list(user_data.keys()))
+        except IntegrityError:
+            raise serializers.ValidationError(
+                'This email or phone is already associated with another account.'
+            )
+        return instance
+
+
+class MemberSelfSerializer(serializers.ModelSerializer):
+    """Restricted serializer for ADMIN self-edit — contact/name fields only."""
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    email = serializers.EmailField(
+        source='user.email', required=False, allow_blank=True, default='',
+    )
+    first_name = serializers.CharField(
+        source='user.first_name', required=False, allow_blank=True, default='',
+    )
+    last_name = serializers.CharField(
+        source='user.last_name', required=False, allow_blank=True, default='',
+    )
+    phone = serializers.CharField(
+        source='user.phone', required=False, allow_blank=True, default='',
+    )
+    hotel = HotelMinimalSerializer(read_only=True)
+    route_count = serializers.IntegerField(read_only=True, default=0)
+    assignment_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = HotelMembership
+        fields = [
+            'id', 'user_id', 'hotel', 'email', 'first_name', 'last_name', 'phone',
+            'role', 'department', 'is_active', 'created_at',
+            'route_count', 'assignment_count',
+        ]
+        read_only_fields = [
+            'id', 'user_id', 'role', 'department', 'is_active', 'created_at',
+            'route_count', 'assignment_count',
+        ]
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
+
+    def validate(self, data):
+        user_data = data.get('user', {})
+        if 'email' in user_data and user_data['email']:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            if User.objects.filter(email=user_data['email']).exclude(pk=self.instance.user_id).exists():
+                raise serializers.ValidationError({
+                    'email': 'This email is already associated with another account.',
+                })
+        if 'phone' in user_data and user_data['phone']:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            if User.objects.filter(phone=user_data['phone']).exclude(pk=self.instance.user_id).exists():
+                raise serializers.ValidationError({
+                    'phone': 'This phone is already associated with another account.',
+                })
+        # Ensure at least one contact method remains after update
+        if self.instance:
+            effective_email = user_data.get('email', self.instance.user.email)
+            effective_phone = user_data.get('phone', self.instance.user.phone)
+            if not effective_email and not effective_phone:
+                raise serializers.ValidationError(
+                    'At least one contact method (email or phone) is required.'
+                )
+        return data
+
+    def update(self, instance, validated_data):
+        from django.db import IntegrityError
+        user_data = validated_data.pop('user', {})
+        if user_data:
+            user = instance.user
+            for field, value in user_data.items():
+                setattr(user, field, value)
+            try:
+                user.save(update_fields=list(user_data.keys()))
+            except IntegrityError:
+                raise serializers.ValidationError(
+                    'This email or phone is already associated with another account.'
+                )
+        return instance
+
+
+class TransferMemberSerializer(serializers.Serializer):
+    target_member_id = serializers.IntegerField()
+
+    def validate_target_member_id(self, value):
+        hotel = self.context['hotel']
+        source = self.context['source']
+        try:
+            target = HotelMembership.objects.select_related('user').get(
+                pk=value, hotel=hotel,
+            )
+        except HotelMembership.DoesNotExist:
+            raise serializers.ValidationError('Target member not found in this hotel.')
+        if target.pk == source.pk:
+            raise serializers.ValidationError('Cannot transfer to the same member.')
+        if not target.is_active:
+            raise serializers.ValidationError('Target member is inactive.')
+        self._target = target
+        return value
+
+    def validate(self, data):
+        data['target_member'] = self._target
+        return data
+
+
+class MergeMemberSerializer(serializers.Serializer):
+    keep_id = serializers.IntegerField()
+    remove_id = serializers.IntegerField()
+
+    def validate(self, data):
+        hotel = self.context['hotel']
+        request_user = self.context['request'].user
+        errors = {}
+        members = {}
+        for field in ('keep_id', 'remove_id'):
+            try:
+                m = HotelMembership.objects.select_related('user').get(
+                    pk=data[field], hotel=hotel,
+                )
+                members[field] = m
+            except HotelMembership.DoesNotExist:
+                errors[field] = 'Member not found in this hotel.'
+        if errors:
+            raise serializers.ValidationError(errors)
+        keep = members['keep_id']
+        remove = members['remove_id']
+        if keep.pk == remove.pk:
+            raise serializers.ValidationError('Cannot merge a member with itself.')
+        if keep.user == request_user or remove.user == request_user:
+            raise serializers.ValidationError('Cannot merge your own membership.')
+        # Last SUPERADMIN guard
+        if remove.role == 'SUPERADMIN':
+            remaining = HotelMembership.objects.filter(
+                hotel=hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=remove.pk).count()
+            if remaining == 0:
+                raise serializers.ValidationError(
+                    'Cannot merge: this would remove the last active superadmin.'
+                )
+        data['keep_member'] = keep
+        data['remove_member'] = remove
         return data
 
 

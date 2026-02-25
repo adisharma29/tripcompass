@@ -15,6 +15,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound
 from rest_framework.parsers import FormParser, JSONParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -44,7 +45,9 @@ from .serializers import (
     GuestStaySerializer, GuestStayUpdateSerializer,
     HotelInfoSectionSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
-    MemberSerializer, NotificationRouteSerializer, NotificationSerializer,
+    MemberSelfSerializer, MemberSerializer,
+    MergeMemberSerializer, TransferMemberSerializer,
+    NotificationRouteSerializer, NotificationSerializer,
     PushSubscriptionSerializer, QRCodeSerializer,
     ServiceRequestCreateSerializer, ServiceRequestDetailSerializer,
     ServiceRequestListSerializer, ServiceRequestUpdateSerializer,
@@ -1259,6 +1262,12 @@ class NotificationRouteViewSet(HotelScopedMixin, viewsets.ModelViewSet):
                 qs = qs.filter(event_id=int(event_id))
             except (ValueError, TypeError):
                 qs = qs.none()
+        member_id = self.request.query_params.get('member')
+        if member_id:
+            try:
+                qs = qs.filter(member_id=int(member_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
         return qs
 
     def get_serializer_context(self):
@@ -1381,7 +1390,14 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
     def get_queryset(self):
         return HotelMembership.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('user', 'department', 'hotel')
+        ).select_related('user', 'department', 'hotel').annotate(
+            route_count=Count('notification_routes', distinct=True),
+            assignment_count=Count(
+                'user__assigned_requests',
+                filter=models.Q(user__assigned_requests__hotel=models.F('hotel')),
+                distinct=True,
+            ),
+        )
 
     def create(self, request, *args, **kwargs):
         from django.contrib.auth import get_user_model
@@ -1490,11 +1506,284 @@ class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         return HotelMembership.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('user', 'department', 'hotel')
+        ).select_related('user', 'department', 'hotel').annotate(
+            route_count=Count('notification_routes', distinct=True),
+            assignment_count=Count(
+                'user__assigned_requests',
+                filter=models.Q(user__assigned_requests__hotel=models.F('hotel')),
+                distinct=True,
+            ),
+        )
 
-    def perform_destroy(self, instance):
-        instance.is_active = False
-        instance.save(update_fields=['is_active'])
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        # Guard: cannot delete self
+        if instance.user == request.user:
+            return Response(
+                {'detail': 'Cannot delete your own membership.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Guard: last active SUPERADMIN
+        if instance.role == 'SUPERADMIN':
+            remaining = HotelMembership.objects.filter(
+                hotel=instance.hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=instance.pk).count()
+            if remaining == 0:
+                return Response(
+                    {'detail': 'Cannot delete the last active superadmin.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        # Guard: block if member still has linked data
+        has_routes = instance.notification_routes.exists()
+        has_assignments = ServiceRequest.objects.filter(
+            assigned_to=instance.user, hotel=instance.hotel,
+        ).exists()
+        if has_routes or has_assignments:
+            return Response(
+                {'detail': 'Transfer data first or deactivate instead.',
+                 'has_routes': has_routes,
+                 'has_assignments': has_assignments},
+                status=status.HTTP_409_CONFLICT,
+            )
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _transfer_member_data(source, target, actor, reason):
+    """Shared transfer logic for transfer-and-remove + merge.
+    Returns (transferred_routes, skipped_routes, transferred_requests).
+    """
+    # 1. Transfer notification routes with dedupe
+    routes = NotificationRoute.objects.filter(member=source)
+    transferred_routes = 0
+    skipped_routes = 0
+    for route in routes:
+        new_target = target.user.phone if route.channel == 'WHATSAPP' else target.user.email
+        new_label = f'{target.user.first_name} {target.user.last_name}'.strip() or target.user.email
+        # Check for collision — exclude self to prevent self-match
+        conflict = NotificationRoute.objects.filter(
+            department=route.department,
+            experience=route.experience,
+            event=route.event,
+            channel=route.channel,
+            target=new_target,
+        ).exclude(pk=route.pk).exists()
+        if conflict:
+            route.delete()
+            skipped_routes += 1
+        else:
+            route.member = target
+            route.target = new_target
+            route.label = new_label
+            route.save()
+            transferred_routes += 1
+
+    # 2. Reassign requests + create audit entries
+    requests_qs = ServiceRequest.objects.filter(
+        assigned_to=source.user, hotel=source.hotel,
+    )
+    transferred_requests = requests_qs.count()
+    for req in requests_qs:
+        RequestActivity.objects.create(
+            request=req,
+            actor=actor,
+            action='REASSIGNED',
+            details={
+                'from_user_id': source.user.id,
+                'from_name': str(source.user),
+                'to_user_id': target.user.id,
+                'to_name': str(target.user),
+                'reason': reason,
+            },
+        )
+    requests_qs.update(assigned_to=target.user)
+
+    return transferred_routes, skipped_routes, transferred_requests
+
+
+class MemberTransfer(HotelScopedMixin, generics.GenericAPIView):
+    """POST /members/{id}/transfer/ — atomic transfer + hard-delete source."""
+    permission_classes = [IsSuperAdmin]
+
+    def get_queryset(self):
+        return HotelMembership.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related('user')
+
+    def post(self, request, *args, **kwargs):
+        source = self.get_object()
+        # Guard: cannot transfer self
+        if source.user == request.user:
+            return Response({'detail': 'Cannot transfer your own membership.'}, status=400)
+        # Guard: last active SUPERADMIN
+        if source.role == 'SUPERADMIN':
+            remaining = HotelMembership.objects.filter(
+                hotel=source.hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=source.pk).count()
+            if remaining == 0:
+                return Response(
+                    {'detail': 'Cannot remove the last active superadmin.'},
+                    status=400,
+                )
+        ser = TransferMemberSerializer(
+            data=request.data,
+            context={'hotel': source.hotel, 'source': source},
+        )
+        ser.is_valid(raise_exception=True)
+        target = ser.validated_data['target_member']
+
+        # Pre-validate route compatibility
+        routes = NotificationRoute.objects.filter(member=source)
+        incompatible = []
+        for route in routes:
+            if route.channel == 'WHATSAPP' and not target.user.phone:
+                incompatible.append(f"WhatsApp route '{route.label}' — target has no phone")
+            elif route.channel == 'EMAIL' and not target.user.email:
+                incompatible.append(f"Email route '{route.label}' — target has no email")
+        if incompatible:
+            return Response(
+                {'detail': 'Target member lacks required contact info.',
+                 'incompatible_routes': incompatible},
+                status=400,
+            )
+
+        with transaction.atomic():
+            tr, sk, rq = _transfer_member_data(source, target, request.user, 'member_transfer')
+            source.delete()
+
+        return Response({
+            'transferred_routes': tr,
+            'skipped_routes': sk,
+            'transferred_requests': rq,
+        })
+
+
+class MemberMerge(HotelScopedMixin, generics.GenericAPIView):
+    """POST /members/merge/ — merge two members into one."""
+    permission_classes = [IsSuperAdmin]
+
+    def post(self, request, *args, **kwargs):
+        hotel = self.get_hotel()
+        ser = MergeMemberSerializer(
+            data=request.data,
+            context={'hotel': hotel, 'request': request},
+        )
+        ser.is_valid(raise_exception=True)
+        keep = ser.validated_data['keep_member']
+        remove = ser.validated_data['remove_member']
+
+        # Pre-validate route compatibility
+        routes = NotificationRoute.objects.filter(member=remove)
+        incompatible = []
+        for route in routes:
+            if route.channel == 'WHATSAPP' and not keep.user.phone:
+                incompatible.append(f"WhatsApp route '{route.label}' — keep member has no phone")
+            elif route.channel == 'EMAIL' and not keep.user.email:
+                incompatible.append(f"Email route '{route.label}' — keep member has no email")
+
+        with transaction.atomic():
+            # Backfill contact info (never overwrite existing)
+            keep_user = keep.user
+            remove_user = remove.user
+            if not keep_user.email and remove_user.email:
+                keep_user.email = remove_user.email
+            if not keep_user.phone and remove_user.phone:
+                keep_user.phone = remove_user.phone
+            if not keep_user.first_name and remove_user.first_name:
+                keep_user.first_name = remove_user.first_name
+            if not keep_user.last_name and remove_user.last_name:
+                keep_user.last_name = remove_user.last_name
+            keep_user.save()
+
+            # Re-check compatibility after backfill (contact may have been filled)
+            if incompatible:
+                # Re-evaluate: after backfill, check again
+                incompatible = []
+                for route in routes:
+                    if route.channel == 'WHATSAPP' and not keep_user.phone:
+                        incompatible.append(f"WhatsApp route '{route.label}' — keep member has no phone")
+                    elif route.channel == 'EMAIL' and not keep_user.email:
+                        incompatible.append(f"Email route '{route.label}' — keep member has no email")
+                if incompatible:
+                    raise serializers.ValidationError({
+                        'detail': 'Keep member lacks required contact info even after backfill.',
+                        'incompatible_routes': incompatible,
+                    })
+
+            tr, sk, rq = _transfer_member_data(remove, keep, request.user, 'member_merge')
+            remove.delete()
+
+            # Deactivate orphaned user (STAFF only, no guest stays)
+            if (
+                remove_user.user_type == 'STAFF'
+                and not remove_user.hotel_memberships.exists()
+                and not remove_user.stays.filter(is_active=True).exists()
+            ):
+                remove_user.is_active = False
+                remove_user.save(update_fields=['is_active'])
+
+        return Response({
+            'transferred_routes': tr,
+            'skipped_routes': sk,
+            'transferred_requests': rq,
+        })
+
+
+class MemberResendInvite(HotelScopedMixin, generics.GenericAPIView):
+    """POST /members/{id}/resend-invite/ — re-send invitation notification."""
+    permission_classes = [IsSuperAdmin]
+
+    def get_queryset(self):
+        return HotelMembership.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related('user')
+
+    def post(self, request, *args, **kwargs):
+        from datetime import timedelta
+        member = self.get_object()
+        if not member.is_active:
+            return Response(
+                {'detail': 'Cannot resend invite to inactive member.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Rate limit: 1 per 5 minutes per member
+        if member.last_invite_sent_at:
+            cooldown = timedelta(minutes=5)
+            if timezone.now() - member.last_invite_sent_at < cooldown:
+                remaining = cooldown - (timezone.now() - member.last_invite_sent_at)
+                return Response(
+                    {'detail': f'Please wait {int(remaining.total_seconds())} seconds before resending.'},
+                    status=429,
+                )
+        from .tasks import send_staff_invite_notification_task
+        send_staff_invite_notification_task.delay(
+            member.user.id, member.hotel.id, member.role,
+        )
+        member.last_invite_sent_at = timezone.now()
+        member.save(update_fields=['last_invite_sent_at'])
+        return Response({'detail': 'Invite sent.'})
+
+
+class MemberSelfView(HotelScopedMixin, generics.RetrieveUpdateAPIView):
+    """ADMIN+ can view/edit their own contact info (email, phone, name)."""
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = MemberSelfSerializer
+
+    def get_object(self):
+        hotel = self.get_hotel()
+        try:
+            return HotelMembership.objects.select_related(
+                'user', 'department', 'hotel',
+            ).annotate(
+                route_count=Count('notification_routes', distinct=True),
+                assignment_count=Count(
+                    'user__assigned_requests',
+                    filter=models.Q(user__assigned_requests__hotel=models.F('hotel')),
+                    distinct=True,
+                ),
+            ).get(user=self.request.user, hotel=hotel)
+        except HotelMembership.DoesNotExist:
+            raise NotFound('No membership found for this hotel.')
 
 
 class HotelSettingsUpdate(HotelScopedMixin, generics.RetrieveUpdateAPIView):

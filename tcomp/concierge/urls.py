@@ -161,8 +161,16 @@ urlpatterns = [
     # --- SuperAdmin ---
     path('hotels/<slug:hotel_slug>/admin/members/',
          views.MemberList.as_view(), name='admin-member-list'),
+    path('hotels/<slug:hotel_slug>/admin/members/me/',
+         views.MemberSelfView.as_view(), name='admin-member-self'),
+    path('hotels/<slug:hotel_slug>/admin/members/merge/',
+         views.MemberMerge.as_view(), name='admin-member-merge'),
     path('hotels/<slug:hotel_slug>/admin/members/<int:pk>/',
          views.MemberDetail.as_view(), name='admin-member-detail'),
+    path('hotels/<slug:hotel_slug>/admin/members/<int:pk>/transfer/',
+         views.MemberTransfer.as_view(), name='admin-member-transfer'),
+    path('hotels/<slug:hotel_slug>/admin/members/<int:pk>/resend-invite/',
+         views.MemberResendInvite.as_view(), name='admin-member-resend-invite'),
     path('hotels/<slug:hotel_slug>/admin/settings/',
          views.HotelSettingsUpdate.as_view(), name='admin-hotel-settings'),
 
