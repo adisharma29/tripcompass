@@ -1,3 +1,5 @@
+import re
+
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 
@@ -43,6 +45,11 @@ class User(AbstractUser):
                 name='users_user_phone_unique',
             ),
         ]
+
+    def save(self, *args, **kwargs):
+        if self.phone:
+            self.phone = re.sub(r'\D', '', self.phone)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         if self.email:

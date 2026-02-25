@@ -8,6 +8,7 @@ from django.contrib.gis.db import models as gis_models
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -57,14 +58,18 @@ class Hotel(models.Model):
 
     escalation_enabled = models.BooleanField(default=False)
 
+    # --- Notification channel toggles ---
+    whatsapp_notifications_enabled = models.BooleanField(default=False)
+    email_notifications_enabled = models.BooleanField(default=False)
+
     class EscalationChannel(models.TextChoices):
         NONE = 'NONE', 'None'
         EMAIL = 'EMAIL', 'Email'
-        SMS = 'SMS', 'SMS'
-        EMAIL_SMS = 'EMAIL_SMS', 'Email + SMS'
+        WHATSAPP = 'WHATSAPP', 'WhatsApp'
+        EMAIL_WHATSAPP = 'EMAIL_WHATSAPP', 'Email + WhatsApp'
 
     escalation_fallback_channel = models.CharField(
-        max_length=10,
+        max_length=14,
         choices=EscalationChannel.choices,
         default=EscalationChannel.NONE,
     )
@@ -122,6 +127,23 @@ class Hotel(models.Model):
     terms_url = models.URLField(blank=True, default='')
     privacy_url = models.URLField(blank=True, default='')
 
+    # --- Booking Window Defaults ---
+    default_booking_opens_hours = models.PositiveIntegerField(
+        default=0,
+        help_text='Default hours before event start when bookings open. 0 = always open.',
+    )
+    default_booking_closes_hours = models.PositiveIntegerField(
+        default=0,
+        help_text='Default hours before event start when bookings close. 0 = no cutoff.',
+    )
+
+    # --- Explore Tab (fieldguide destination link) ---
+    destination = models.ForeignKey(
+        'guides.Destination', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='hotels',
+        help_text='Linked fieldguide destination for Explore tab',
+    )
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -170,6 +192,7 @@ class HotelMembership(models.Model):
         null=True, blank=True, related_name='staff_memberships',
     )
     is_active = models.BooleanField(default=True)
+    last_invite_sent_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -187,7 +210,37 @@ class Department(models.Model):
     slug = models.SlugField(max_length=100)
     description = models.TextField(blank=True)
     photo = models.ImageField(upload_to='department_photos/', blank=True)
-    icon = models.ImageField(upload_to='department_icons/', blank=True)
+    ALLOWED_DEPARTMENT_ICONS = frozenset({
+        # Dining
+        'utensils-crossed', 'coffee', 'wine', 'beer', 'pizza', 'cake',
+        'chef-hat', 'cup-soda', 'ice-cream-cone', 'salad', 'soup',
+        # Wellness / Spa
+        'waves', 'droplets', 'flower-2', 'heart-pulse', 'bath', 'flame',
+        # Activities / Tours
+        'mountain', 'bike', 'tent', 'compass', 'map', 'camera',
+        'binoculars', 'footprints', 'trees', 'sailboat', 'fish',
+        # Transport
+        'car', 'bus', 'plane', 'ship', 'train-front',
+        # Fitness
+        'dumbbell', 'trophy',
+        # Accommodation
+        'bed-double', 'key', 'door-open', 'lamp',
+        # Services
+        'concierge-bell', 'phone', 'mail', 'printer', 'shirt', 'scissors',
+        'briefcase', 'gift', 'ticket', 'calendar-days', 'clock',
+        # Entertainment
+        'music', 'tv', 'gamepad-2', 'palette', 'book-open',
+        # Shopping
+        'shopping-bag', 'store', 'gem',
+        # Kids / Family
+        'baby', 'dog', 'puzzle',
+        # Nature
+        'sun', 'moon', 'leaf', 'flower',
+        # General
+        'shield-check', 'info', 'map-pin', 'wifi', 'credit-card',
+        'luggage', 'cigarette-off', 'heart', 'star', 'sparkles',
+    })
+    icon = models.CharField(max_length=50, blank=True)
     display_order = models.IntegerField(default=0)
     schedule = models.JSONField(
         default=dict,
@@ -207,6 +260,20 @@ class Department(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # Slugs reserved for frontend route segments
+    RESERVED_SLUGS = frozenset({
+        'explore', 'events', 'request', 'requests',
+        'confirmation', 'verify', 'api', 'manifest-json',
+    })
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        super().clean()
+        if self.slug and self.slug.lower() in self.RESERVED_SLUGS:
+            raise ValidationError(
+                {'slug': f'"{self.slug}" is a reserved word and cannot be used as a department slug.'}
+            )
+
     def save(self, *args, **kwargs):
         # Keep is_active in sync with status (dual-write)
         self.is_active = self.status == ContentStatus.PUBLISHED
@@ -214,7 +281,10 @@ class Department(models.Model):
             base = slugify(self.name) or 'department'
             slug = base[:100]
             counter = 1
-            while Department.objects.filter(hotel=self.hotel, slug=slug).exclude(pk=self.pk).exists():
+            while (
+                slug.lower() in self.RESERVED_SLUGS
+                or Department.objects.filter(hotel=self.hotel, slug=slug).exclude(pk=self.pk).exists()
+            ):
                 suffix = f'-{counter}'
                 slug = f'{base[:100 - len(suffix)]}{suffix}'
                 counter += 1
@@ -268,6 +338,12 @@ class Experience(models.Model):
     )
     published_at = models.DateTimeField(null=True, blank=True)
     display_order = models.IntegerField(default=0)
+
+    # --- Top Deals ---
+    is_top_deal = models.BooleanField(default=False)
+    deal_price_display = models.CharField(max_length=100, blank=True, default='')
+    deal_ends_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -288,6 +364,9 @@ class Experience(models.Model):
     class Meta:
         unique_together = ('department', 'slug')
         ordering = ['display_order', 'name']
+        indexes = [
+            models.Index(fields=['is_top_deal', 'deal_ends_at']),
+        ]
 
     def __str__(self):
         return f'{self.name} ({self.department.name})'
@@ -308,6 +387,23 @@ class ExperienceImage(models.Model):
 
     def __str__(self):
         return f'Image {self.id} for {self.experience.name}'
+
+
+class DepartmentImage(models.Model):
+    """Gallery images for a department."""
+    department = models.ForeignKey(
+        Department, on_delete=models.CASCADE, related_name='gallery_images',
+    )
+    image = models.ImageField(upload_to='department_gallery/')
+    alt_text = models.CharField(max_length=255, blank=True)
+    display_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['display_order', 'created_at']
+
+    def __str__(self):
+        return f'Image {self.id} for dept {self.department.name}'
 
 
 class Event(models.Model):
@@ -350,6 +446,22 @@ class Event(models.Model):
     is_recurring = models.BooleanField(default=False)
     recurrence_rule = models.JSONField(null=True, blank=True)
 
+    # Booking window (null = use hotel default)
+    booking_opens_hours = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Hours before event start when bookings open. Null = use hotel default.',
+    )
+    booking_closes_hours = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Hours before event start when bookings close. Null = use hotel default.',
+    )
+
+    # Notification routing
+    notify_department = models.BooleanField(
+        default=True,
+        help_text='When True, also notify the resolved department contacts for requests on this event.',
+    )
+
     # Visibility & status
     is_featured = models.BooleanField(default=False)
     status = models.CharField(
@@ -391,7 +503,18 @@ class Event(models.Model):
         super().save(*args, **kwargs)
 
     def clean(self):
-        """Validate recurrence rule schema."""
+        """Validate recurrence rule schema and booking window cross-field constraints."""
+        # Booking window: opens must be >= closes when both non-zero.
+        # Guard: skip when hotel is missing (temp instances from serializer validation).
+        if self.hotel_id:
+            opens = self.get_effective_booking_opens_hours()
+            closes = self.get_effective_booking_closes_hours()
+            if opens > 0 and closes > 0 and opens < closes:
+                raise ValidationError(
+                    'Booking opens window must be >= closes window '
+                    '(e.g. opens 48h before, closes 2h before).'
+                )
+
         if self.is_recurring:
             if not self.recurrence_rule or not isinstance(self.recurrence_rule, dict):
                 raise ValidationError(
@@ -426,6 +549,91 @@ class Event(models.Model):
                     raise ValidationError(
                         {'recurrence_rule': 'until must be a valid ISO date (YYYY-MM-DD).'}
                     )
+
+    def get_effective_booking_opens_hours(self) -> int:
+        """Resolve opens window: event override > hotel default > 0 (no limit)."""
+        if self.booking_opens_hours is not None:
+            return self.booking_opens_hours
+        return self.hotel.default_booking_opens_hours
+
+    def get_effective_booking_closes_hours(self) -> int:
+        """Resolve closes window: event override > hotel default > 0 (no cutoff)."""
+        if self.booking_closes_hours is not None:
+            return self.booking_closes_hours
+        return self.hotel.default_booking_closes_hours
+
+    def get_booking_window_for(self, target_dt):
+        """
+        Returns (opens_at, closes_at) datetimes for a specific occurrence.
+
+        Boundary semantics (canonical, used everywhere):
+          opens_at is inclusive  — now >= opens_at  → bookable
+          closes_at is exclusive — now < closes_at  → bookable
+
+        Args:
+            target_dt: The datetime of the occurrence being booked.
+
+        Returns:
+            (opens_at, closes_at) — both are timezone-aware datetimes.
+            opens_at is None when opens_hours == 0 (always open).
+            closes_at falls back to target_dt when closes_hours == 0.
+        """
+        opens_hours = self.get_effective_booking_opens_hours()
+        closes_hours = self.get_effective_booking_closes_hours()
+
+        opens_at = (target_dt - timedelta(hours=opens_hours)) if opens_hours > 0 else None
+        closes_at = (target_dt - timedelta(hours=closes_hours)) if closes_hours > 0 else target_dt
+
+        return (opens_at, closes_at)
+
+    def is_bookable_for(self, target_dt, now=None):
+        """
+        Check if the event is currently within its booking window for a
+        specific occurrence datetime.
+
+        Returns False if target_dt is None (no valid occurrence).
+        """
+        if target_dt is None:
+            return False
+        now = now or timezone.now()
+        opens_at, closes_at = self.get_booking_window_for(target_dt)
+
+        if opens_at is not None and now < opens_at:
+            return False  # Too early
+        if now >= closes_at:
+            return False  # Too late (or event started)
+        return True
+
+    def resolve_target_datetime(self, occurrence_date=None):
+        """
+        Resolve the target occurrence datetime for booking window checks.
+
+        For one-time events: returns event_start.
+        For recurring events with occurrence_date: combines occurrence_date
+            with event_start time in hotel timezone.
+        For recurring events without occurrence_date: returns next_occurrence.
+        Returns None if no valid target exists.
+
+        DST ambiguity handling:
+            Uses datetime.replace(tzinfo=...) which applies the zone's offset
+            for that date. For "fall back" ambiguous times (e.g. 1:30 AM occurs
+            twice), Python's zoneinfo picks the FIRST (earlier/DST) occurrence
+            (fold=0). For "spring forward" nonexistent times (e.g. 2:30 AM is
+            skipped), zoneinfo folds to the post-transition offset. Tests should
+            use these same semantics for boundary assertions.
+        """
+        if not self.is_recurring:
+            return self.event_start
+
+        if occurrence_date:
+            hotel_tz = zoneinfo.ZoneInfo(self.hotel.timezone or 'UTC')
+            event_local_time = self.event_start.astimezone(hotel_tz).time()
+            from datetime import datetime as dt
+            naive = dt.combine(occurrence_date, event_local_time)
+            # fold=0 → first occurrence for ambiguous times (DST fall-back)
+            return naive.replace(tzinfo=hotel_tz)
+
+        return self.get_next_occurrence()
 
     def get_next_occurrence(self, after=None):
         """Return the next datetime this event occurs, evaluated in hotel timezone.
@@ -564,6 +772,23 @@ class Event(models.Model):
 
     def __str__(self):
         return f'{self.name} ({self.hotel.name})'
+
+
+class EventImage(models.Model):
+    """Gallery images for an event."""
+    event = models.ForeignKey(
+        Event, on_delete=models.CASCADE, related_name='gallery_images',
+    )
+    image = models.ImageField(upload_to='event_gallery/')
+    alt_text = models.CharField(max_length=255, blank=True)
+    display_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['display_order', 'created_at']
+
+    def __str__(self):
+        return f'Image {self.id} for event {self.event.name}'
 
 
 class GuestStay(models.Model):
@@ -727,10 +952,13 @@ class RequestActivity(models.Model):
         NOTE_ADDED = 'NOTE_ADDED', 'Note Added'
         OWNERSHIP_TAKEN = 'OWNERSHIP_TAKEN', 'Ownership Taken'
         EXPIRED = 'EXPIRED', 'Expired'
+        REASSIGNED = 'REASSIGNED', 'Reassigned'
 
     ALLOWED_DETAIL_KEYS = {
         'status_from', 'status_to', 'note_length',
         'assigned_to_id', 'department_id',
+        'channel', 'phone',  # For WhatsApp ack activities
+        'from_user_id', 'from_name', 'to_user_id', 'to_name', 'reason',
     }
 
     request = models.ForeignKey(
@@ -854,6 +1082,7 @@ class QRCode(models.Model):
         BAR = 'BAR', 'Bar'
         GYM = 'GYM', 'Gym'
         GARDEN = 'GARDEN', 'Garden'
+        BOOKING = 'BOOKING', 'Booking Email'
         OTHER = 'OTHER', 'Other'
 
     hotel = models.ForeignKey(
@@ -877,6 +1106,15 @@ class QRCode(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['hotel'],
+                condition=Q(placement='BOOKING'),
+                name='unique_booking_qr_per_hotel',
+            ),
+        ]
+
     def save(self, *args, **kwargs):
         if not self.code:
             self.code = secrets.token_urlsafe(6)
@@ -884,6 +1122,23 @@ class QRCode(models.Model):
 
     def __str__(self):
         return f'QR {self.code} ({self.hotel.name} - {self.placement})'
+
+
+class QRScanDaily(models.Model):
+    """Daily aggregate of raw QR code scans (pre-verification)."""
+    qr_code = models.ForeignKey(QRCode, on_delete=models.CASCADE, related_name='daily_scans')
+    date = models.DateField()  # Hotel-local date (not UTC)
+    scan_count = models.PositiveIntegerField(default=0)
+    unique_visitors = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        unique_together = ('qr_code', 'date')
+        indexes = [
+            models.Index(fields=['date', 'qr_code']),
+        ]
+
+    def __str__(self):
+        return f'QR {self.qr_code.code} on {self.date}: {self.scan_count} scans'
 
 
 class EscalationHeartbeat(models.Model):
@@ -900,3 +1155,330 @@ class EscalationHeartbeat(models.Model):
 
     def __str__(self):
         return f'{self.task_name}: {self.status} ({self.last_run})'
+
+
+class HotelInfoSection(models.Model):
+    ALLOWED_ICONS = frozenset({
+        'wifi', 'clock', 'utensils', 'phone', 'car', 'map-pin', 'shield',
+        'info', 'coffee', 'dumbbell', 'waves', 'luggage', 'credit-card',
+        'calendar', 'key', 'shirt', 'baby', 'dog', 'cigarette', 'heart',
+    })
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='info_sections',
+    )
+    title = models.CharField(max_length=200)
+    body = models.TextField(blank=True)
+    icon = models.CharField(max_length=50, blank=True)
+    display_order = models.IntegerField(default=0)
+    is_visible = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['display_order', 'id']
+        indexes = [
+            models.Index(fields=['hotel', 'display_order']),
+        ]
+
+    def __str__(self):
+        return f'{self.title} ({self.hotel.name})'
+
+
+def _hex_color_validator(value):
+    """Allow empty string or valid #RRGGBB hex color."""
+    import re
+    from django.core.exceptions import ValidationError
+    if value and not re.match(r'^#[0-9a-fA-F]{6}$', value):
+        raise ValidationError('Must be a valid hex color (e.g. #FF5733) or empty.')
+
+
+class BookingEmailTemplate(models.Model):
+    """One per hotel. Stores customizable text for the post-booking welcome email."""
+    hotel = models.OneToOneField(
+        Hotel, on_delete=models.CASCADE, related_name='booking_email_template',
+    )
+    qr_code = models.ForeignKey(
+        QRCode, on_delete=models.SET_NULL, null=True, blank=True,
+        help_text='Auto-created BOOKING QR code. Links to hotel landing page.',
+    )
+    subject = models.CharField(max_length=200, blank=True)
+    heading = models.CharField(max_length=200, blank=True)
+    body = models.TextField(blank=True, help_text='Welcome message paragraph(s)')
+    features = models.JSONField(default=list, blank=True, help_text='List of feature highlight strings')
+    cta_text = models.CharField(max_length=100, blank=True)
+    footer_text = models.CharField(max_length=500, blank=True)
+    primary_color = models.CharField(
+        max_length=7, blank=True, default='',
+        validators=[_hex_color_validator],
+        help_text='Override hotel primary color for this email. Empty = use hotel default.',
+    )
+    accent_color = models.CharField(
+        max_length=7, blank=True, default='',
+        validators=[_hex_color_validator],
+        help_text='Override hotel accent color for this email. Empty = use hotel default.',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Booking Email Template'
+
+    def clean(self):
+        import re
+        from django.core.exceptions import ValidationError
+        if self.qr_code_id:
+            qr = self.qr_code
+            if qr.hotel_id != self.hotel_id:
+                raise ValidationError({'qr_code': 'QR code must belong to the same hotel.'})
+            if qr.placement != 'BOOKING':
+                raise ValidationError({'qr_code': 'Only BOOKING QR codes can be linked.'})
+        errors = {}
+        for field in ('primary_color', 'accent_color'):
+            val = getattr(self, field)
+            if val and not re.match(r'^#[0-9a-fA-F]{6}$', val):
+                errors[field] = 'Must be a valid hex color (e.g. #FF5733) or empty.'
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        import re
+        from django.core.exceptions import ValidationError
+        errors = {}
+        for field in ('primary_color', 'accent_color'):
+            val = getattr(self, field)
+            if val and not re.match(r'^#[0-9a-fA-F]{6}$', val):
+                errors[field] = 'Must be a valid hex color (e.g. #FF5733) or empty.'
+        if errors:
+            raise ValidationError(errors)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'Booking email — {self.hotel.name}'
+
+
+class NotificationRoute(models.Model):
+    """Routes external notifications (WhatsApp, Email) to specific contacts per department/experience."""
+
+    class Channel(models.TextChoices):
+        WHATSAPP = 'WHATSAPP'
+        EMAIL = 'EMAIL'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='notification_routes',
+    )
+    department = models.ForeignKey(
+        Department, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+    )
+    event = models.ForeignKey(
+        Event, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+    )
+    experience = models.ForeignKey(
+        Experience, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+        help_text='If set, route only fires for this experience. If null, fires for all requests in the department.',
+    )
+    channel = models.CharField(max_length=20, choices=Channel.choices)
+
+    # Target contact — either linked to a team member or free-text for external contacts
+    member = models.ForeignKey(
+        HotelMembership, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+        help_text='Link to an existing team member. When set, target is auto-derived from member contact info.',
+    )
+    target = models.CharField(
+        max_length=255,
+        help_text='Phone (E.164) or email. Auto-filled from member if linked, or manually entered for external contacts.',
+    )
+    label = models.CharField(max_length=100, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # --- Department-scoped routes (existing) ---
+            # Experience-specific routes: one per (dept, exp, channel, target)
+            models.UniqueConstraint(
+                fields=['department', 'experience', 'channel', 'target'],
+                condition=Q(experience__isnull=False),
+                name='unique_route_with_experience',
+            ),
+            # Department-wide routes: one per (dept, channel, target) where experience IS NULL
+            models.UniqueConstraint(
+                fields=['department', 'channel', 'target'],
+                condition=Q(experience__isnull=True, event__isnull=True),
+                name='unique_route_dept_wide',
+            ),
+            # --- Event-scoped routes (new) ---
+            # Event routes: one per (event, channel, target)
+            models.UniqueConstraint(
+                fields=['event', 'channel', 'target'],
+                condition=Q(event__isnull=False),
+                name='unique_event_channel_target',
+            ),
+            # --- Scope exclusivity ---
+            # Exactly one scope: department XOR event
+            models.CheckConstraint(
+                check=(
+                    Q(department__isnull=False, event__isnull=True)
+                    | Q(department__isnull=True, event__isnull=False)
+                ),
+                name='route_scope_dept_xor_event',
+            ),
+            # Experience only valid on department-scoped routes
+            models.CheckConstraint(
+                check=Q(event__isnull=True) | Q(experience__isnull=True),
+                name='route_no_experience_on_event_scope',
+            ),
+        ]
+
+    def clean(self):
+        """Cross-hotel FK consistency and scope validation."""
+        from django.core.exceptions import ValidationError
+        errors = {}
+        # Scope: exactly one of department or event
+        has_dept = self.department_id is not None
+        has_event = self.event_id is not None
+        if has_dept == has_event:
+            errors['__all__'] = 'Exactly one of department or event must be set.'
+        if has_dept and self.department.hotel_id != self.hotel_id:
+            errors['department'] = 'Department must belong to this hotel.'
+        if has_event and self.event.hotel_id != self.hotel_id:
+            errors['event'] = 'Event must belong to this hotel.'
+        if has_event and self.experience_id:
+            errors['experience'] = 'Experience cannot be set on event-scoped routes.'
+        if self.experience_id and self.experience.department_id != self.department_id:
+            errors['experience'] = 'Experience must belong to the selected department.'
+        if self.member_id and self.member.hotel_id != self.hotel_id:
+            errors['member'] = 'Team member must belong to this hotel.'
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        import re
+        # Normalize phone to digits-only on write (canonical E.164 without +)
+        if self.channel == self.Channel.WHATSAPP:
+            self.target = re.sub(r'\D', '', self.target)
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        scope = self.event.name if self.event_id else self.department.name if self.department_id else '?'
+        return f'{self.channel} → {self.target} ({scope})'
+
+
+class DeliveryRecord(models.Model):
+    """Audit log for channel deliveries (WhatsApp, Email). Push uses existing Notification model."""
+
+    class Status(models.TextChoices):
+        QUEUED = 'QUEUED'
+        SENT = 'SENT'
+        DELIVERED = 'DELIVERED'
+        FAILED = 'FAILED'
+        SKIPPED = 'SKIPPED'
+
+    class MessageType(models.TextChoices):
+        TEMPLATE = 'TEMPLATE'
+        SESSION = 'SESSION'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, db_index=True,
+        help_text='Denormalized for efficient per-hotel log queries without joining through nullable route.',
+    )
+    route = models.ForeignKey(
+        'NotificationRoute', on_delete=models.SET_NULL, null=True,
+    )
+    request = models.ForeignKey(
+        ServiceRequest, on_delete=models.CASCADE, null=True,
+    )
+    channel = models.CharField(max_length=20, choices=NotificationRoute.Channel.choices)
+    target = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=50)
+    message_type = models.CharField(
+        max_length=20, choices=MessageType.choices, default=MessageType.TEMPLATE,
+        help_text='TEMPLATE = paid utility template, SESSION = free session message',
+    )
+    idempotency_key = models.CharField(
+        max_length=200, unique=True, null=True, blank=True,
+        help_text="'{event_type}:{public_id}:{escalation_tier}:{route_id}' — prevents duplicate sends on retries.",
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.QUEUED)
+    provider_message_id = models.CharField(max_length=100, blank=True)
+    error_message = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    acknowledged_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='When recipient tapped a quick-reply button (ack/esc_ack/view).',
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['channel', 'status', '-created_at']),
+            models.Index(
+                fields=['channel', 'provider_message_id'],
+                name='idx_dlvr_chan_provmsg',
+                condition=Q(provider_message_id__gt=''),
+            ),
+            models.Index(
+                fields=['hotel', '-created_at'],
+                name='idx_dlvr_hotel_created',
+            ),
+            models.Index(
+                fields=['hotel', 'channel', 'status', '-created_at'],
+                name='idx_dlvr_hotel_filtered',
+            ),
+            models.Index(
+                fields=['channel', 'target', 'request'],
+                name='idx_dlvr_ack_lookup',
+                condition=Q(acknowledged_at__isnull=True),
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['channel', 'provider_message_id'],
+                name='uniq_chan_provider_msg',
+                condition=Q(provider_message_id__gt=''),
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.channel} → {self.target} [{self.status}]'
+
+
+class WhatsAppServiceWindow(models.Model):
+    """Tracks 24-hour WhatsApp service windows per phone number per hotel.
+
+    A window opens when a staff member sends ANY inbound message to our
+    WhatsApp Business number (including tapping a quick-reply button on
+    a template). While the window is active, we can send free session
+    messages instead of paid utility templates — reducing costs by ~92%.
+    """
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='wa_service_windows',
+    )
+    phone = models.CharField(max_length=20, help_text='Digits-only E.164 without +')
+    last_inbound_at = models.DateTimeField(
+        help_text='When we last received an inbound message from this phone',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('hotel', 'phone')]
+        indexes = [
+            models.Index(fields=['phone', 'last_inbound_at']),
+        ]
+
+    @property
+    def is_active(self):
+        """True if the 24h window is still open (with 5-minute safety margin)."""
+        from datetime import timedelta
+        return self.last_inbound_at > timezone.now() - timedelta(hours=23, minutes=55)
+
+    def __str__(self):
+        return f'WA window: {self.phone} @ {self.hotel.name}'

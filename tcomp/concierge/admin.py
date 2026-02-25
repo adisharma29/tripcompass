@@ -5,6 +5,7 @@ from .models import (
     Hotel, HotelMembership, Department, Experience, Event,
     GuestStay, OTPCode, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode, EscalationHeartbeat,
+    BookingEmailTemplate,
 )
 
 
@@ -95,6 +96,12 @@ class QRCodeAdmin(admin.ModelAdmin):
     list_filter = ['placement', 'is_active', 'hotel']
     search_fields = ['code', 'label']
     readonly_fields = ['code']
+
+
+@admin.register(BookingEmailTemplate)
+class BookingEmailTemplateAdmin(admin.ModelAdmin):
+    list_display = ['hotel', 'subject', 'updated_at']
+    readonly_fields = ['created_at', 'updated_at']
 
 
 @admin.register(EscalationHeartbeat)

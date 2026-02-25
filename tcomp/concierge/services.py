@@ -1,10 +1,13 @@
+import datetime
 import hashlib
 import io
 import json
 import logging
 import random
+import re
 import secrets
 import string
+import zoneinfo
 from datetime import timedelta
 
 import redis as redis_lib
@@ -296,28 +299,31 @@ def verify_otp(phone, code, hotel=None, qr_code_str=None):
         if not otp:
             raise ValidationError('Invalid or expired OTP.')
 
-        # Check if phone belongs to existing staff user
-        try:
-            user = User.objects.get(phone=phone, user_type='STAFF')
+        # Check if phone belongs to existing staff user.
+        # Try normalized (digits-only) first, fall back to +prefixed
+        # for pre-backfill compatibility.
+        user = (
+            User.objects.filter(phone=phone, user_type='STAFF').first()
+            or User.objects.filter(phone=f'+{phone}', user_type='STAFF').first()
+        )
+        if user:
             if not user.is_active:
                 raise ValidationError('Account is disabled.')
             otp.is_used = True
             otp.save(update_fields=['is_used'])
             return user, None
-        except User.DoesNotExist:
-            pass
 
         # Guest flow — hotel is required (validate before consuming the OTP)
         if not hotel:
             raise ValidationError('hotel_slug is required for non-staff users.')
 
         # Check if existing guest is disabled before consuming the OTP
-        try:
-            existing_guest = User.objects.get(phone=phone, user_type='GUEST')
-            if not existing_guest.is_active:
-                raise ValidationError('Account is disabled.')
-        except User.DoesNotExist:
-            existing_guest = None
+        existing_guest = (
+            User.objects.filter(phone=phone, user_type='GUEST').first()
+            or User.objects.filter(phone=f'+{phone}', user_type='GUEST').first()
+        )
+        if existing_guest and not existing_guest.is_active:
+            raise ValidationError('Account is disabled.')
 
         # Mark as used atomically — concurrent requests block on select_for_update
         # and will see is_used=True when they acquire the lock.
@@ -333,7 +339,10 @@ def verify_otp(phone, code, hotel=None, qr_code_str=None):
             user = User.objects.create_guest_user(phone=phone)
         except IntegrityError:
             # Another request created the user between our get() and create()
-            user = User.objects.get(phone=phone, user_type='GUEST')
+            user = (
+                User.objects.filter(phone=phone, user_type='GUEST').first()
+                or User.objects.get(phone=f'+{phone}', user_type='GUEST')
+            )
 
     # Resolve QR code
     qr = None
@@ -729,7 +738,15 @@ def _fire_escalation(request_obj, tier, hotel):
 
     # Step 3: Send notification
     try:
-        notify_department_staff(request_obj.department, request_obj)
+        from .notifications import NotificationEvent, dispatch_notification
+        dispatch_notification(NotificationEvent(
+            event_type='escalation',
+            hotel=hotel,
+            department=request_obj.department,
+            request=request_obj,
+            event_obj=request_obj.event,
+            escalation_tier=tier,
+        ))
         activity.notified_at = timezone.now()
         activity.save(update_fields=['notified_at'])
     except Exception:
@@ -763,8 +780,15 @@ def send_response_due_reminders():
         reminder_sent_at__isnull=True,
     ).select_related('department', 'hotel', 'guest_stay')
 
+    from .notifications import NotificationEvent, dispatch_notification
     for req in overdue:
-        notify_department_staff(req.department, req)
+        dispatch_notification(NotificationEvent(
+            event_type='response_due',
+            hotel=req.hotel,
+            department=req.department,
+            request=req,
+            event_obj=req.event,
+        ))
         req.reminder_sent_at = now
         req.save(update_fields=['reminder_sent_at'])
 
@@ -875,9 +899,15 @@ def get_dashboard_stats(hotel, department=None):
     if department:
         qs = qs.filter(department=department)
 
-    now = timezone.now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_qs = qs.filter(created_at__gte=today_start)
+    # Compute "today" in the hotel's configured timezone (fallback to UTC)
+    try:
+        hotel_tz = zoneinfo.ZoneInfo(hotel.timezone) if hotel.timezone else zoneinfo.ZoneInfo('UTC')
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        hotel_tz = zoneinfo.ZoneInfo('UTC')
+    now_local = timezone.now().astimezone(hotel_tz)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + datetime.timedelta(days=1)
+    today_qs = qs.filter(created_at__gte=today_start, created_at__lt=tomorrow_start)
 
     total = today_qs.count()
     pending = today_qs.filter(status=ServiceRequest.Status.CREATED).count()
@@ -894,6 +924,10 @@ def get_dashboard_stats(hotel, department=None):
 
     setup = {
         'settings_configured': hotel.settings_configured,
+        'settings_partial': bool(
+            hotel.settings_configured
+            and not (hotel.timezone and hotel.whatsapp_number)
+        ),
         'has_departments': hotel.departments.exists(),
         'has_experiences': Experience.objects.filter(department__hotel=hotel).exists(),
         'has_photos': (
@@ -905,6 +939,7 @@ def get_dashboard_stats(hotel, department=None):
         'has_published': hotel.departments.filter(status=ContentStatus.PUBLISHED).exists(),
     }
 
+    # %-d is Linux/macOS only; backend is always Docker Linux.
     return {
         'total_requests': total,
         'pending': pending,
@@ -913,6 +948,10 @@ def get_dashboard_stats(hotel, department=None):
         'conversion_rate': round(conversion_rate, 1),
         'by_department': by_department,
         'setup': setup,
+        'period_label': 'Today',
+        'period_date_display': now_local.strftime('%a, %-d %b'),
+        'period_date': now_local.strftime('%Y-%m-%d'),
+        'period_timezone': str(hotel_tz),
     }
 
 
@@ -924,3 +963,180 @@ def validate_and_process_image(file):
     """Validate and process uploaded image. Wrapper around validators."""
     from .validators import validate_image_upload
     return validate_image_upload(file)
+
+
+# ---------------------------------------------------------------------------
+# Staff invitation notifications
+# ---------------------------------------------------------------------------
+
+def _normalize_phone(phone):
+    """Strip to digits only (E.164 without '+').  e.g. '+91 918-755-1736' → '919187551736'."""
+    return re.sub(r'\D', '', phone)
+
+
+def send_staff_invite_whatsapp(phone, first_name, hotel_name, role_display):
+    """Send WhatsApp invitation to newly added staff member.
+
+    Raises on transient errors (network, timeout) so the Celery task can retry.
+    Returns False only for permanent/config failures (missing keys, API rejection).
+    """
+    api_key = settings.GUPSHUP_WA_API_KEY
+    template_id = settings.GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID
+    if not api_key or not template_id:
+        logger.warning('Staff invite WA skipped: missing API key or template ID')
+        return False
+
+    normalized = _normalize_phone(phone)
+    if len(normalized) < 10:
+        logger.warning('Staff invite WA skipped: phone too short after normalization: %s', phone)
+        return False
+
+    payload = {
+        'channel': 'whatsapp',
+        'source': settings.GUPSHUP_WA_SOURCE_PHONE,
+        'destination': normalized,
+        'src.name': settings.GUPSHUP_WA_APP_NAME,
+        'template': json.dumps({
+            'id': template_id,
+            'params': [hotel_name, first_name or 'there', hotel_name, role_display],
+        }),
+    }
+
+    # Let network/timeout errors propagate → Celery task retries.
+    resp = http_requests.post(
+        'https://api.gupshup.io/wa/api/v1/template/msg',
+        data=payload,
+        headers={'apikey': api_key},
+        timeout=10,
+    )
+    # 5xx = transient provider error → raise so Celery retries
+    if resp.status_code >= 500:
+        raise RuntimeError(
+            f'Gupshup server error {resp.status_code}: {resp.text[:200]}'
+        )
+    # Parse JSON safely — malformed responses on 4xx are permanent failures
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        if resp.status_code in (200, 202):
+            # Success status but unparseable body — treat as transient
+            raise RuntimeError(f'Gupshup returned non-JSON on {resp.status_code}: {resp.text[:200]}')
+        logger.warning('Staff invite WA rejected (non-JSON): %s %s', resp.status_code, resp.text[:200])
+        return False
+    if resp.status_code in (200, 202) and data.get('status') == 'submitted':
+        logger.info('Staff invite WA sent to %s (msgId=%s)', normalized, data.get('messageId'))
+        return True
+    # 4xx = permanent (bad template, invalid number, auth error)
+    logger.warning('Staff invite WA rejected: %s %s', resp.status_code, data)
+    return False
+
+
+def send_staff_invite_email(email, first_name, hotel_name, role_display):
+    """Send email invitation to newly added staff member via Resend."""
+    api_key = settings.RESEND_API_KEY
+    if not api_key:
+        logger.warning('Staff invite email skipped: missing RESEND_API_KEY')
+        return False
+
+    import resend
+    resend.api_key = api_key
+
+    login_url = 'https://refuje.com/login'
+    greeting = first_name or 'there'
+
+    html = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
+      <h2 style="color: #1a1a1a; font-size: 22px; margin-bottom: 8px;">You're invited to {hotel_name}</h2>
+      <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 20px;">
+        Hi {greeting}, the team at <strong>{hotel_name}</strong> has added you as
+        <strong>{role_display}</strong> on their concierge platform.
+        You can now view and manage guest requests from your dashboard.
+      </p>
+      <a href="{login_url}"
+         style="display: inline-block; background: #1a1a1a; color: #ffffff; text-decoration: none;
+                padding: 12px 28px; border-radius: 6px; font-size: 15px; font-weight: 500;">
+        Log In to Your Dashboard
+      </a>
+      <p style="color: #888; font-size: 13px; margin-top: 28px; line-height: 1.5;">
+        Use your phone number or email to log in.
+        If you didn't expect this invitation, you can safely ignore this email.
+      </p>
+      <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
+      <p style="color: #aaa; font-size: 12px;">Powered by Refuje</p>
+    </div>
+    """
+
+    from resend.exceptions import (
+        ValidationError, MissingRequiredFieldsError,
+        MissingApiKeyError, InvalidApiKeyError,
+    )
+
+    # Known-permanent Resend errors — don't retry these.
+    _PERMANENT = (ValidationError, MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError)
+
+    try:
+        response = resend.Emails.send({
+            'from': settings.RESEND_FROM_EMAIL,
+            'to': [email],
+            'subject': f"You're invited to {hotel_name}",
+            'html': html,
+            'tags': [
+                {'name': 'type', 'value': 'staff_invite'},
+                {'name': 'hotel', 'value': re.sub(r'[^A-Za-z0-9_-]', '-', hotel_name)},
+            ],
+        })
+        logger.info('Staff invite email sent to %s (id=%s)', email, response.get('id'))
+        return True
+    except _PERMANENT as exc:
+        # 400/401/403/422 — permanent, don't retry.
+        logger.warning('Staff invite email permanently rejected for %s: %s', email, exc)
+        return False
+    # All other exceptions (RateLimitError 429, ApplicationError 500, future
+    # transient ResendError subclasses, network/DNS errors) propagate → Celery retry.
+
+
+def send_staff_invite_notification(user, hotel, role, *, skip_channels=None):
+    """Send invitation notifications to a newly added staff member.
+
+    Sends WhatsApp if phone is available, email if email is available.
+    Returns a set of resolved channels (succeeded or permanently failed).
+    Raises on the first transient error after attempting all remaining channels,
+    so the Celery task can retry with skip_channels for already-resolved ones.
+
+    "Resolved" means the channel doesn't need to be retried — either it
+    succeeded (True) or permanently failed (False). Only transient errors
+    (raised exceptions) leave a channel unresolved.
+    """
+    skip = skip_channels or set()
+    role_display = dict(HotelMembership.Role.choices).get(role, role)
+    hotel_name = hotel.name
+    first_name = user.first_name
+    resolved = set(skip)  # carry forward prior resolved channels
+    errors = []
+
+    if user.phone and 'whatsapp' not in skip:
+        try:
+            send_staff_invite_whatsapp(user.phone, first_name, hotel_name, role_display)
+            # True = sent, False = permanent failure (bad number, missing config)
+            resolved.add('whatsapp')
+        except Exception as exc:
+            # Transient — leave unresolved so retry attempts again
+            logger.exception('Staff invite WA transient error for %s', user.phone)
+            errors.append(exc)
+
+    if user.email and 'email' not in skip:
+        try:
+            send_staff_invite_email(user.email, first_name, hotel_name, role_display)
+            # True = sent, False = permanent Resend rejection
+            resolved.add('email')
+        except Exception as exc:
+            # Transient — leave unresolved so retry attempts again
+            logger.exception('Staff invite email transient error for %s', user.email)
+            errors.append(exc)
+
+    if errors:
+        # Attach resolved channels so the Celery task skips them on retry
+        errors[0]._resolved_channels = resolved
+        raise errors[0]
+
+    return resolved

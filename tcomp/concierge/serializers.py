@@ -7,15 +7,62 @@ from rest_framework import serializers
 
 from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
-    ExperienceImage, Event, GuestStay, ServiceRequest, RequestActivity,
-    Notification, PushSubscription, QRCode,
+    ExperienceImage, DepartmentImage, Event, EventImage,
+    GuestStay, ServiceRequest, RequestActivity,
+    Notification, NotificationRoute, PushSubscription, QRCode, HotelInfoSection,
+    BookingEmailTemplate,
 )
 from .validators import validate_image_upload
 
 ALLOWED_HTML_TAGS = [
-    'p', 'br', 'strong', 'em', 's', 'h2', 'h3',
-    'ul', 'ol', 'li', 'blockquote', 'hr',
+    'p', 'br', 'strong', 'em', 'u', 's', 'h2', 'h3',
+    'ul', 'ol', 'li', 'blockquote', 'hr', 'a', 'img',
 ]
+ALLOWED_HTML_ATTRIBUTES = {
+    'a': ['href'],
+    'img': ['src', 'alt', 'width', 'height'],
+}
+
+
+def _get_allowed_img_hosts():
+    """Build the set of hostnames that guest-page CSP img-src allows."""
+    from urllib.parse import urlparse
+    from django.conf import settings
+    hosts = set()
+    # The storage backend's own domain (R2 CDN in prod, localhost in dev)
+    media_url = getattr(settings, 'MEDIA_URL', '')
+    parsed = urlparse(media_url)
+    if parsed.hostname:
+        hosts.add(parsed.hostname)
+    # Explicit R2 public bucket
+    custom = getattr(settings, 'AWS_S3_CUSTOM_DOMAIN', None)
+    if custom:
+        hosts.add(custom)
+    # API's own domain serves /media/ in dev
+    for allowed in getattr(settings, 'ALLOWED_HOSTS', []):
+        if allowed and allowed != '*':
+            hosts.add(allowed.lstrip('.'))
+    return hosts
+
+
+def _sanitize_img_src(html):
+    """Remove <img> tags whose src is not from an allowed host (matches guest CSP img-src)."""
+    allowed = _get_allowed_img_hosts()
+
+    def _check(match):
+        from urllib.parse import urlparse
+        src_match = re.search(r'src=["\']([^"\']*)["\']', match.group(0))
+        if not src_match:
+            return ''
+        src = src_match.group(1)
+        if not src.lower().startswith(('https://', 'http://')):
+            return ''
+        host = urlparse(src).hostname or ''
+        if not any(host == h or host.endswith('.' + h) for h in allowed):
+            return ''
+        return match.group(0)
+
+    return re.sub(r'<img\b[^>]*/?>', _check, html)
 
 
 def _clean_image(file):
@@ -46,12 +93,33 @@ class ExperienceImageSerializer(serializers.ModelSerializer):
         return _clean_image(value)
 
 
+class DepartmentImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DepartmentImage
+        fields = ['id', 'image', 'alt_text', 'display_order', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def validate_image(self, value):
+        return _clean_image(value)
+
+
+class EventImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = EventImage
+        fields = ['id', 'image', 'alt_text', 'display_order', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def validate_image(self, value):
+        return _clean_image(value)
+
+
 # ---------------------------------------------------------------------------
 # Public serializers
 # ---------------------------------------------------------------------------
 
 class ExperiencePublicSerializer(serializers.ModelSerializer):
     gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+    is_deal_active = serializers.SerializerMethodField()
 
     class Meta:
         model = Experience
@@ -59,22 +127,79 @@ class ExperiencePublicSerializer(serializers.ModelSerializer):
             'id', 'name', 'slug', 'description', 'photo', 'cover_image',
             'price_display', 'category', 'timing', 'duration', 'capacity',
             'highlights', 'display_order', 'gallery_images',
+            'is_top_deal', 'deal_price_display', 'deal_ends_at',
+            'is_deal_active',
+        ]
+
+    def get_is_deal_active(self, obj):
+        if not obj.is_top_deal:
+            return False
+        if obj.deal_ends_at is None:
+            return True
+        return obj.deal_ends_at > timezone.now()
+
+
+class TopDealSerializer(ExperiencePublicSerializer):
+    """Extended public serializer for /top-deals/ endpoint with routing fields."""
+    department_slug = serializers.CharField(source='department.slug', read_only=True)
+    department_name = serializers.CharField(source='department.name', read_only=True)
+
+    class Meta(ExperiencePublicSerializer.Meta):
+        fields = ExperiencePublicSerializer.Meta.fields + [
+            'department_slug', 'department_name',
         ]
 
 
 class DepartmentPublicSerializer(serializers.ModelSerializer):
     experiences = ExperiencePublicSerializer(many=True, read_only=True)
+    gallery_images = DepartmentImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Department
         fields = [
             'id', 'name', 'slug', 'description', 'photo', 'icon',
             'display_order', 'schedule', 'is_ops', 'experiences',
+            'gallery_images',
         ]
+
+
+class HotelInfoSectionPublicSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = HotelInfoSection
+        fields = ['id', 'title', 'body', 'icon', 'display_order']
+
+
+class HotelInfoSectionSerializer(serializers.ModelSerializer):
+    """Admin serializer — full CRUD with validation."""
+    ALLOWED_ICONS = HotelInfoSection.ALLOWED_ICONS
+
+    class Meta:
+        model = HotelInfoSection
+        fields = [
+            'id', 'title', 'body', 'icon', 'display_order', 'is_visible',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_icon(self, value):
+        if value and value not in self.ALLOWED_ICONS:
+            raise serializers.ValidationError(
+                f'Invalid icon key. Allowed: {sorted(self.ALLOWED_ICONS)}'
+            )
+        return value
+
+    def validate_body(self, value):
+        if value:
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
+        return value
 
 
 class HotelPublicSerializer(serializers.ModelSerializer):
     departments = DepartmentPublicSerializer(many=True, read_only=True)
+    info_sections = HotelInfoSectionPublicSerializer(many=True, read_only=True)
+    destination_slug = serializers.SlugRelatedField(
+        source='destination', slug_field='slug', read_only=True,
+    )
 
     class Meta:
         model = Hotel
@@ -88,9 +213,26 @@ class HotelPublicSerializer(serializers.ModelSerializer):
             'instagram_url', 'facebook_url', 'twitter_url', 'whatsapp_number',
             # Footer & Legal
             'footer_text', 'terms_url', 'privacy_url',
+            # Explore tab
+            'destination_slug',
             # Relations
-            'departments',
+            'departments', 'info_sections',
         ]
+
+
+class _DestinationSlugField(serializers.SlugRelatedField):
+    """Lazy-loaded queryset to avoid circular import with guides app.
+    Includes the hotel's current destination even if unpublished,
+    so unrelated settings edits don't 400."""
+    def get_queryset(self):
+        from guides.models import Destination
+        qs = Destination.objects.filter(is_published=True)
+        # If updating an existing hotel, also allow its current destination
+        if self.parent and self.parent.instance:
+            current = self.parent.instance.destination_id
+            if current:
+                qs = qs | Destination.objects.filter(pk=current)
+        return qs.distinct()
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +243,10 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
     # Write-only flags to clear image fields via multipart or JSON
     favicon_clear = serializers.BooleanField(write_only=True, required=False, default=False)
     og_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    destination_slug = _DestinationSlugField(
+        source='destination', slug_field='slug',
+        required=False, allow_null=True,
+    )
 
     class Meta:
         model = Hotel
@@ -110,6 +256,8 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'escalation_enabled', 'escalation_fallback_channel',
             'oncall_email', 'oncall_phone', 'require_frontdesk_kiosk',
             'escalation_tier_minutes', 'settings_configured',
+            # Booking window defaults
+            'default_booking_opens_hours', 'default_booking_closes_hours',
             # Brand
             'primary_color', 'secondary_color', 'accent_color',
             'heading_font', 'body_font', 'favicon', 'og_image',
@@ -118,8 +266,20 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'instagram_url', 'facebook_url', 'twitter_url', 'whatsapp_number',
             # Footer & Legal
             'footer_text', 'terms_url', 'privacy_url',
+            # Explore tab
+            'destination_slug',
+            # Notification channels
+            'whatsapp_notifications_enabled', 'email_notifications_enabled',
         ]
         read_only_fields = ['settings_configured']
+
+    def validate_room_number_pattern(self, value):
+        if value:
+            try:
+                re.compile(value)
+            except re.error:
+                raise serializers.ValidationError('Invalid regex pattern.')
+        return value
 
     def validate_favicon(self, value):
         return _clean_image(value)
@@ -167,6 +327,29 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
                     'Escalation enabled requires either a fallback channel with '
                     'contact info or require_frontdesk_kiosk=True.'
                 )
+
+        # Booking window defaults: upper bounds + opens >= closes
+        opens = data.get(
+            'default_booking_opens_hours',
+            getattr(self.instance, 'default_booking_opens_hours', 0),
+        )
+        closes = data.get(
+            'default_booking_closes_hours',
+            getattr(self.instance, 'default_booking_closes_hours', 0),
+        )
+        if opens > 8760:
+            raise serializers.ValidationError(
+                {'default_booking_opens_hours': 'Cannot exceed 8760 hours (1 year).'}
+            )
+        if closes > 720:
+            raise serializers.ValidationError(
+                {'default_booking_closes_hours': 'Cannot exceed 720 hours (30 days).'}
+            )
+        if opens > 0 and closes > 0 and opens < closes:
+            raise serializers.ValidationError(
+                'Default booking opens must be >= default booking closes.'
+            )
+
         return data
 
 
@@ -174,6 +357,7 @@ class _ExperienceNestedSerializer(serializers.ModelSerializer):
     """Lightweight serializer for experiences nested inside admin DepartmentSerializer.
     Includes status/is_active fields that ExperiencePublicSerializer omits."""
     gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+    is_deal_active = serializers.SerializerMethodField()
 
     class Meta:
         model = Experience
@@ -182,20 +366,29 @@ class _ExperienceNestedSerializer(serializers.ModelSerializer):
             'price', 'price_display', 'category', 'timing', 'duration',
             'capacity', 'highlights', 'display_order', 'gallery_images',
             'is_active', 'status', 'published_at', 'created_at', 'updated_at',
+            'is_top_deal', 'deal_price_display', 'deal_ends_at',
+            'is_deal_active',
         ]
+
+    def get_is_deal_active(self, obj):
+        if not obj.is_top_deal:
+            return False
+        if obj.deal_ends_at is None:
+            return True
+        return obj.deal_ends_at > timezone.now()
 
 
 class DepartmentSerializer(serializers.ModelSerializer):
     experiences = _ExperienceNestedSerializer(many=True, read_only=True)
-    icon_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    gallery_images = DepartmentImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Department
         fields = [
-            'id', 'name', 'slug', 'description', 'photo', 'icon', 'icon_clear',
+            'id', 'name', 'slug', 'description', 'photo', 'icon',
             'display_order', 'schedule', 'is_ops', 'is_active',
             'status', 'published_at',
-            'experiences', 'created_at', 'updated_at',
+            'experiences', 'gallery_images', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at']
 
@@ -203,11 +396,13 @@ class DepartmentSerializer(serializers.ModelSerializer):
         return _clean_image(value)
 
     def validate_icon(self, value):
-        return _clean_image(value)
+        if value and value not in Department.ALLOWED_DEPARTMENT_ICONS:
+            raise serializers.ValidationError('Invalid icon key.')
+        return value
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
         return value
 
     _VALID_DAY_KEYS = frozenset([
@@ -285,14 +480,9 @@ class DepartmentSerializer(serializers.ModelSerializer):
         new_status = validated_data.get('status')
         if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
-        if validated_data.pop('icon_clear', False):
-            if instance.icon:
-                instance.icon.delete(save=False)
-            setattr(instance, 'icon', '')
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
-        validated_data.pop('icon_clear', None)
         if validated_data.get('status') == ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
@@ -303,18 +493,31 @@ class ExperienceSerializer(serializers.ModelSerializer):
         queryset=Department.objects.all(),
     )
     gallery_images = ExperienceImageSerializer(many=True, read_only=True)
+    is_deal_active = serializers.SerializerMethodField()
+    photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
 
     class Meta:
         model = Experience
         fields = [
             'id', 'department', 'name', 'slug', 'description',
-            'photo', 'cover_image', 'price', 'price_display',
+            'photo', 'cover_image', 'photo_clear', 'cover_image_clear',
+            'price', 'price_display',
             'category', 'timing', 'duration', 'capacity',
             'highlights', 'is_active', 'display_order',
             'status', 'published_at',
+            'is_top_deal', 'deal_price_display', 'deal_ends_at',
+            'is_deal_active',
             'gallery_images', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'slug', 'is_active', 'published_at', 'created_at', 'updated_at', 'is_deal_active']
+
+    def get_is_deal_active(self, obj):
+        if not obj.is_top_deal:
+            return False
+        if obj.deal_ends_at is None:
+            return True
+        return obj.deal_ends_at > timezone.now()
 
     def validate_department(self, value):
         hotel = self.context.get('hotel')
@@ -332,16 +535,56 @@ class ExperienceSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
         return value
+
+    def validate_deal_ends_at(self, value):
+        # Coerce FormData empty string to None
+        if value == '' or value is None:
+            return None
+        return value
+
+    def validate(self, data):
+        is_top_deal = data.get('is_top_deal', getattr(self.instance, 'is_top_deal', False))
+
+        if is_top_deal:
+            deal_price = data.get(
+                'deal_price_display',
+                getattr(self.instance, 'deal_price_display', ''),
+            )
+            if not deal_price or not deal_price.strip():
+                raise serializers.ValidationError(
+                    {'deal_price_display': 'Deal price is required when marking as a top deal.'}
+                )
+            # Only enforce future check when deal_ends_at is explicitly in this request
+            if 'deal_ends_at' in data and data['deal_ends_at'] is not None:
+                if data['deal_ends_at'] <= timezone.now():
+                    raise serializers.ValidationError(
+                        {'deal_ends_at': 'Deal end time must be in the future.'}
+                    )
+        else:
+            # Auto-clear deal fields when toggled off
+            data['deal_price_display'] = ''
+            data['deal_ends_at'] = None
+
+        return data
 
     def update(self, instance, validated_data):
         new_status = validated_data.get('status')
         if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
+        # Handle image field clearing
+        for field in ('photo', 'cover_image'):
+            if validated_data.pop(f'{field}_clear', False):
+                file_field = getattr(instance, field)
+                if file_field:
+                    file_field.delete(save=False)
+                setattr(instance, field, '')
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
+        validated_data.pop('photo_clear', None)
+        validated_data.pop('cover_image_clear', None)
         if validated_data.get('status') == ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
@@ -351,6 +594,25 @@ class ExperienceSerializer(serializers.ModelSerializer):
 # Event serializers
 # ---------------------------------------------------------------------------
 
+class _NullableIntegerField(serializers.IntegerField):
+    """IntegerField that coerces '' to None — needed for multipart/FormData.
+
+    min_value is enforced here (not via DRF's MinValueValidator) to avoid
+    the validator crashing when the coerced value is None.
+    """
+    def __init__(self, **kwargs):
+        self._min = kwargs.pop('min_value', None)
+        super().__init__(**kwargs)
+
+    def to_internal_value(self, data):
+        if data == '' or data is None:
+            return None
+        value = super().to_internal_value(data)
+        if self._min is not None and value < self._min:
+            self.fail('min_value', min_value=self._min)
+        return value
+
+
 class EventSerializer(serializers.ModelSerializer):
     """Admin serializer for Event CRUD."""
     experience = serializers.PrimaryKeyRelatedField(
@@ -359,8 +621,16 @@ class EventSerializer(serializers.ModelSerializer):
     department = serializers.PrimaryKeyRelatedField(
         queryset=Department.objects.all(), required=False, allow_null=True,
     )
+    booking_opens_hours = _NullableIntegerField(
+        required=False, allow_null=True, min_value=0,
+    )
+    booking_closes_hours = _NullableIntegerField(
+        required=False, allow_null=True, min_value=0,
+    )
     photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
     cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    gallery_images = EventImageSerializer(many=True, read_only=True)
+    resolved_department_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
@@ -371,13 +641,15 @@ class EventSerializer(serializers.ModelSerializer):
             'price_display', 'highlights', 'category',
             'event_start', 'event_end', 'is_all_day',
             'is_recurring', 'recurrence_rule',
+            'booking_opens_hours', 'booking_closes_hours',
+            'notify_department', 'resolved_department_name',
             'is_featured', 'status', 'is_active', 'published_at',
             'auto_expire', 'display_order',
-            'created_at', 'updated_at',
+            'gallery_images', 'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'hotel', 'slug', 'is_active', 'published_at',
-            'created_at', 'updated_at',
+            'created_at', 'updated_at', 'resolved_department_name',
         ]
 
     def validate_experience(self, value):
@@ -404,6 +676,10 @@ class EventSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def get_resolved_department_name(self, obj):
+        dept = obj.get_routing_department()
+        return dept.name if dept else None
+
     def validate_photo(self, value):
         return _clean_image(value)
 
@@ -412,7 +688,7 @@ class EventSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         if value:
-            return bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes={}, strip=True)
+            return _sanitize_img_src(bleach.clean(value, tags=ALLOWED_HTML_TAGS, attributes=ALLOWED_HTML_ATTRIBUTES, strip=True))
         return value
 
     def validate(self, data):
@@ -444,6 +720,33 @@ class EventSerializer(serializers.ModelSerializer):
                 if hasattr(e, 'message_dict'):
                     raise serializers.ValidationError(e.message_dict)
                 raise serializers.ValidationError({'recurrence_rule': str(e)})
+
+        # Cross-field: booking window opens >= closes
+        opens = data.get('booking_opens_hours')
+        closes = data.get('booking_closes_hours')
+        if opens is not None and opens > 8760:
+            raise serializers.ValidationError(
+                {'booking_opens_hours': 'Cannot exceed 8760 hours (1 year).'}
+            )
+        if closes is not None and closes > 720:
+            raise serializers.ValidationError(
+                {'booking_closes_hours': 'Cannot exceed 720 hours (30 days).'}
+            )
+        # Resolve effective values for cross-field check
+        hotel = self.context.get('hotel') or (self.instance.hotel if self.instance else None)
+        eff_opens = opens if opens is not None else (
+            self.instance.booking_opens_hours if self.instance and self.instance.booking_opens_hours is not None
+            else (hotel.default_booking_opens_hours if hotel else 0)
+        )
+        eff_closes = closes if closes is not None else (
+            self.instance.booking_closes_hours if self.instance and self.instance.booking_closes_hours is not None
+            else (hotel.default_booking_closes_hours if hotel else 0)
+        )
+        if eff_opens > 0 and eff_closes > 0 and eff_opens < eff_closes:
+            raise serializers.ValidationError(
+                'Booking opens window must be >= closes window.'
+            )
+
         return data
 
     def _handle_image_clears(self, instance, validated_data):
@@ -488,11 +791,15 @@ def _get_safe_routing_department(event):
 class EventPublicSerializer(serializers.ModelSerializer):
     """Guest-facing serializer for published events."""
     next_occurrence = serializers.SerializerMethodField()
+    booking_opens_at = serializers.SerializerMethodField()
+    booking_closes_at = serializers.SerializerMethodField()
+    is_bookable = serializers.SerializerMethodField()
     routing_department_slug = serializers.SerializerMethodField()
     routing_department_name = serializers.SerializerMethodField()
     experience_name = serializers.SerializerMethodField()
     experience_slug = serializers.SerializerMethodField()
     experience_department_slug = serializers.SerializerMethodField()
+    gallery_images = EventImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Event
@@ -502,14 +809,36 @@ class EventPublicSerializer(serializers.ModelSerializer):
             'event_start', 'event_end', 'is_all_day',
             'is_recurring', 'recurrence_rule',
             'is_featured', 'next_occurrence',
+            'booking_opens_at', 'booking_closes_at', 'is_bookable',
             'department',
             'routing_department_slug', 'routing_department_name',
             'experience_name', 'experience_slug', 'experience_department_slug',
+            'gallery_images',
         ]
 
     def get_next_occurrence(self, obj):
         dt = obj.get_next_occurrence()
         return dt.isoformat() if dt else None
+
+    def get_booking_opens_at(self, obj):
+        """Window for next_occurrence (display default). Frontend uses this for CTA state."""
+        target = obj.resolve_target_datetime()
+        if target is None:
+            return None
+        opens_at, _ = obj.get_booking_window_for(target)
+        return opens_at.isoformat() if opens_at else None
+
+    def get_booking_closes_at(self, obj):
+        target = obj.resolve_target_datetime()
+        if target is None:
+            return None
+        _, closes_at = obj.get_booking_window_for(target)
+        return closes_at.isoformat() if closes_at else None
+
+    def get_is_bookable(self, obj):
+        """Bookable right now for the next occurrence."""
+        target = obj.resolve_target_datetime()
+        return obj.is_bookable_for(target)
 
     def get_routing_department_slug(self, obj):
         dept = _get_safe_routing_department(obj)
@@ -540,19 +869,41 @@ class HotelMinimalSerializer(serializers.ModelSerializer):
 
 
 class MemberSerializer(serializers.ModelSerializer):
-    email = serializers.EmailField(source='user.email', read_only=True)
-    first_name = serializers.CharField(source='user.first_name', read_only=True)
-    last_name = serializers.CharField(source='user.last_name', read_only=True)
-    phone = serializers.CharField(source='user.phone', read_only=True)
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    email = serializers.EmailField(
+        source='user.email', required=False, allow_blank=True, default='',
+    )
+    first_name = serializers.CharField(
+        source='user.first_name', required=False, allow_blank=True, default='',
+    )
+    last_name = serializers.CharField(
+        source='user.last_name', required=False, allow_blank=True, default='',
+    )
+    phone = serializers.CharField(
+        source='user.phone', required=False, allow_blank=True, default='',
+    )
     hotel = HotelMinimalSerializer(read_only=True)
+    route_count = serializers.IntegerField(read_only=True, default=0)
+    assignment_count = serializers.IntegerField(read_only=True, default=0)
 
     class Meta:
         model = HotelMembership
         fields = [
-            'id', 'hotel', 'email', 'first_name', 'last_name', 'phone',
+            'id', 'user_id', 'hotel', 'email', 'first_name', 'last_name', 'phone',
             'role', 'department', 'is_active', 'created_at',
+            'route_count', 'assignment_count',
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'user_id', 'created_at', 'route_count', 'assignment_count']
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
 
     def validate_department(self, value):
         hotel = self.context.get('hotel')
@@ -562,6 +913,21 @@ class MemberSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def _validate_user_field_uniqueness(self, field_name, value):
+        """Check that email/phone is unique across User table (excluding current member's user)."""
+        if not value:
+            return
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        qs = User.objects.filter(**{field_name: value})
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.user_id)
+        if qs.exists():
+            raise serializers.ValidationError({
+                field_name: f'This {field_name} is already associated with another account. '
+                            'Use Merge to combine records.',
+            })
+
     def validate(self, data):
         role = data.get('role', getattr(self.instance, 'role', None))
         department = data.get('department', getattr(self.instance, 'department', None))
@@ -569,6 +935,186 @@ class MemberSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {'department': 'Department is required for STAFF role.'}
             )
+        # Validate user field uniqueness
+        user_data = data.get('user', {})
+        if 'email' in user_data:
+            self._validate_user_field_uniqueness('email', user_data['email'])
+        if 'phone' in user_data:
+            self._validate_user_field_uniqueness('phone', user_data['phone'])
+        # Ensure at least one contact method remains after update
+        if self.instance:
+            effective_email = user_data.get('email', self.instance.user.email)
+            effective_phone = user_data.get('phone', self.instance.user.phone)
+            if not effective_email and not effective_phone:
+                raise serializers.ValidationError(
+                    'At least one contact method (email or phone) is required.'
+                )
+        return data
+
+    def update(self, instance, validated_data):
+        from django.db import IntegrityError
+        from django.db import transaction
+        user_data = validated_data.pop('user', {})
+        try:
+            with transaction.atomic():
+                # Update membership fields (role, department, is_active)
+                instance = super().update(instance, validated_data)
+                # Write-through user fields
+                if user_data:
+                    user = instance.user
+                    for field, value in user_data.items():
+                        setattr(user, field, value)
+                    user.save(update_fields=list(user_data.keys()))
+        except IntegrityError:
+            raise serializers.ValidationError(
+                'This email or phone is already associated with another account.'
+            )
+        return instance
+
+
+class MemberSelfSerializer(serializers.ModelSerializer):
+    """Restricted serializer for ADMIN self-edit — contact/name fields only."""
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    email = serializers.EmailField(
+        source='user.email', required=False, allow_blank=True, default='',
+    )
+    first_name = serializers.CharField(
+        source='user.first_name', required=False, allow_blank=True, default='',
+    )
+    last_name = serializers.CharField(
+        source='user.last_name', required=False, allow_blank=True, default='',
+    )
+    phone = serializers.CharField(
+        source='user.phone', required=False, allow_blank=True, default='',
+    )
+    hotel = HotelMinimalSerializer(read_only=True)
+    route_count = serializers.IntegerField(read_only=True, default=0)
+    assignment_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = HotelMembership
+        fields = [
+            'id', 'user_id', 'hotel', 'email', 'first_name', 'last_name', 'phone',
+            'role', 'department', 'is_active', 'created_at',
+            'route_count', 'assignment_count',
+        ]
+        read_only_fields = [
+            'id', 'user_id', 'role', 'department', 'is_active', 'created_at',
+            'route_count', 'assignment_count',
+        ]
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
+
+    def validate(self, data):
+        user_data = data.get('user', {})
+        if 'email' in user_data and user_data['email']:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            if User.objects.filter(email=user_data['email']).exclude(pk=self.instance.user_id).exists():
+                raise serializers.ValidationError({
+                    'email': 'This email is already associated with another account.',
+                })
+        if 'phone' in user_data and user_data['phone']:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            if User.objects.filter(phone=user_data['phone']).exclude(pk=self.instance.user_id).exists():
+                raise serializers.ValidationError({
+                    'phone': 'This phone is already associated with another account.',
+                })
+        # Ensure at least one contact method remains after update
+        if self.instance:
+            effective_email = user_data.get('email', self.instance.user.email)
+            effective_phone = user_data.get('phone', self.instance.user.phone)
+            if not effective_email and not effective_phone:
+                raise serializers.ValidationError(
+                    'At least one contact method (email or phone) is required.'
+                )
+        return data
+
+    def update(self, instance, validated_data):
+        from django.db import IntegrityError
+        user_data = validated_data.pop('user', {})
+        if user_data:
+            user = instance.user
+            for field, value in user_data.items():
+                setattr(user, field, value)
+            try:
+                user.save(update_fields=list(user_data.keys()))
+            except IntegrityError:
+                raise serializers.ValidationError(
+                    'This email or phone is already associated with another account.'
+                )
+        return instance
+
+
+class TransferMemberSerializer(serializers.Serializer):
+    target_member_id = serializers.IntegerField()
+
+    def validate_target_member_id(self, value):
+        hotel = self.context['hotel']
+        source = self.context['source']
+        try:
+            target = HotelMembership.objects.select_related('user').get(
+                pk=value, hotel=hotel,
+            )
+        except HotelMembership.DoesNotExist:
+            raise serializers.ValidationError('Target member not found in this hotel.')
+        if target.pk == source.pk:
+            raise serializers.ValidationError('Cannot transfer to the same member.')
+        if not target.is_active:
+            raise serializers.ValidationError('Target member is inactive.')
+        self._target = target
+        return value
+
+    def validate(self, data):
+        data['target_member'] = self._target
+        return data
+
+
+class MergeMemberSerializer(serializers.Serializer):
+    keep_id = serializers.IntegerField()
+    remove_id = serializers.IntegerField()
+
+    def validate(self, data):
+        hotel = self.context['hotel']
+        request_user = self.context['request'].user
+        errors = {}
+        members = {}
+        for field in ('keep_id', 'remove_id'):
+            try:
+                m = HotelMembership.objects.select_related('user').get(
+                    pk=data[field], hotel=hotel,
+                )
+                members[field] = m
+            except HotelMembership.DoesNotExist:
+                errors[field] = 'Member not found in this hotel.'
+        if errors:
+            raise serializers.ValidationError(errors)
+        keep = members['keep_id']
+        remove = members['remove_id']
+        if keep.pk == remove.pk:
+            raise serializers.ValidationError('Cannot merge a member with itself.')
+        if keep.user == request_user or remove.user == request_user:
+            raise serializers.ValidationError('Cannot merge your own membership.')
+        # Last SUPERADMIN guard
+        if remove.role == 'SUPERADMIN':
+            remaining = HotelMembership.objects.filter(
+                hotel=hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=remove.pk).count()
+            if remaining == 0:
+                raise serializers.ValidationError(
+                    'Cannot merge: this would remove the last active superadmin.'
+                )
+        data['keep_member'] = keep
+        data['remove_member'] = remove
         return data
 
 
@@ -581,6 +1127,16 @@ class MemberCreateSerializer(serializers.Serializer):
     department = serializers.PrimaryKeyRelatedField(
         queryset=Department.objects.all(), required=False, allow_null=True,
     )
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        digits = re.sub(r'\D', '', value)
+        if not (11 <= len(digits) <= 15):
+            raise serializers.ValidationError(
+                'Enter 11-15 digits including country code.'
+            )
+        return digits
 
     def validate_department(self, value):
         hotel = self.context.get('hotel')
@@ -778,7 +1334,29 @@ class ServiceRequestCreateSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {'occurrence_date': 'This date does not match the event schedule.'}
                     )
+
+            # --- Booking window enforcement ---
+            if event.is_recurring and occurrence_date:
+                target_dt = event.resolve_target_datetime(occurrence_date=occurrence_date)
             else:
+                target_dt = event.resolve_target_datetime()
+
+            if target_dt is not None and not event.is_bookable_for(target_dt):
+                import zoneinfo
+                hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone or 'UTC')
+                opens_at, closes_at = event.get_booking_window_for(target_dt)
+                bw_now = timezone.now()
+                if opens_at is not None and bw_now < opens_at:
+                    opens_local = opens_at.astimezone(hotel_tz)
+                    raise serializers.ValidationError(
+                        {'event': f"Bookings for this event open on {opens_local.strftime('%b %d at %I:%M %p')}."}
+                    )
+                closes_local = closes_at.astimezone(hotel_tz)
+                raise serializers.ValidationError(
+                    {'event': f"Bookings for this event closed on {closes_local.strftime('%b %d at %I:%M %p')}."}
+                )
+
+            if not event.is_recurring:
                 # Strip occurrence_date for non-recurring events
                 data.pop('occurrence_date', None)
         else:
@@ -961,6 +1539,7 @@ class PushSubscriptionSerializer(serializers.ModelSerializer):
 
 class SetupFlagsSerializer(serializers.Serializer):
     settings_configured = serializers.BooleanField()
+    settings_partial = serializers.BooleanField()
     has_departments = serializers.BooleanField()
     has_experiences = serializers.BooleanField()
     has_photos = serializers.BooleanField()
@@ -977,3 +1556,178 @@ class DashboardStatsSerializer(serializers.Serializer):
     conversion_rate = serializers.FloatField()
     by_department = serializers.ListField()
     setup = SetupFlagsSerializer()
+    period_label = serializers.CharField()
+    period_date_display = serializers.CharField()
+    period_date = serializers.CharField()
+    period_timezone = serializers.CharField()
+
+
+class BookingEmailTemplateSerializer(serializers.ModelSerializer):
+    qr_code = QRCodeSerializer(read_only=True)
+    hotel_context = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BookingEmailTemplate
+        fields = [
+            'id', 'subject', 'heading', 'body', 'features',
+            'cta_text', 'footer_text', 'primary_color', 'accent_color',
+            'qr_code', 'hotel_context', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'qr_code', 'hotel_context', 'created_at', 'updated_at']
+
+    def get_hotel_context(self, obj):
+        hotel = obj.hotel
+        request = self.context.get('request')
+        logo_url = None
+        if hotel.logo:
+            logo_url = request.build_absolute_uri(hotel.logo.url) if request else hotel.logo.url
+        return {
+            'name': hotel.name,
+            'logo': logo_url,
+            'primary_color': hotel.primary_color,
+            'secondary_color': hotel.secondary_color,
+            'accent_color': hotel.accent_color,
+        }
+
+    def validate_features(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError('Must be a list.')
+        if len(value) > 6:
+            raise serializers.ValidationError('Maximum 6 features allowed.')
+        for item in value:
+            if not isinstance(item, str):
+                raise serializers.ValidationError('Each feature must be a string.')
+        return value
+
+    def _validate_hex_color(self, value):
+        import re
+        if value and not re.match(r'^#[0-9a-fA-F]{6}$', value):
+            raise serializers.ValidationError('Must be a valid hex color (e.g. #FF5733) or empty.')
+        return value
+
+    def validate_primary_color(self, value):
+        return self._validate_hex_color(value)
+
+    def validate_accent_color(self, value):
+        return self._validate_hex_color(value)
+
+
+# ---------------------------------------------------------------------------
+# Notification Routes
+# ---------------------------------------------------------------------------
+
+class NotificationRouteSerializer(serializers.ModelSerializer):
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), required=False, allow_null=True,
+    )
+    event = serializers.PrimaryKeyRelatedField(
+        queryset=Event.objects.all(), required=False, allow_null=True,
+    )
+    member_name = serializers.SerializerMethodField()
+    department_name = serializers.SerializerMethodField()
+    experience_name = serializers.SerializerMethodField()
+    event_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NotificationRoute
+        fields = [
+            'id', 'department', 'event', 'experience', 'channel', 'member',
+            'target', 'label', 'is_active',
+            'member_name', 'department_name', 'experience_name', 'event_name',
+            'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']
+        # Suppress DRF auto-generated UniqueTogetherValidators from conditional
+        # UniqueConstraints — they make nullable scope fields required.
+        # DB constraints handle uniqueness; our validate() handles scope logic.
+        validators = []
+
+    def get_member_name(self, obj):
+        if obj.member_id:
+            return obj.member.user.get_full_name() or obj.member.user.phone
+        return None
+
+    def get_department_name(self, obj):
+        return obj.department.name if obj.department_id else None
+
+    def get_experience_name(self, obj):
+        return obj.experience.name if obj.experience_id else None
+
+    def get_event_name(self, obj):
+        return obj.event.name if obj.event_id else None
+
+    def validate_target(self, value):
+        return value.strip()
+
+    def validate(self, data):
+        hotel = self.context['hotel']
+
+        # Scope: exactly one of department or event
+        department = data.get('department', self.instance.department if self.instance else None)
+        event = data.get('event', self.instance.event if self.instance else None)
+        has_dept = department is not None
+        has_event = event is not None
+        if has_dept == has_event:
+            raise serializers.ValidationError(
+                'Exactly one of department or event must be set.'
+            )
+
+        # Department must belong to this hotel
+        if has_dept and department.hotel_id != hotel.id:
+            raise serializers.ValidationError({'department': 'Department must belong to this hotel.'})
+
+        # Event must belong to this hotel
+        if has_event and event.hotel_id != hotel.id:
+            raise serializers.ValidationError({'event': 'Event must belong to this hotel.'})
+
+        # Experience only valid on department-scoped routes
+        experience = data.get('experience')
+        if has_event and experience is not None:
+            raise serializers.ValidationError({'experience': 'Experience cannot be set on event-scoped routes.'})
+
+        # Experience must belong to the department
+        if experience is not None and has_dept and experience.department_id != department.id:
+            raise serializers.ValidationError({'experience': 'Experience must belong to the selected department.'})
+
+        # Member must belong to this hotel
+        member = data.get('member')
+        if member and member.hotel_id != hotel.id:
+            raise serializers.ValidationError({'member': 'Team member must belong to this hotel.'})
+
+        # Auto-fill target from member contact info
+        if member:
+            channel = data.get('channel') or (self.instance.channel if self.instance else None)
+            if channel == NotificationRoute.Channel.WHATSAPP:
+                if not member.user.phone:
+                    raise serializers.ValidationError({'member': 'Selected team member has no phone number.'})
+                data['target'] = member.user.phone
+            elif channel == NotificationRoute.Channel.EMAIL:
+                if not member.user.email:
+                    raise serializers.ValidationError({'member': 'Selected team member has no email address.'})
+                data['target'] = member.user.email
+            if not data.get('label'):
+                data['label'] = member.user.get_full_name() or ''
+
+        # Target is required
+        target = data.get('target') or (self.instance.target if self.instance else '')
+        if not target:
+            raise serializers.ValidationError({'target': 'Contact info is required.'})
+
+        # Channel-specific format validation
+        channel = data.get('channel') or (self.instance.channel if self.instance else None)
+        if channel == NotificationRoute.Channel.WHATSAPP:
+            import re
+            digits = re.sub(r'\D', '', target)
+            if len(digits) < 10 or len(digits) > 15:
+                raise serializers.ValidationError(
+                    {'target': 'WhatsApp number must be 10-15 digits (with country code).'}
+                )
+        elif channel == NotificationRoute.Channel.EMAIL:
+            from django.core.validators import validate_email
+            from django.core.exceptions import ValidationError as DjangoValidationError
+            try:
+                validate_email(target)
+            except DjangoValidationError:
+                raise serializers.ValidationError({'target': 'Enter a valid email address.'})
+
+        return data

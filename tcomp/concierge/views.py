@@ -2,25 +2,33 @@ import hashlib
 import hmac
 import json
 import logging
+import re
+import zoneinfo
 from datetime import timedelta
 
 from django.conf import settings
-from django.db import transaction
-from django.db.models import Count, Max, Prefetch
+from django.core.cache import cache
+from django.db import IntegrityError, models, transaction
+from django.db.models import Count, F, Max, Prefetch
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import generics, status, viewsets
+from rest_framework import generics, serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound
+from rest_framework.parsers import FormParser, JSONParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 
 from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
-    ContentStatus, Department, Event, Experience, ExperienceImage, GuestStay,
-    Hotel, HotelMembership, Notification, PushSubscription, QRCode,
+    BookingEmailTemplate, ContentStatus, Department, DepartmentImage,
+    Event, EventImage, Experience,
+    ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
+    Notification, NotificationRoute, PushSubscription, QRCode, QRScanDaily,
     ServiceRequest, RequestActivity,
 )
 from .permissions import (
@@ -29,24 +37,27 @@ from .permissions import (
     IsStayOwner, IsSuperAdmin,
 )
 from .serializers import (
-    DashboardStatsSerializer, DepartmentPublicSerializer,
-    DepartmentSerializer, EventPublicSerializer, EventSerializer,
+    BookingEmailTemplateSerializer, DashboardStatsSerializer,
+    DepartmentImageSerializer, DepartmentPublicSerializer, DepartmentSerializer,
+    EventImageSerializer, EventPublicSerializer, EventSerializer,
     ExperienceImageSerializer,
-    ExperiencePublicSerializer, ExperienceSerializer,
-    GuestStaySerializer,
-    GuestStayUpdateSerializer, HotelPublicSerializer,
+    ExperiencePublicSerializer, ExperienceSerializer, TopDealSerializer,
+    GuestStaySerializer, GuestStayUpdateSerializer,
+    HotelInfoSectionSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
-    MemberSerializer, NotificationSerializer,
+    MemberSelfSerializer, MemberSerializer,
+    MergeMemberSerializer, TransferMemberSerializer,
+    NotificationRouteSerializer, NotificationSerializer,
     PushSubscriptionSerializer, QRCodeSerializer,
     ServiceRequestCreateSerializer, ServiceRequestDetailSerializer,
     ServiceRequestListSerializer, ServiceRequestUpdateSerializer,
 )
+from .notifications import NotificationEvent, dispatch_notification
 from .services import (
     check_room_rate_limit, check_stay_rate_limit,
     compute_response_due_at, generate_qr,
     get_dashboard_stats, handle_wa_delivery_event,
     is_department_after_hours,
-    notify_after_hours_fallback, notify_department_staff,
     publish_request_event, stream_request_events,
 )
 
@@ -72,6 +83,11 @@ class HotelPublicDetail(generics.RetrieveAPIView):
             queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
         ),
         'departments__experiences__gallery_images',
+        'departments__gallery_images',
+        Prefetch(
+            'info_sections',
+            queryset=HotelInfoSection.objects.filter(is_visible=True).order_by('display_order', 'id'),
+        ),
     )
 
 
@@ -91,6 +107,7 @@ class DepartmentPublicList(generics.ListAPIView):
                 queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
             ),
             'experiences__gallery_images',
+            'gallery_images',
         )
 
 
@@ -112,6 +129,7 @@ class DepartmentPublicDetail(generics.RetrieveAPIView):
                 queryset=Experience.objects.filter(status=ContentStatus.PUBLISHED),
             ),
             'experiences__gallery_images',
+            'gallery_images',
         )
 
 
@@ -142,8 +160,8 @@ class EventPublicList(generics.ListAPIView):
             hotel__is_active=True,
             status=ContentStatus.PUBLISHED,
         ).select_related(
-            'department', 'experience__department', 'hotel__fallback_department',
-        )
+            'hotel', 'department', 'experience__department', 'hotel__fallback_department',
+        ).prefetch_related('gallery_images')
 
         if self.request.query_params.get('featured') == 'true':
             qs = qs.filter(is_featured=True)
@@ -161,11 +179,15 @@ class EventPublicList(generics.ListAPIView):
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
+
         # Sort by next_occurrence so recurring events that started long ago
         # appear in chronological order alongside one-time events.
+        # get_next_occurrence() requires Python-side rrule evaluation — can't be
+        # done in SQL. Cap the working set to prevent abuse on large event lists.
+        MAX_EVENTS = 200
         far_future = timezone.now() + timedelta(days=3650)
         events = sorted(
-            queryset,
+            queryset[:MAX_EVENTS],
             key=lambda e: e.get_next_occurrence() or far_future,
         )
 
@@ -190,7 +212,129 @@ class EventPublicDetail(generics.RetrieveAPIView):
             hotel__is_active=True,
             status=ContentStatus.PUBLISHED,
         ).select_related(
-            'department', 'experience__department', 'hotel__fallback_department',
+            'hotel', 'department', 'experience__department', 'hotel__fallback_department',
+        ).prefetch_related('gallery_images')
+
+
+class TopDealsList(generics.ListAPIView):
+    permission_classes = [AllowAny]
+    serializer_class = TopDealSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        now = timezone.now()
+        return Experience.objects.filter(
+            department__hotel__slug=self.kwargs['hotel_slug'],
+            department__hotel__is_active=True,
+            status=ContentStatus.PUBLISHED,
+            is_top_deal=True,
+            department__status=ContentStatus.PUBLISHED,
+            department__is_ops=False,
+        ).filter(
+            models.Q(deal_ends_at__isnull=True) | models.Q(deal_ends_at__gt=now),
+        ).select_related(
+            'department',
+        ).prefetch_related(
+            'gallery_images',
+        ).order_by(
+            models.F('deal_ends_at').asc(nulls_last=True), 'name',
+        )
+
+
+# ---------------------------------------------------------------------------
+# QR scan tracking (public, pre-auth)
+# ---------------------------------------------------------------------------
+
+def _get_hotel_tz(hotel):
+    """Return the hotel's ZoneInfo, falling back to UTC on bad/empty values."""
+    try:
+        return zoneinfo.ZoneInfo(hotel.timezone) if hotel.timezone else zoneinfo.ZoneInfo('UTC')
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        return zoneinfo.ZoneInfo('UTC')
+
+
+def _record_scan(qr, vid, hotel):
+    """Dedup via Redis and atomically increment the daily aggregate row."""
+    hotel_tz = _get_hotel_tz(hotel)
+    now_local = timezone.now().astimezone(hotel_tz)
+    today = now_local.date()
+    hour = now_local.hour
+
+    hour_key = f'qrscan:{qr.id}:{vid}:{today}:{hour}'
+    day_key = f'qrscan:uv:{qr.id}:{vid}:{today}'
+
+    is_new_visitor = True
+    try:
+        if cache.get(hour_key):
+            return
+        cache.set(hour_key, 1, timeout=3600)
+
+        is_new_visitor = not cache.get(day_key)
+        if is_new_visitor:
+            cache.set(day_key, 1, timeout=86400)
+    except Exception:
+        # Redis down — fall through to DB write without dedup.
+        is_new_visitor = True
+
+    try:
+        obj, _created = QRScanDaily.objects.get_or_create(
+            qr_code=qr, date=today,
+        )
+    except IntegrityError:
+        obj = QRScanDaily.objects.get(qr_code=qr, date=today)
+
+    QRScanDaily.objects.filter(pk=obj.pk).update(
+        scan_count=F('scan_count') + 1,
+        unique_visitors=F('unique_visitors') + (1 if is_new_visitor else 0),
+    )
+
+
+class QRScanThrottle(AnonRateThrottle):
+    rate = '300/min'
+    scope = 'qr_scan'
+
+
+class QRScanSerializer(serializers.Serializer):
+    """Accepts both JSON and form-encoded bodies from sendBeacon."""
+    code = serializers.CharField(max_length=40)
+    vid = serializers.CharField(max_length=64, required=False, default='')
+
+
+class QRScanView(APIView):
+    """Record a raw QR code scan. Public, rate-limited, best-effort."""
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [QRScanThrottle]
+    parser_classes = [JSONParser, FormParser]
+
+    def post(self, request, hotel_slug):
+        ser = QRScanSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        code = ser.validated_data['code'].strip()
+        vid = ser.validated_data['vid'].strip()
+        if not code:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        if not vid:
+            vid = f'ip:{self._get_client_ip(request)}'
+
+        try:
+            qr = QRCode.objects.select_related('hotel').get(
+                code=code, hotel__slug=hotel_slug, is_active=True,
+            )
+        except QRCode.DoesNotExist:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        _record_scan(qr, vid, qr.hotel)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @staticmethod
+    def _get_client_ip(request):
+        return (
+            request.META.get('HTTP_CF_CONNECTING_IP')
+            or request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip()
+            or request.META.get('REMOTE_ADDR', '')
         )
 
 
@@ -269,14 +413,27 @@ class ServiceRequestCreate(HotelScopedMixin, generics.CreateAPIView):
         )
 
         # Notifications
-        notify_department_staff(req.department, req)
+        dispatch_notification(NotificationEvent(
+            event_type='request.created',
+            hotel=hotel,
+            department=req.department,
+            request=req,
+            event_obj=req.event,
+        ))
 
         # SSE
         publish_request_event(hotel, 'request.created', req)
 
         # After-hours handling
         if req.after_hours and hotel.fallback_department:
-            notify_after_hours_fallback(req)
+            dispatch_notification(NotificationEvent(
+                event_type='after_hours_fallback',
+                hotel=hotel,
+                department=hotel.fallback_department,
+                request=req,
+                event_obj=req.event,
+                extra={'original_department_name': req.department.name},
+            ))
 
         detail_serializer = ServiceRequestDetailSerializer(req)
         return Response(detail_serializer.data, status=status.HTTP_201_CREATED)
@@ -567,7 +724,8 @@ class DashboardStats(HotelScopedMixin, APIView):
             department = membership.department
 
         stats = get_dashboard_stats(hotel, department)
-        return Response(stats)
+        serializer = DashboardStatsSerializer(stats)
+        return Response(serializer.data)
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +765,7 @@ class DepartmentViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         return Department.objects.filter(
             hotel=self.get_hotel(),
-        ).prefetch_related('experiences')
+        ).prefetch_related('experiences', 'gallery_images')
 
 
 class ExperienceViewSet(HotelScopedMixin, viewsets.ModelViewSet):
@@ -631,7 +789,7 @@ class EventAdminViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         return [IsAdminOrAbove()]
 
     def get_queryset(self):
-        qs = Event.objects.filter(hotel=self.get_hotel())
+        qs = Event.objects.filter(hotel=self.get_hotel()).prefetch_related('gallery_images')
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -744,6 +902,106 @@ class EventBulkReorder(HotelScopedMixin, APIView):
 
 
 # ---------------------------------------------------------------------------
+# Hotel info sections
+# ---------------------------------------------------------------------------
+
+class HotelInfoSectionViewSet(HotelScopedMixin, viewsets.ModelViewSet):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = HotelInfoSectionSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        return HotelInfoSection.objects.filter(hotel=self.get_hotel())
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        max_order = HotelInfoSection.objects.filter(
+            hotel=hotel,
+        ).aggregate(m=Max('display_order'))['m']
+        serializer.save(hotel=hotel, display_order=(max_order or 0) + 1)
+
+
+class InfoSectionBulkReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            sections = HotelInfoSection.objects.filter(hotel=hotel)
+            total_count = sections.count()
+            if len(ordered_ids) != total_count:
+                return Response(
+                    {'detail': 'order must include all info section IDs for this hotel.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            matched = sections.filter(id__in=ordered_ids)
+            if matched.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more IDs do not belong to this hotel.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            section_map = {s.id: s for s in matched}
+            for idx, section_id in enumerate(ordered_ids):
+                section_map[section_id].display_order = idx
+            HotelInfoSection.objects.bulk_update(section_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} info sections reordered.'})
+
+
+# ---------------------------------------------------------------------------
+# Content image upload (for rich text editors — model-less)
+# Files are not reference-tracked in DB. Orphaned images are cleaned up
+# weekly by cleanup_orphaned_content_images_task (see tasks.py).
+# ---------------------------------------------------------------------------
+
+class ContentImageUpload(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, **kwargs):
+        import uuid
+        from django.core.files.base import ContentFile
+        from django.core.files.storage import default_storage
+
+        file = request.FILES.get('image')
+        if not file:
+            return Response(
+                {'detail': 'No image provided.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            from .validators import validate_image_upload
+            buf, fmt = validate_image_upload(file)
+        except Exception as e:
+            return Response(
+                {'detail': str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ext = 'png' if fmt == 'png' else 'jpg'
+        filename = f'{uuid.uuid4().hex[:12]}.{ext}'
+        hotel = self.get_hotel()
+        path = default_storage.save(
+            f'content/{hotel.slug}/{filename}',
+            ContentFile(buf.getvalue()),
+        )
+        image_url = default_storage.url(path)
+        if image_url.startswith('/'):
+            image_url = request.build_absolute_uri(image_url)
+        return Response({'url': image_url})
+
+
+# ---------------------------------------------------------------------------
 # Experience gallery images
 # ---------------------------------------------------------------------------
 
@@ -810,6 +1068,134 @@ class ExperienceImageReorder(HotelScopedMixin, APIView):
         return Response({'detail': f'{len(ordered_ids)} images reordered.'})
 
 
+# ---------------------------------------------------------------------------
+# Department gallery images
+# ---------------------------------------------------------------------------
+
+class DepartmentImageUpload(HotelScopedMixin, generics.CreateAPIView):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = DepartmentImageSerializer
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        dept = get_object_or_404(
+            Department,
+            hotel=hotel,
+            slug=self.kwargs['dept_slug'],
+        )
+        max_order = dept.gallery_images.aggregate(m=Max('display_order'))['m'] or 0
+        serializer.save(department=dept, display_order=max_order + 1)
+
+
+class DepartmentImageDelete(HotelScopedMixin, generics.DestroyAPIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get_queryset(self):
+        return DepartmentImage.objects.filter(
+            department__hotel=self.get_hotel(),
+        )
+
+
+class DepartmentImageReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            images = DepartmentImage.objects.filter(
+                department__hotel=hotel,
+                department__slug=self.kwargs['dept_slug'],
+                id__in=ordered_ids,
+            )
+            if images.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more image IDs are invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            img_map = {img.id: img for img in images}
+            for idx, img_id in enumerate(ordered_ids):
+                img_map[img_id].display_order = idx
+            DepartmentImage.objects.bulk_update(img_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} images reordered.'})
+
+
+# ---------------------------------------------------------------------------
+# Event gallery images
+# ---------------------------------------------------------------------------
+
+class EventImageUpload(HotelScopedMixin, generics.CreateAPIView):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = EventImageSerializer
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        event = get_object_or_404(
+            Event,
+            pk=self.kwargs['event_id'],
+            hotel=hotel,
+        )
+        max_order = event.gallery_images.aggregate(m=Max('display_order'))['m'] or 0
+        serializer.save(event=event, display_order=max_order + 1)
+
+
+class EventImageDelete(HotelScopedMixin, generics.DestroyAPIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get_queryset(self):
+        return EventImage.objects.filter(
+            event__hotel=self.get_hotel(),
+        )
+
+
+class EventImageReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            images = EventImage.objects.filter(
+                event__hotel=hotel,
+                event__pk=self.kwargs['event_id'],
+                id__in=ordered_ids,
+            )
+            if images.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more image IDs are invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            img_map = {img.id: img for img in images}
+            for idx, img_id in enumerate(ordered_ids):
+                img_map[img_id].display_order = idx
+            EventImage.objects.bulk_update(img_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} images reordered.'})
+
+
 class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     permission_classes = [IsAdminOrAbove]
     serializer_class = QRCodeSerializer
@@ -822,7 +1208,14 @@ class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
             stay_count=Count('guest_stays'),
         )
 
+    def _reject_booking_placement(self, serializer):
+        if serializer.validated_data.get('placement') == 'BOOKING':
+            raise serializers.ValidationError(
+                {'placement': 'BOOKING QR codes are managed from the Booking Email page.'}
+            )
+
     def perform_create(self, serializer):
+        self._reject_booking_placement(serializer)
         hotel = self.get_hotel()
         qr = generate_qr(
             hotel=hotel,
@@ -833,13 +1226,161 @@ class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         )
         serializer.instance = qr
 
+    def perform_update(self, serializer):
+        self._reject_booking_placement(serializer)
+        # Also block editing existing BOOKING QR codes via generic endpoint
+        if serializer.instance.placement == 'BOOKING':
+            raise serializers.ValidationError(
+                {'placement': 'BOOKING QR codes are managed from the Booking Email page.'}
+            )
+        serializer.save()
+
+
+class NotificationRouteViewSet(HotelScopedMixin, viewsets.ModelViewSet):
+    """CRUD for notification routing rules (WhatsApp/Email contacts per department)."""
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = NotificationRouteSerializer
+    pagination_class = None  # Small set per hotel, no pagination needed
+    http_method_names = ['get', 'post', 'patch', 'delete']
+
+    def get_queryset(self):
+        qs = NotificationRoute.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related('department', 'experience', 'event', 'member__user').order_by('channel', 'id')
+        dept_id = self.request.query_params.get('department')
+        event_id = self.request.query_params.get('event')
+        # Mutual exclusion: cannot filter by both
+        if dept_id and event_id:
+            raise serializers.ValidationError('Cannot filter by both department and event.')
+        if dept_id:
+            try:
+                qs = qs.filter(department_id=int(dept_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
+        if event_id:
+            try:
+                qs = qs.filter(event_id=int(event_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
+        member_id = self.request.query_params.get('member')
+        if member_id:
+            try:
+                qs = qs.filter(member_id=int(member_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
+        return qs
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx['hotel'] = self.get_hotel()
+        return ctx
+
+    def perform_create(self, serializer):
+        self._save_with_conflict_handling(
+            serializer,
+            hotel=self.get_hotel(),
+            created_by=self.request.user,
+        )
+
+    def perform_update(self, serializer):
+        self._save_with_conflict_handling(serializer)
+
+    def _save_with_conflict_handling(self, serializer, **kwargs):
+        """Save, converting model ValidationError / IntegrityError to DRF 400.
+
+        With Meta.validators = [] on the serializer, uniqueness is enforced
+        at the DB level.  Model.save() → full_clean() raises Django
+        ValidationError; a race or constraint violation raises IntegrityError.
+        """
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            serializer.save(**kwargs)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                exc.message_dict if hasattr(exc, 'message_dict') else exc.messages,
+            )
+        except IntegrityError:
+            raise serializers.ValidationError(
+                'A route with this target, channel, and scope already exists.',
+            )
+
+
+class BookingEmailTemplateView(HotelScopedMixin, APIView):
+    """GET: auto-create template + BOOKING QR. PATCH: update template fields."""
+    permission_classes = [IsAdminOrAbove]
+
+    def _get_or_create_template(self, hotel, user):
+        """Atomic auto-create of template + BOOKING QR. Idempotent."""
+        with transaction.atomic():
+            template, _created = BookingEmailTemplate.objects.select_for_update().get_or_create(
+                hotel=hotel,
+                defaults={
+                    'subject': f'Welcome to {hotel.name} \u2014 Your Digital Concierge',
+                    'heading': 'Your Digital Concierge Awaits',
+                    'body': (
+                        "We're excited to welcome you! Scan the QR code below "
+                        "or tap the button to explore everything we have to offer "
+                        "\u2014 from dining and spa experiences to room service requests."
+                    ),
+                    'features': [
+                        'Browse curated experiences',
+                        'Make service requests',
+                        'Get real-time updates',
+                    ],
+                    'cta_text': 'Explore Our Services',
+                    'footer_text': '',
+                },
+            )
+            if not template.qr_code:
+                existing_qr = QRCode.objects.filter(
+                    hotel=hotel, placement='BOOKING',
+                ).first()
+                if existing_qr:
+                    template.qr_code = existing_qr
+                else:
+                    try:
+                        template.qr_code = generate_qr(
+                            hotel=hotel,
+                            label='Booking Email',
+                            placement='BOOKING',
+                            department=None,
+                            created_by=user,
+                        )
+                    except IntegrityError:
+                        template.qr_code = QRCode.objects.get(
+                            hotel=hotel, placement='BOOKING',
+                        )
+                template.save(update_fields=['qr_code'])
+        return template
+
+    def get(self, request, hotel_slug):
+        hotel = self.get_hotel()
+        template = self._get_or_create_template(hotel, request.user)
+        serializer = BookingEmailTemplateSerializer(template, context={'request': request})
+        return Response(serializer.data)
+
+    def patch(self, request, hotel_slug):
+        hotel = self.get_hotel()
+        template = self._get_or_create_template(hotel, request.user)
+        serializer = BookingEmailTemplateSerializer(
+            template, data=request.data, partial=True, context={'request': request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
 
 # ---------------------------------------------------------------------------
 # SuperAdmin views
 # ---------------------------------------------------------------------------
 
 class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
-    permission_classes = [IsSuperAdmin]
+    # Admin can list members (for member picker in notification routing).
+    # Only SuperAdmin can create (invite) new members.
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [IsAdminOrAbove()]
+        return [IsSuperAdmin()]
 
     def get_serializer_class(self):
         if self.request.method == 'POST':
@@ -849,7 +1390,14 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
     def get_queryset(self):
         return HotelMembership.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('user', 'department', 'hotel')
+        ).select_related('user', 'department', 'hotel').annotate(
+            route_count=Count('notification_routes', distinct=True),
+            assignment_count=Count(
+                'user__assigned_requests',
+                filter=models.Q(user__assigned_requests__hotel=models.F('hotel')),
+                distinct=True,
+            ),
+        )
 
     def create(self, request, *args, **kwargs):
         from django.contrib.auth import get_user_model
@@ -873,10 +1421,15 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
 
         # Fall back to phone lookup (guest accounts have email='')
         if user is None and data['phone']:
+            normalized = re.sub(r'\D', '', data['phone'])
             try:
-                user = User.objects.get(phone=data['phone'])
+                user = User.objects.get(phone=normalized)
             except User.DoesNotExist:
-                pass
+                # Pre-backfill compatibility: try +prefixed format
+                try:
+                    user = User.objects.get(phone=f'+{normalized}')
+                except User.DoesNotExist:
+                    pass
 
         if user is not None:
             # Promote to staff and backfill missing fields
@@ -930,6 +1483,16 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Send invitation notifications (background, best-effort)
+        from django.db import transaction as db_transaction
+        def _enqueue_invite():
+            try:
+                from .tasks import send_staff_invite_notification_task
+                send_staff_invite_notification_task.delay(user.id, hotel.id, data['role'])
+            except Exception:
+                logger.warning('Failed to enqueue staff invite notification (broker down?)', exc_info=True)
+        db_transaction.on_commit(_enqueue_invite)
+
         return Response(
             MemberSerializer(membership).data,
             status=status.HTTP_201_CREATED,
@@ -943,11 +1506,284 @@ class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         return HotelMembership.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('user', 'department', 'hotel')
+        ).select_related('user', 'department', 'hotel').annotate(
+            route_count=Count('notification_routes', distinct=True),
+            assignment_count=Count(
+                'user__assigned_requests',
+                filter=models.Q(user__assigned_requests__hotel=models.F('hotel')),
+                distinct=True,
+            ),
+        )
 
-    def perform_destroy(self, instance):
-        instance.is_active = False
-        instance.save(update_fields=['is_active'])
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        # Guard: cannot delete self
+        if instance.user == request.user:
+            return Response(
+                {'detail': 'Cannot delete your own membership.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Guard: last active SUPERADMIN
+        if instance.role == 'SUPERADMIN':
+            remaining = HotelMembership.objects.filter(
+                hotel=instance.hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=instance.pk).count()
+            if remaining == 0:
+                return Response(
+                    {'detail': 'Cannot delete the last active superadmin.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        # Guard: block if member still has linked data
+        has_routes = instance.notification_routes.exists()
+        has_assignments = ServiceRequest.objects.filter(
+            assigned_to=instance.user, hotel=instance.hotel,
+        ).exists()
+        if has_routes or has_assignments:
+            return Response(
+                {'detail': 'Transfer data first or deactivate instead.',
+                 'has_routes': has_routes,
+                 'has_assignments': has_assignments},
+                status=status.HTTP_409_CONFLICT,
+            )
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _transfer_member_data(source, target, actor, reason):
+    """Shared transfer logic for transfer-and-remove + merge.
+    Returns (transferred_routes, skipped_routes, transferred_requests).
+    """
+    # 1. Transfer notification routes with dedupe
+    routes = NotificationRoute.objects.filter(member=source)
+    transferred_routes = 0
+    skipped_routes = 0
+    for route in routes:
+        new_target = target.user.phone if route.channel == 'WHATSAPP' else target.user.email
+        new_label = f'{target.user.first_name} {target.user.last_name}'.strip() or target.user.email
+        # Check for collision — exclude self to prevent self-match
+        conflict = NotificationRoute.objects.filter(
+            department=route.department,
+            experience=route.experience,
+            event=route.event,
+            channel=route.channel,
+            target=new_target,
+        ).exclude(pk=route.pk).exists()
+        if conflict:
+            route.delete()
+            skipped_routes += 1
+        else:
+            route.member = target
+            route.target = new_target
+            route.label = new_label
+            route.save()
+            transferred_routes += 1
+
+    # 2. Reassign requests + create audit entries
+    requests_qs = ServiceRequest.objects.filter(
+        assigned_to=source.user, hotel=source.hotel,
+    )
+    transferred_requests = requests_qs.count()
+    for req in requests_qs:
+        RequestActivity.objects.create(
+            request=req,
+            actor=actor,
+            action='REASSIGNED',
+            details={
+                'from_user_id': source.user.id,
+                'from_name': str(source.user),
+                'to_user_id': target.user.id,
+                'to_name': str(target.user),
+                'reason': reason,
+            },
+        )
+    requests_qs.update(assigned_to=target.user)
+
+    return transferred_routes, skipped_routes, transferred_requests
+
+
+class MemberTransfer(HotelScopedMixin, generics.GenericAPIView):
+    """POST /members/{id}/transfer/ — atomic transfer + hard-delete source."""
+    permission_classes = [IsSuperAdmin]
+
+    def get_queryset(self):
+        return HotelMembership.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related('user')
+
+    def post(self, request, *args, **kwargs):
+        source = self.get_object()
+        # Guard: cannot transfer self
+        if source.user == request.user:
+            return Response({'detail': 'Cannot transfer your own membership.'}, status=400)
+        # Guard: last active SUPERADMIN
+        if source.role == 'SUPERADMIN':
+            remaining = HotelMembership.objects.filter(
+                hotel=source.hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=source.pk).count()
+            if remaining == 0:
+                return Response(
+                    {'detail': 'Cannot remove the last active superadmin.'},
+                    status=400,
+                )
+        ser = TransferMemberSerializer(
+            data=request.data,
+            context={'hotel': source.hotel, 'source': source},
+        )
+        ser.is_valid(raise_exception=True)
+        target = ser.validated_data['target_member']
+
+        # Pre-validate route compatibility
+        routes = NotificationRoute.objects.filter(member=source)
+        incompatible = []
+        for route in routes:
+            if route.channel == 'WHATSAPP' and not target.user.phone:
+                incompatible.append(f"WhatsApp route '{route.label}' — target has no phone")
+            elif route.channel == 'EMAIL' and not target.user.email:
+                incompatible.append(f"Email route '{route.label}' — target has no email")
+        if incompatible:
+            return Response(
+                {'detail': 'Target member lacks required contact info.',
+                 'incompatible_routes': incompatible},
+                status=400,
+            )
+
+        with transaction.atomic():
+            tr, sk, rq = _transfer_member_data(source, target, request.user, 'member_transfer')
+            source.delete()
+
+        return Response({
+            'transferred_routes': tr,
+            'skipped_routes': sk,
+            'transferred_requests': rq,
+        })
+
+
+class MemberMerge(HotelScopedMixin, generics.GenericAPIView):
+    """POST /members/merge/ — merge two members into one."""
+    permission_classes = [IsSuperAdmin]
+
+    def post(self, request, *args, **kwargs):
+        hotel = self.get_hotel()
+        ser = MergeMemberSerializer(
+            data=request.data,
+            context={'hotel': hotel, 'request': request},
+        )
+        ser.is_valid(raise_exception=True)
+        keep = ser.validated_data['keep_member']
+        remove = ser.validated_data['remove_member']
+
+        # Pre-validate route compatibility
+        routes = NotificationRoute.objects.filter(member=remove)
+        incompatible = []
+        for route in routes:
+            if route.channel == 'WHATSAPP' and not keep.user.phone:
+                incompatible.append(f"WhatsApp route '{route.label}' — keep member has no phone")
+            elif route.channel == 'EMAIL' and not keep.user.email:
+                incompatible.append(f"Email route '{route.label}' — keep member has no email")
+
+        with transaction.atomic():
+            # Backfill contact info (never overwrite existing)
+            keep_user = keep.user
+            remove_user = remove.user
+            if not keep_user.email and remove_user.email:
+                keep_user.email = remove_user.email
+            if not keep_user.phone and remove_user.phone:
+                keep_user.phone = remove_user.phone
+            if not keep_user.first_name and remove_user.first_name:
+                keep_user.first_name = remove_user.first_name
+            if not keep_user.last_name and remove_user.last_name:
+                keep_user.last_name = remove_user.last_name
+            keep_user.save()
+
+            # Re-check compatibility after backfill (contact may have been filled)
+            if incompatible:
+                # Re-evaluate: after backfill, check again
+                incompatible = []
+                for route in routes:
+                    if route.channel == 'WHATSAPP' and not keep_user.phone:
+                        incompatible.append(f"WhatsApp route '{route.label}' — keep member has no phone")
+                    elif route.channel == 'EMAIL' and not keep_user.email:
+                        incompatible.append(f"Email route '{route.label}' — keep member has no email")
+                if incompatible:
+                    raise serializers.ValidationError({
+                        'detail': 'Keep member lacks required contact info even after backfill.',
+                        'incompatible_routes': incompatible,
+                    })
+
+            tr, sk, rq = _transfer_member_data(remove, keep, request.user, 'member_merge')
+            remove.delete()
+
+            # Deactivate orphaned user (STAFF only, no guest stays)
+            if (
+                remove_user.user_type == 'STAFF'
+                and not remove_user.hotel_memberships.exists()
+                and not remove_user.stays.filter(is_active=True).exists()
+            ):
+                remove_user.is_active = False
+                remove_user.save(update_fields=['is_active'])
+
+        return Response({
+            'transferred_routes': tr,
+            'skipped_routes': sk,
+            'transferred_requests': rq,
+        })
+
+
+class MemberResendInvite(HotelScopedMixin, generics.GenericAPIView):
+    """POST /members/{id}/resend-invite/ — re-send invitation notification."""
+    permission_classes = [IsSuperAdmin]
+
+    def get_queryset(self):
+        return HotelMembership.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related('user')
+
+    def post(self, request, *args, **kwargs):
+        from datetime import timedelta
+        member = self.get_object()
+        if not member.is_active:
+            return Response(
+                {'detail': 'Cannot resend invite to inactive member.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Rate limit: 1 per 5 minutes per member
+        if member.last_invite_sent_at:
+            cooldown = timedelta(minutes=5)
+            if timezone.now() - member.last_invite_sent_at < cooldown:
+                remaining = cooldown - (timezone.now() - member.last_invite_sent_at)
+                return Response(
+                    {'detail': f'Please wait {int(remaining.total_seconds())} seconds before resending.'},
+                    status=429,
+                )
+        from .tasks import send_staff_invite_notification_task
+        send_staff_invite_notification_task.delay(
+            member.user.id, member.hotel.id, member.role,
+        )
+        member.last_invite_sent_at = timezone.now()
+        member.save(update_fields=['last_invite_sent_at'])
+        return Response({'detail': 'Invite sent.'})
+
+
+class MemberSelfView(HotelScopedMixin, generics.RetrieveUpdateAPIView):
+    """ADMIN+ can view/edit their own contact info (email, phone, name)."""
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = MemberSelfSerializer
+
+    def get_object(self):
+        hotel = self.get_hotel()
+        try:
+            return HotelMembership.objects.select_related(
+                'user', 'department', 'hotel',
+            ).annotate(
+                route_count=Count('notification_routes', distinct=True),
+                assignment_count=Count(
+                    'user__assigned_requests',
+                    filter=models.Q(user__assigned_requests__hotel=models.F('hotel')),
+                    distinct=True,
+                ),
+            ).get(user=self.request.user, hotel=hotel)
+        except HotelMembership.DoesNotExist:
+            raise NotFound('No membership found for this hotel.')
 
 
 class HotelSettingsUpdate(HotelScopedMixin, generics.RetrieveUpdateAPIView):
@@ -1094,25 +1930,34 @@ class GupshupWAWebhookView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        # Validate HMAC signature
+        # Validate shared-secret header (Gupshup "Include Headers" key-value pair)
         secret = settings.GUPSHUP_WA_WEBHOOK_SECRET
         if not secret:
             logger.error('GUPSHUP_WA_WEBHOOK_SECRET not configured; rejecting webhook')
             return Response(status=status.HTTP_403_FORBIDDEN)
 
-        signature = request.headers.get('X-Gupshup-Signature', '')
-        body = request.body
-        expected = hmac.new(
-            secret.encode(), body, hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(signature, expected):
-            logger.warning('Invalid Gupshup webhook signature')
+        token = request.headers.get('X-Webhook-Secret', '')
+        if not hmac.compare_digest(token, secret):
+            logger.warning('Invalid Gupshup webhook secret header')
             return Response(status=status.HTTP_403_FORBIDDEN)
 
         payload = request.data
+
+        # 1. Existing OTP delivery tracking (matches by gupshup_message_id on OTPCode)
         try:
             handle_wa_delivery_event(payload)
         except Exception:
-            logger.exception('Error processing Gupshup webhook')
+            logger.exception('Error processing Gupshup webhook (OTP handler)')
+
+        # 2. Notification channel handlers (inbound messages + delivery status)
+        from .notifications.webhook import handle_inbound_message, handle_message_event
+        event_type = payload.get('type', '')
+        try:
+            if event_type == 'message':
+                handle_inbound_message(payload)
+            elif event_type == 'message-event':
+                handle_message_event(payload)
+        except Exception:
+            logger.exception('Error processing Gupshup webhook (notification handler)')
 
         return Response(status=status.HTTP_200_OK)

@@ -118,7 +118,7 @@ REST_FRAMEWORK = {
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.OrderingFilter',
     ],
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'DEFAULT_PAGINATION_CLASS': 'tcomp.pagination.StandardPagination',
     'PAGE_SIZE': 50,
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
@@ -175,6 +175,16 @@ GUPSHUP_WA_APP_NAME = config('GUPSHUP_WA_APP_NAME', default='Refuje')
 GUPSHUP_WA_OTP_TEMPLATE_ID = config('GUPSHUP_WA_OTP_TEMPLATE_ID', default='')
 GUPSHUP_WA_WEBHOOK_SECRET = config('GUPSHUP_WA_WEBHOOK_SECRET', default='')
 GUPSHUP_WA_FALLBACK_TIMEOUT_SECONDS = 10
+GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID = config('GUPSHUP_WA_STAFF_INVITE_TEMPLATE_ID', default='')
+
+# --- Gupshup WhatsApp Notification Templates (per event type) ---
+GUPSHUP_WA_STAFF_REQUEST_TEMPLATE_ID = config('GUPSHUP_WA_STAFF_REQUEST_TEMPLATE_ID', default='')
+GUPSHUP_WA_STAFF_ESCALATION_TEMPLATE_ID = config('GUPSHUP_WA_STAFF_ESCALATION_TEMPLATE_ID', default='')
+GUPSHUP_WA_STAFF_RESPONSE_DUE_TEMPLATE_ID = config('GUPSHUP_WA_STAFF_RESPONSE_DUE_TEMPLATE_ID', default='')
+
+# --- Resend Email API ---
+RESEND_API_KEY = config('RESEND_API_KEY', default='')
+RESEND_FROM_EMAIL = config('RESEND_FROM_EMAIL', default='Refuje <notifications@notifications.refuje.com>')
 
 # --- Gupshup Enterprise SMS API (fallback OTP + escalation SMS) ---
 GUPSHUP_SMS_USERID = config('GUPSHUP_SMS_USERID', default='')
@@ -245,6 +255,14 @@ CELERY_BEAT_SCHEDULE = {
     'expire-events': {
         'task': 'concierge.tasks.expire_events_task',
         'schedule': 60 * 60,  # every hour
+    },
+    'expire-top-deals': {
+        'task': 'concierge.tasks.expire_top_deals_task',
+        'schedule': 5 * 60,  # every 5 minutes
+    },
+    'cleanup-orphaned-content-images': {
+        'task': 'concierge.tasks.cleanup_orphaned_content_images_task',
+        'schedule': 7 * 24 * 60 * 60,  # weekly
     },
 }
 CELERY_TASK_ACKS_LATE = True

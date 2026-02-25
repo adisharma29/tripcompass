@@ -1,6 +1,8 @@
 import logging
+import re
 import zoneinfo
 from datetime import date, timedelta
+from urllib.parse import urlparse
 
 from celery import shared_task
 from django.conf import settings
@@ -99,6 +101,20 @@ def otp_wa_fallback_sweep_task():
 
 
 @shared_task
+def expire_top_deals_task():
+    """Runs every 5 minutes. Clears is_top_deal when deal_ends_at has passed."""
+    from .models import Experience
+    now = timezone.now()
+    expired = Experience.objects.filter(
+        is_top_deal=True,
+        deal_ends_at__isnull=False,
+        deal_ends_at__lt=now,
+    ).update(is_top_deal=False, deal_price_display='', deal_ends_at=None)
+    if expired:
+        logger.info('Cleared %d expired top deals', expired)
+
+
+@shared_task
 def expire_events_task():
     """Runs hourly. Auto-unpublishes published events whose event_end has passed."""
     from .models import ContentStatus, Event
@@ -157,8 +173,14 @@ def cleanup_expired_otps_task():
 
 @shared_task
 def daily_digest_task():
-    """Runs daily. Sends digest notification per hotel."""
-    from .models import Hotel, Notification
+    """Runs daily. Sends digest notification per hotel.
+
+    Routes through dispatch_notification() so PushAdapter creates
+    in-app Notification records (no web push for daily_digest).
+    WhatsApp/Email adapters skip daily_digest events.
+    """
+    from .models import Hotel
+    from .notifications import NotificationEvent, dispatch_notification
     from .services import get_dashboard_stats
 
     for hotel in Hotel.objects.filter(is_active=True):
@@ -166,23 +188,182 @@ def daily_digest_task():
         if stats['total_requests'] == 0:
             continue
 
-        # Notify all admins/superadmins
-        from .models import HotelMembership
-        admins = HotelMembership.objects.filter(
+        dispatch_notification(NotificationEvent(
+            event_type='daily_digest',
             hotel=hotel,
-            is_active=True,
-            role__in=[HotelMembership.Role.ADMIN, HotelMembership.Role.SUPERADMIN],
-        ).select_related('user')
+            extra={
+                'total_requests': stats['total_requests'],
+                'confirmed': stats['confirmed'],
+                'pending': stats['pending'],
+            },
+        ))
 
-        for m in admins:
-            Notification.objects.create(
-                user=m.user,
-                hotel=hotel,
-                title='Daily Summary',
-                body=(
-                    f"{stats['total_requests']} requests today — "
-                    f"{stats['confirmed']} confirmed, "
-                    f"{stats['pending']} pending"
-                ),
-                notification_type=Notification.NotificationType.DAILY_DIGEST,
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def send_staff_invite_notification_task(self, user_id, hotel_id, role, resolved_channels=None):
+    """Send WhatsApp/email invitation to newly added staff member (background).
+
+    Tracks resolved channels (succeeded OR permanently failed) so retries
+    skip them — avoiding duplicate sends and pointless permanent-failure retries.
+    """
+    from django.contrib.auth import get_user_model
+    from .models import Hotel
+    User = get_user_model()
+    try:
+        user = User.objects.get(id=user_id)
+        hotel = Hotel.objects.get(id=hotel_id)
+    except (User.DoesNotExist, Hotel.DoesNotExist):
+        return
+
+    skip = set(resolved_channels or [])
+
+    from .services import send_staff_invite_notification
+    try:
+        send_staff_invite_notification(user, hotel, role, skip_channels=skip)
+    except Exception as exc:
+        # Merge any newly resolved channels (sent or permanently rejected)
+        skip = skip | getattr(exc, '_resolved_channels', set())
+        logger.warning(
+            'Staff invite notification partially failed (attempt %d/%d, resolved=%s): %s',
+            self.request.retries + 1, self.max_retries + 1, skip, exc,
+        )
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                'Staff invite notification exhausted retries for user=%s hotel=%s. '
+                'Resolved: %s. Manual follow-up may be needed.',
+                user_id, hotel_id, skip,
             )
+            return
+        raise self.retry(exc=exc, kwargs={
+            'user_id': user_id, 'hotel_id': hotel_id,
+            'role': role, 'resolved_channels': list(skip),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Orphaned content-image cleanup
+# ---------------------------------------------------------------------------
+
+_IMG_SRC_RE = re.compile(r'<img\b[^>]*\bsrc=["\']([^"\']*)["\']', re.IGNORECASE)
+
+
+def _list_storage_files(storage, prefix):
+    """Recursively list all file paths under *prefix* in *storage*."""
+    try:
+        dirs, files = storage.listdir(prefix)
+    except (FileNotFoundError, OSError):
+        return []
+    result = [f'{prefix}/{f}' for f in files if f]
+    for d in dirs:
+        if d:
+            result.extend(_list_storage_files(storage, f'{prefix}/{d}'))
+    return result
+
+
+def _url_to_content_path(url):
+    """Extract the ``content/…`` storage path from an image URL.
+
+    Works for both local (``/media/content/…``) and CDN
+    (``https://cdn.example.com/content/…``) URLs.
+    """
+    try:
+        path = urlparse(url).path
+    except Exception:
+        path = url
+    marker = 'content/'
+    idx = path.find(marker)
+    if idx == -1:
+        return None
+    return path[idx:]
+
+
+def cleanup_orphaned_content_images(min_age_hours=24, dry_run=False):
+    """Delete ``content/*`` files not referenced in any model HTML field.
+
+    Args:
+        min_age_hours: Skip files younger than this (avoids racing with
+            editors that upload before saving the form).
+        dry_run: If True, log what *would* be deleted but don't touch storage.
+
+    Returns:
+        ``(deleted_count, total_scanned)`` tuple.
+    """
+    from django.core.files.storage import default_storage
+
+    from .models import Department, Event, Experience, Hotel, HotelInfoSection
+
+    # 1. List every file under content/
+    stored = _list_storage_files(default_storage, 'content')
+    if not stored:
+        return (0, 0)
+
+    # 2. Filter to files older than min_age_hours
+    cutoff = timezone.now() - timedelta(hours=min_age_hours)
+    candidates = []
+    for path in stored:
+        try:
+            modified = default_storage.get_modified_time(path)
+            if timezone.is_naive(modified):
+                modified = timezone.make_aware(modified)
+            if modified < cutoff:
+                candidates.append(path)
+        except Exception:
+            # Can't determine age → don't delete
+            continue
+
+    if not candidates:
+        return (0, len(stored))
+
+    # 3. Collect every content/* path referenced in HTML fields
+    referenced = set()
+    html_sources = [
+        Hotel.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        Department.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        Experience.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        Event.objects.filter(description__contains='<img').values_list(
+            'description', flat=True,
+        ),
+        HotelInfoSection.objects.filter(body__contains='<img').values_list(
+            'body', flat=True,
+        ),
+    ]
+    for qs in html_sources:
+        for html in qs.iterator():
+            if not html:
+                continue
+            for m in _IMG_SRC_RE.finditer(html):
+                sp = _url_to_content_path(m.group(1))
+                if sp:
+                    referenced.add(sp)
+
+    # 4. Delete orphans
+    orphaned = [p for p in candidates if p not in referenced]
+    deleted = 0
+    for path in orphaned:
+        if dry_run:
+            logger.info('[DRY RUN] Would delete: %s', path)
+        else:
+            try:
+                default_storage.delete(path)
+                deleted += 1
+            except Exception:
+                logger.warning('Failed to delete orphaned content image: %s', path)
+
+    return (len(orphaned) if dry_run else deleted, len(stored))
+
+
+@shared_task
+def cleanup_orphaned_content_images_task():
+    """Runs weekly. Deletes content/* images not referenced in any HTML field."""
+    deleted, total = cleanup_orphaned_content_images(min_age_hours=24)
+    if deleted:
+        logger.info(
+            'Deleted %d orphaned content images (%d total scanned)',
+            deleted, total,
+        )
