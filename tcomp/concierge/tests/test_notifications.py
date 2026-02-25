@@ -630,6 +630,234 @@ class WebhookDeliveryStatusTest(NotificationSetupMixin, TestCase):
         })
 
 
+class WebhookButtonTypeTest(NotificationSetupMixin, TestCase):
+    """Tests for type='button' payloads and dict reply fields."""
+
+    def test_button_type_with_string_reply(self):
+        """type='button' + reply as string should parse postback."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        handle_inbound_message({
+            'payload': {
+                'source': '919876543210',
+                'type': 'button',
+                'reply': f'ack:{req.public_id}',
+            },
+        })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+
+    def test_button_type_with_dict_reply(self):
+        """type='button' + reply as {"id": "ack:..."} should not crash."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        handle_inbound_message({
+            'payload': {
+                'source': '919876543210',
+                'type': 'button',
+                'reply': {'id': f'ack:{req.public_id}', 'title': 'Acknowledge'},
+            },
+        })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+
+    def test_button_type_with_dict_reply_view(self):
+        """type='button' + reply={"id": "view:..."} sends dashboard URL."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        with patch('concierge.notifications.webhook._send_session_text') as mock_send:
+            handle_inbound_message({
+                'payload': {
+                    'source': '919876543210',
+                    'type': 'button',
+                    'reply': {'id': f'view:{req.public_id}'},
+                },
+            })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+        mock_send.assert_called_once()
+
+    def test_button_type_with_empty_dict_reply(self):
+        """type='button' + reply={} should not crash (no postback parsed)."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        # Should not raise — no postback, no window, skips silently
+        handle_inbound_message({
+            'payload': {
+                'source': '911111111111',
+                'type': 'button',
+                'reply': {},
+            },
+        })
+
+
+class WebhookTextFallbackTest(NotificationSetupMixin, TestCase):
+    """Tests for free-text replies that match button labels."""
+
+    def test_text_acknowledge_via_delivery_fallback(self):
+        """Typing 'Acknowledge' should ack the most recent pending request."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, request=req,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+        handle_inbound_message({
+            'payload': {
+                'source': '919876543210',
+                'type': 'text',
+                'text': 'Acknowledge',
+            },
+        })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+
+    def test_text_view_details_sends_url(self):
+        """Typing 'View Details' should send dashboard link."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, request=req,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+        with patch('concierge.notifications.webhook._send_session_text') as mock_send:
+            handle_inbound_message({
+                'payload': {
+                    'source': '919876543210',
+                    'type': 'text',
+                    'text': 'View Details',
+                },
+            })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+        mock_send.assert_called_once()
+
+    def test_text_on_it_acknowledges(self):
+        """'On it' maps to ack action."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, request=req,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+        handle_inbound_message({
+            'payload': {
+                'source': '919876543210',
+                'type': 'text',
+                'text': 'on it',
+            },
+        })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+
+    def test_unrecognized_text_no_action(self):
+        """Arbitrary text should not acknowledge any request."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, request=req,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+        handle_inbound_message({
+            'payload': {
+                'source': '919876543210',
+                'type': 'text',
+                'text': 'hello there',
+            },
+        })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'CREATED')
+
+    def test_no_delivery_record_skips(self):
+        """Text from phone with no delivery records should skip silently."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        # Should not raise
+        handle_inbound_message({
+            'payload': {
+                'source': '910000000000',
+                'type': 'text',
+                'text': 'Acknowledge',
+            },
+        })
+
+    def test_null_request_delivery_record_skipped(self):
+        """DeliveryRecord with request=None should be skipped in fallback."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        req = self._make_request()
+        # Older valid record
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, request=req,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+        # Newer record with no request (should be skipped by filter)
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, request=None,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+        handle_inbound_message({
+            'payload': {
+                'source': '919876543210',
+                'type': 'text',
+                'text': 'Acknowledge',
+            },
+        })
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+
+    def test_delivery_fallback_scoped_to_member_hotels(self):
+        """Fallback should only match deliveries from hotels where phone is a member."""
+        from concierge.notifications.webhook import handle_inbound_message
+
+        # Create a second hotel where staff_user is NOT a member
+        other_hotel = Hotel.objects.create(name='Other Hotel', slug='other-hotel')
+        other_dept = Department.objects.create(hotel=other_hotel, name='Bar', slug='bar')
+        other_req = ServiceRequest.objects.create(
+            hotel=other_hotel, guest_stay=self.stay,
+            department=other_dept, request_type='BOOKING',
+        )
+        # Delivery record on the OTHER hotel (newer)
+        DeliveryRecord.objects.create(
+            hotel=other_hotel, request=other_req,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+        # Delivery record on member's hotel (older)
+        req = self._make_request()
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, request=req,
+            channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+        )
+
+        handle_inbound_message({
+            'payload': {
+                'source': '919876543210',
+                'type': 'text',
+                'text': 'Acknowledge',
+            },
+        })
+        # Should ack the member's hotel request, not the other hotel's
+        req.refresh_from_db()
+        self.assertEqual(req.status, 'ACKNOWLEDGED')
+        other_req.refresh_from_db()
+        self.assertEqual(other_req.status, 'CREATED')
+
+
 # ---------------------------------------------------------------------------
 # Celery tasks
 # ---------------------------------------------------------------------------
