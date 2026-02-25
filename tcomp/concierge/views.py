@@ -1682,17 +1682,26 @@ class MemberMerge(HotelScopedMixin, generics.GenericAPIView):
                 incompatible.append(f"Email route '{route.label}' — keep member has no email")
 
         with transaction.atomic():
-            # Backfill contact info (never overwrite existing)
+            # Backfill contact info (never overwrite existing).
+            # Clear transferred fields on remove_user FIRST to avoid
+            # unique constraint violations on email/phone.
             keep_user = keep.user
             remove_user = remove.user
+            remove_clear_fields = []
             if not keep_user.email and remove_user.email:
                 keep_user.email = remove_user.email
+                remove_user.email = ''
+                remove_clear_fields.append('email')
             if not keep_user.phone and remove_user.phone:
                 keep_user.phone = remove_user.phone
+                remove_user.phone = ''
+                remove_clear_fields.append('phone')
             if not keep_user.first_name and remove_user.first_name:
                 keep_user.first_name = remove_user.first_name
             if not keep_user.last_name and remove_user.last_name:
                 keep_user.last_name = remove_user.last_name
+            if remove_clear_fields:
+                remove_user.save(update_fields=remove_clear_fields)
             keep_user.save()
 
             # Re-check compatibility after backfill (contact may have been filled)
