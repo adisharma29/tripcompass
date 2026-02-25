@@ -34,7 +34,12 @@ def _resolve_postback(msg_payload):
     """
     msg_type = msg_payload.get("type", "")
     if msg_type in ("quick_reply", "button_reply", "button"):
+        # postbackText may be at this level or nested inside an inner "payload" dict
         postback = msg_payload.get("postbackText", "")
+        if not postback:
+            inner = msg_payload.get("payload", {})
+            if isinstance(inner, dict):
+                postback = inner.get("postbackText", "")
         if postback and isinstance(postback, str):
             return postback
         reply = msg_payload.get("reply", "")
@@ -142,7 +147,8 @@ def handle_inbound_message(payload):
     else:
         # No postback — check if free-text matches a button label,
         # then resolve hotel from recent delivery record or service window.
-        text = (msg_payload.get("text", "") or msg_payload.get("title", "")).strip()
+        inner = msg_payload.get("payload", {}) if isinstance(msg_payload.get("payload"), dict) else {}
+        text = (msg_payload.get("text", "") or inner.get("text", "") or msg_payload.get("title", "")).strip()
         text_action = _TEXT_TO_ACTION.get(text.lower())
 
         # Try delivery record fallback first (covers template button taps
