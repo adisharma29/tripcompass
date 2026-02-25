@@ -127,6 +127,12 @@ class CanAccessRequestObjectByLookup(BasePermission):
     Derives hotel from request_obj.hotel instead of URL kwargs."""
 
     def has_object_permission(self, request, view, obj):
+        # Allow guest to view their own request
+        if (request.user.user_type == 'GUEST'
+                and obj.guest_stay
+                and obj.guest_stay.guest == request.user):
+            return True
+
         membership = get_membership_by_hotel(request.user, obj.hotel)
         if not membership:
             return False
