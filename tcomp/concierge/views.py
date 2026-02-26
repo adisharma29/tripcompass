@@ -477,6 +477,9 @@ class MyRequestsList(generics.ListAPIView):
         hotel_slug = self.request.query_params.get('hotel')
         if hotel_slug:
             qs = qs.filter(guest_stay__hotel__slug=hotel_slug)
+        status_filter = self.request.query_params.getlist('status')
+        if status_filter:
+            qs = qs.filter(status__in=status_filter)
         return qs
 
 

@@ -206,6 +206,9 @@ class HotelPublicSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'slug', 'description', 'tagline',
             'logo', 'cover_image', 'timezone',
+            # Contact
+            'address', 'city', 'state', 'pin_code',
+            'phone', 'email', 'website',
             # Brand
             'primary_color', 'secondary_color', 'accent_color',
             'heading_font', 'body_font', 'favicon', 'og_image',
@@ -247,6 +250,24 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
         source='destination', slug_field='slug',
         required=False, allow_null=True,
     )
+    fallback_department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.none(),  # scoped in __init__
+        allow_null=True, required=False,
+    )
+    fallback_department_name = serializers.SerializerMethodField()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        hotel = self.context.get('hotel') or self.instance
+        if hotel:
+            self.fields['fallback_department'].queryset = (
+                Department.objects.filter(hotel=hotel, is_ops=False)
+            )
+
+    def get_fallback_department_name(self, obj):
+        if obj.fallback_department_id:
+            return obj.fallback_department.name
+        return None
 
     class Meta:
         model = Hotel
@@ -270,8 +291,10 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'destination_slug',
             # Notification channels
             'whatsapp_notifications_enabled', 'email_notifications_enabled',
+            # Request routing
+            'fallback_department', 'fallback_department_name',
         ]
-        read_only_fields = ['settings_configured']
+        read_only_fields = ['settings_configured', 'fallback_department_name']
 
     def validate_room_number_pattern(self, value):
         if value:
@@ -747,6 +770,29 @@ class EventSerializer(serializers.ModelSerializer):
                 'Booking opens window must be >= closes window.'
             )
 
+        # Block publishing when no department can be resolved
+        status = data.get('status', getattr(self.instance, 'status', ContentStatus.DRAFT))
+        if status == ContentStatus.PUBLISHED:
+            dept = data.get('department', getattr(self.instance, 'department', None))
+            exp = data.get('experience', getattr(self.instance, 'experience', None))
+            if not hotel:
+                hotel = self.context.get('hotel') or (self.instance.hotel if self.instance else None)
+            resolved = (
+                dept
+                or (exp.department if exp and exp.department_id else None)
+                or (hotel.fallback_department if hotel and hotel.fallback_department_id else None)
+            )
+            if resolved is None:
+                raise serializers.ValidationError({
+                    'status': 'Cannot publish: no department to route guest requests. '
+                              'Set a department on this event, link an experience that has a department, '
+                              'or set a fallback department in hotel settings.'
+                })
+            if resolved.hotel_id != hotel.id or resolved.is_ops:
+                raise serializers.ValidationError({
+                    'status': 'Cannot publish: resolved department is invalid for routing.'
+                })
+
         return data
 
     def _handle_image_clears(self, instance, validated_data):
@@ -794,6 +840,7 @@ class EventPublicSerializer(serializers.ModelSerializer):
     booking_opens_at = serializers.SerializerMethodField()
     booking_closes_at = serializers.SerializerMethodField()
     is_bookable = serializers.SerializerMethodField()
+    is_routable = serializers.SerializerMethodField()
     routing_department_slug = serializers.SerializerMethodField()
     routing_department_name = serializers.SerializerMethodField()
     experience_name = serializers.SerializerMethodField()
@@ -810,7 +857,7 @@ class EventPublicSerializer(serializers.ModelSerializer):
             'is_recurring', 'recurrence_rule',
             'is_featured', 'next_occurrence',
             'booking_opens_at', 'booking_closes_at', 'is_bookable',
-            'department',
+            'is_routable', 'department',
             'routing_department_slug', 'routing_department_name',
             'experience_name', 'experience_slug', 'experience_department_slug',
             'gallery_images',
@@ -839,6 +886,9 @@ class EventPublicSerializer(serializers.ModelSerializer):
         """Bookable right now for the next occurrence."""
         target = obj.resolve_target_datetime()
         return obj.is_bookable_for(target)
+
+    def get_is_routable(self, obj):
+        return _get_safe_routing_department(obj) is not None
 
     def get_routing_department_slug(self, obj):
         dept = _get_safe_routing_department(obj)
