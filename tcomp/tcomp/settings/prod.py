@@ -11,6 +11,7 @@ DATABASES = {
         'PORT': os.environ.get('DB_PORT'),
         'USER': os.environ.get('DB_USER'),
         'PASSWORD': os.environ.get('DB_PASSWORD'),
+        'DISABLE_SERVER_SIDE_CURSORS': True,  # Required for pgbouncer transaction mode
         'OPTIONS': {
             'sslmode': os.environ.get('DB_SSLMODE', 'require'),
             **(

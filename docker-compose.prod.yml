@@ -57,7 +57,7 @@ services:
     command: >
       sh -c "
       python manage.py migrate --noinput &&
-      uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --workers 4 --timeout-graceful-shutdown 5 --proxy-headers --forwarded-allow-ips='${TRUSTED_PROXY_IPS:-172.16.0.0/12,192.168.0.0/16,10.0.0.0/8}'
+      uvicorn tcomp.asgi:application --host 0.0.0.0 --port 8000 --workers 6 --timeout-graceful-shutdown 5 --proxy-headers --forwarded-allow-ips='${TRUSTED_PROXY_IPS:-172.16.0.0/12,192.168.0.0/16,10.0.0.0/8}'
       "
     expose:
       - "8000"
@@ -98,7 +98,7 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CACHE_REDIS_URL=redis://redis:6379/1
       - SSE_REDIS_URL=redis://redis:6379/2
-    command: celery -A tcomp worker -l info --concurrency=2 --prefetch-multiplier=1 --max-tasks-per-child=200 -O fair
+    command: celery -A tcomp worker -l info --concurrency=4 --prefetch-multiplier=1 --max-tasks-per-child=200 -O fair
     volumes:
       - media_volume:/app/media
     depends_on:
