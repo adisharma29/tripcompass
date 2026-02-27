@@ -410,26 +410,31 @@ class ServiceRequestCreate(HotelScopedMixin, generics.CreateAPIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        if not stay.room_number:
-            return Response(
-                {'detail': 'Please set your room number first.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Rate limits
+        # Rate limits (stay-level always applies)
         if not check_stay_rate_limit(stay):
             return Response(
                 {'detail': 'Too many requests. Please try again later.'},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
-        if not check_room_rate_limit(hotel, stay.room_number):
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Room number: required unless the offering explicitly opts out
+        offering = serializer.validated_data.get('special_request_offering')
+        room_required = True
+        if offering and not offering.requires_room_number:
+            room_required = False
+        if room_required and not stay.room_number:
+            return Response(
+                {'detail': 'Please set your room number first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if stay.room_number and not check_room_rate_limit(hotel, stay.room_number):
             return Response(
                 {'detail': 'Too many requests from this room. Please try again later.'},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
-
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
 
         # Handle guest_name
         guest_name = serializer.validated_data.pop('guest_name', '')
@@ -821,7 +826,7 @@ class DepartmentViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         return Department.objects.filter(
             hotel=self.get_hotel(),
-        ).prefetch_related('experiences', 'gallery_images')
+        ).prefetch_related('experiences__gallery_images', 'gallery_images')
 
 
 class ExperienceViewSet(HotelScopedMixin, viewsets.ModelViewSet):
@@ -845,7 +850,11 @@ class EventAdminViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         return [IsAdminOrAbove()]
 
     def get_queryset(self):
-        qs = Event.objects.filter(hotel=self.get_hotel()).prefetch_related('gallery_images')
+        qs = Event.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related(
+            'department', 'experience__department', 'hotel__fallback_department',
+        ).prefetch_related('gallery_images')
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -2014,6 +2023,12 @@ class MyHotelsList(generics.ListAPIView):
             memberships__user=self.request.user,
             memberships__is_active=True,
             is_active=True,
+        ).select_related(
+            'destination', 'fallback_department',
+        ).prefetch_related(
+            'departments__experiences__gallery_images',
+            'departments__gallery_images',
+            'info_sections',
         ).distinct()
 
 
@@ -2022,7 +2037,7 @@ class NotificationList(generics.ListAPIView):
     serializer_class = NotificationSerializer
 
     def get_queryset(self):
-        qs = Notification.objects.filter(user=self.request.user)
+        qs = Notification.objects.filter(user=self.request.user).select_related('request')
         is_read = self.request.query_params.get('is_read')
         if is_read is not None:
             qs = qs.filter(is_read=is_read.lower() in ('true', '1'))
