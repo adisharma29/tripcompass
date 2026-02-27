@@ -5,7 +5,7 @@ from .models import (
     Hotel, HotelMembership, Department, Experience, Event,
     GuestStay, OTPCode, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode, EscalationHeartbeat,
-    BookingEmailTemplate,
+    BookingEmailTemplate, SpecialRequestOffering, SpecialRequestOfferingImage,
 )
 
 
@@ -102,6 +102,20 @@ class QRCodeAdmin(admin.ModelAdmin):
 class BookingEmailTemplateAdmin(admin.ModelAdmin):
     list_display = ['hotel', 'subject', 'updated_at']
     readonly_fields = ['created_at', 'updated_at']
+
+
+@admin.register(SpecialRequestOffering)
+class SpecialRequestOfferingAdmin(admin.ModelAdmin):
+    list_display = ['name', 'hotel', 'category', 'status', 'display_order']
+    list_filter = ['category', 'status', 'hotel']
+    search_fields = ['name', 'slug']
+    prepopulated_fields = {'slug': ('name',)}
+
+
+@admin.register(SpecialRequestOfferingImage)
+class SpecialRequestOfferingImageAdmin(admin.ModelAdmin):
+    list_display = ['offering', 'display_order', 'created_at']
+    list_filter = ['offering__hotel']
 
 
 @admin.register(EscalationHeartbeat)

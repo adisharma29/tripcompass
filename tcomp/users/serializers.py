@@ -46,8 +46,6 @@ class AuthProfileSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_memberships(self, obj):
-        if obj.user_type != 'STAFF':
-            return []
         from concierge.serializers import MemberSerializer
         memberships = obj.hotel_memberships.filter(
             is_active=True,
@@ -55,8 +53,6 @@ class AuthProfileSerializer(serializers.ModelSerializer):
         return MemberSerializer(memberships, many=True).data
 
     def get_stays(self, obj):
-        if obj.user_type != 'GUEST':
-            return []
         from concierge.serializers import GuestStaySerializer
         stays = obj.stays.order_by('-created_at')[:5]
         return GuestStaySerializer(stays, many=True).data

@@ -14,6 +14,7 @@ class NotificationEvent:
     department: Optional[Department] = None  # None for hotel-wide events (daily_digest)
     request: Optional[ServiceRequest] = None  # None for daily_digest
     event_obj: Optional["Event"] = None  # Set when request originated from an Event
+    offering_obj: Optional["SpecialRequestOffering"] = None  # Set when request is for an offering
     escalation_tier: Optional[int] = None  # For escalation events
     extra: dict = field(default_factory=dict)  # Adapter-specific data
 
@@ -24,6 +25,8 @@ class NotificationEvent:
     @property
     def display_name(self) -> str:
         """Human-readable name for the request subject."""
+        if self.offering_obj:
+            return self.offering_obj.name
         if self.event_obj:
             return self.event_obj.name
         if self.request and self.request.experience:

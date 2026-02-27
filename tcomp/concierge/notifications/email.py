@@ -31,9 +31,17 @@ class EmailAdapter(ChannelAdapter):
         experience = event.request.experience if event.request else None
         scope_q = Q()
 
+        # Offering-scoped routes (mutually exclusive with dept/event)
+        if event.offering_obj:
+            scope_q = scope_q | Q(
+                special_request_offering=event.offering_obj,
+                department__isnull=True,
+                event__isnull=True,
+            )
+
         # Department routes: only if no event or event.notify_department is True
         if event.event_obj is None or event.event_obj.notify_department:
-            dept_q = Q(department=event.department, event__isnull=True)
+            dept_q = Q(department=event.department, event__isnull=True, special_request_offering__isnull=True)
             if experience:
                 dept_q = dept_q & (Q(experience__isnull=True) | Q(experience=experience))
             else:
@@ -42,7 +50,7 @@ class EmailAdapter(ChannelAdapter):
 
         # Event-specific routes
         if event.event_obj:
-            scope_q = scope_q | Q(event=event.event_obj, department__isnull=True)
+            scope_q = scope_q | Q(event=event.event_obj, department__isnull=True, special_request_offering__isnull=True)
 
         if not scope_q:
             return []
