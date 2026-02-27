@@ -745,6 +745,7 @@ def _fire_escalation(request_obj, tier, hotel):
             department=request_obj.department,
             request=request_obj,
             event_obj=request_obj.event,
+            offering_obj=request_obj.special_request_offering,
             escalation_tier=tier,
         ))
         activity.notified_at = timezone.now()
@@ -778,7 +779,7 @@ def send_response_due_reminders():
         status=ServiceRequest.Status.CREATED,
         response_due_at__lt=now,
         reminder_sent_at__isnull=True,
-    ).select_related('department', 'hotel', 'guest_stay')
+    ).select_related('department', 'hotel', 'guest_stay', 'special_request_offering')
 
     from .notifications import NotificationEvent, dispatch_notification
     for req in overdue:
@@ -788,6 +789,7 @@ def send_response_due_reminders():
             department=req.department,
             request=req,
             event_obj=req.event,
+            offering_obj=req.special_request_offering,
         ))
         req.reminder_sent_at = now
         req.save(update_fields=['reminder_sent_at'])

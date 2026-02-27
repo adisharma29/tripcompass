@@ -30,6 +30,7 @@ from .models import (
     ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
     Notification, NotificationRoute, PushSubscription, QRCode, QRScanDaily,
     ServiceRequest, RequestActivity,
+    SpecialRequestOffering, SpecialRequestOfferingImage,
 )
 from .permissions import (
     CanAccessRequestObject, CanAccessRequestObjectByLookup,
@@ -51,6 +52,8 @@ from .serializers import (
     PushSubscriptionSerializer, QRCodeSerializer,
     ServiceRequestCreateSerializer, ServiceRequestDetailSerializer,
     ServiceRequestListSerializer, ServiceRequestUpdateSerializer,
+    SpecialRequestOfferingSerializer, SpecialRequestOfferingPublicSerializer,
+    SpecialRequestOfferingImageSerializer,
 )
 from .notifications import NotificationEvent, dispatch_notification
 from .services import (
@@ -213,6 +216,50 @@ class EventPublicDetail(generics.RetrieveAPIView):
             status=ContentStatus.PUBLISHED,
         ).select_related(
             'hotel', 'department', 'experience__department', 'hotel__fallback_department',
+        ).prefetch_related('gallery_images')
+
+
+# ---------------------------------------------------------------------------
+# Special Request Offerings — Public
+# ---------------------------------------------------------------------------
+
+class SpecialRequestOfferingPublicList(APIView):
+    """Public list returning offerings grouped by category."""
+    permission_classes = [AllowAny]
+
+    def get(self, request, hotel_slug):
+        qs = SpecialRequestOffering.objects.filter(
+            hotel__slug=hotel_slug,
+            hotel__is_active=True,
+            status=ContentStatus.PUBLISHED,
+        ).prefetch_related('gallery_images').order_by('display_order', 'name')
+
+        utilitarian = []
+        personalization = []
+        for offering in qs:
+            data = SpecialRequestOfferingPublicSerializer(offering, context={'request': request}).data
+            if offering.category == SpecialRequestOffering.Category.UTILITARIAN:
+                utilitarian.append(data)
+            else:
+                personalization.append(data)
+
+        return Response({
+            'utilitarian': utilitarian,
+            'personalization': personalization,
+        })
+
+
+class SpecialRequestOfferingPublicDetail(generics.RetrieveAPIView):
+    permission_classes = [AllowAny]
+    serializer_class = SpecialRequestOfferingPublicSerializer
+    lookup_field = 'slug'
+    lookup_url_kwarg = 'offering_slug'
+
+    def get_queryset(self):
+        return SpecialRequestOffering.objects.filter(
+            hotel__slug=self.kwargs['hotel_slug'],
+            hotel__is_active=True,
+            status=ContentStatus.PUBLISHED,
         ).prefetch_related('gallery_images')
 
 
@@ -419,6 +466,7 @@ class ServiceRequestCreate(HotelScopedMixin, generics.CreateAPIView):
             department=req.department,
             request=req,
             event_obj=req.event,
+            offering_obj=req.special_request_offering,
         ))
 
         # SSE
@@ -432,6 +480,7 @@ class ServiceRequestCreate(HotelScopedMixin, generics.CreateAPIView):
                 department=hotel.fallback_department,
                 request=req,
                 event_obj=req.event,
+                offering_obj=req.special_request_offering,
                 extra={'original_department_name': req.department.name},
             ))
 
@@ -473,6 +522,7 @@ class MyRequestsList(generics.ListAPIView):
             guest_stay__guest=self.request.user,
         ).select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
+            'special_request_offering',
         ).order_by('-created_at')
         hotel_slug = self.request.query_params.get('hotel')
         if hotel_slug:
@@ -497,6 +547,7 @@ class ServiceRequestList(HotelScopedMixin, generics.ListAPIView):
     def get_queryset(self):
         qs = super().get_queryset().select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
+            'special_request_offering',
         )
         membership = getattr(self.request, 'membership', None)
         if membership and membership.role == HotelMembership.Role.STAFF:
@@ -518,6 +569,7 @@ class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveUpdateAPIView):
             hotel=self.get_hotel(),
         ).select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
+            'special_request_offering',
         ).prefetch_related('activities__actor')
 
     def retrieve(self, request, *args, **kwargs):
@@ -581,6 +633,7 @@ class ServiceRequestDetailByPublicId(HotelScopedMixin, generics.RetrieveAPIView)
             hotel=self.get_hotel(),
         ).select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
+            'special_request_offering',
         ).prefetch_related('activities__actor')
 
 
@@ -1199,6 +1252,146 @@ class EventImageReorder(HotelScopedMixin, APIView):
         return Response({'detail': f'{len(ordered_ids)} images reordered.'})
 
 
+# ---------------------------------------------------------------------------
+# Special Request Offerings — Admin
+# ---------------------------------------------------------------------------
+
+class SpecialRequestOfferingViewSet(HotelScopedMixin, viewsets.ModelViewSet):
+    serializer_class = SpecialRequestOfferingSerializer
+    pagination_class = None
+
+    def get_permissions(self):
+        if self.action in ('list', 'retrieve'):
+            return [IsStaffOrAbove()]
+        return [IsAdminOrAbove()]
+
+    def get_queryset(self):
+        qs = SpecialRequestOffering.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related('department').prefetch_related('gallery_images')
+        category = self.request.query_params.get('category')
+        if category:
+            qs = qs.filter(category=category)
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx['hotel'] = self.get_hotel()
+        return ctx
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        max_order = SpecialRequestOffering.objects.filter(
+            hotel=hotel,
+            category=serializer.validated_data['category'],
+        ).aggregate(m=Max('display_order'))['m']
+        serializer.save(hotel=hotel, display_order=(max_order or 0) + 1)
+
+
+class SpecialRequestOfferingBulkReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        category = request.query_params.get('category')
+        if category not in ('UTILITARIAN', 'PERSONALIZATION'):
+            return Response(
+                {'detail': 'category query param must be UTILITARIAN or PERSONALIZATION.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            offerings = SpecialRequestOffering.objects.filter(
+                hotel=hotel, category=category, id__in=ordered_ids,
+            )
+            if offerings.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more IDs do not belong to this hotel/category.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            off_map = {o.id: o for o in offerings}
+            for idx, off_id in enumerate(ordered_ids):
+                off_map[off_id].display_order = idx
+            SpecialRequestOffering.objects.bulk_update(off_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} offerings reordered.'})
+
+
+class SpecialRequestOfferingImageUpload(HotelScopedMixin, generics.CreateAPIView):
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = SpecialRequestOfferingImageSerializer
+
+    def perform_create(self, serializer):
+        hotel = self.get_hotel()
+        offering = get_object_or_404(
+            SpecialRequestOffering,
+            pk=self.kwargs['offering_id'],
+            hotel=hotel,
+        )
+        max_order = offering.gallery_images.aggregate(m=Max('display_order'))['m'] or 0
+        serializer.save(offering=offering, display_order=max_order + 1)
+
+
+class SpecialRequestOfferingImageDelete(HotelScopedMixin, generics.DestroyAPIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get_queryset(self):
+        return SpecialRequestOfferingImage.objects.filter(
+            offering__hotel=self.get_hotel(),
+        )
+
+
+class SpecialRequestOfferingImageReorder(HotelScopedMixin, APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def patch(self, request, **kwargs):
+        ordered_ids = request.data.get('order', [])
+        if not ordered_ids or not isinstance(ordered_ids, list):
+            return Response(
+                {'detail': 'order must be a non-empty list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(ordered_ids) != len(set(ordered_ids)):
+            return Response(
+                {'detail': 'Duplicate IDs in order list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        hotel = self.get_hotel()
+        with transaction.atomic():
+            images = SpecialRequestOfferingImage.objects.filter(
+                offering__hotel=hotel,
+                offering__pk=self.kwargs['offering_id'],
+                id__in=ordered_ids,
+            )
+            if images.count() != len(ordered_ids):
+                return Response(
+                    {'detail': 'One or more image IDs are invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            img_map = {img.id: img for img in images}
+            for idx, img_id in enumerate(ordered_ids):
+                img_map[img_id].display_order = idx
+            SpecialRequestOfferingImage.objects.bulk_update(img_map.values(), ['display_order'])
+
+        return Response({'detail': f'{len(ordered_ids)} images reordered.'})
+
+
 class QRCodeViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     permission_classes = [IsAdminOrAbove]
     serializer_class = QRCodeSerializer
@@ -1249,12 +1442,16 @@ class NotificationRouteViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         qs = NotificationRoute.objects.filter(
             hotel=self.get_hotel(),
-        ).select_related('department', 'experience', 'event', 'member__user').order_by('channel', 'id')
+        ).select_related(
+            'department', 'experience', 'event', 'special_request_offering', 'member__user',
+        ).order_by('channel', 'id')
         dept_id = self.request.query_params.get('department')
         event_id = self.request.query_params.get('event')
-        # Mutual exclusion: cannot filter by both
-        if dept_id and event_id:
-            raise serializers.ValidationError('Cannot filter by both department and event.')
+        offering_id = self.request.query_params.get('special_request_offering')
+        # Mutual exclusion: cannot filter by multiple scopes
+        scope_count = sum(1 for v in (dept_id, event_id, offering_id) if v)
+        if scope_count > 1:
+            raise serializers.ValidationError('Cannot filter by more than one scope (department, event, special_request_offering).')
         if dept_id:
             try:
                 qs = qs.filter(department_id=int(dept_id))
@@ -1263,6 +1460,11 @@ class NotificationRouteViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         if event_id:
             try:
                 qs = qs.filter(event_id=int(event_id))
+            except (ValueError, TypeError):
+                qs = qs.none()
+        if offering_id:
+            try:
+                qs = qs.filter(special_request_offering_id=int(offering_id))
             except (ValueError, TypeError):
                 qs = qs.none()
         member_id = self.request.query_params.get('member')
@@ -1568,6 +1770,7 @@ def _transfer_member_data(source, target, actor, reason):
             department=route.department,
             experience=route.experience,
             event=route.event,
+            special_request_offering=route.special_request_offering,
             channel=route.channel,
             target=new_target,
         ).exclude(pk=route.pk).exists()
@@ -1915,6 +2118,7 @@ class MyRequestDetail(generics.RetrieveAPIView):
     def get_queryset(self):
         return ServiceRequest.objects.select_related(
             'department', 'experience', 'event', 'guest_stay__guest', 'hotel',
+            'special_request_offering',
         ).prefetch_related('activities__actor')
 
     def retrieve(self, request, *args, **kwargs):

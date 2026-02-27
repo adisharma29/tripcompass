@@ -58,6 +58,12 @@ class Hotel(models.Model):
 
     escalation_enabled = models.BooleanField(default=False)
 
+    # --- Guest feature toggles ---
+    custom_requests_enabled = models.BooleanField(
+        default=False,
+        help_text='Allow guests to submit freeform custom requests',
+    )
+
     # --- Notification channel toggles ---
     whatsapp_notifications_enabled = models.BooleanField(default=False)
     email_notifications_enabled = models.BooleanField(default=False)
@@ -264,6 +270,7 @@ class Department(models.Model):
     RESERVED_SLUGS = frozenset({
         'explore', 'events', 'request', 'requests',
         'confirmation', 'verify', 'api', 'manifest-json',
+        'special-requests',
     })
 
     def clean(self):
@@ -791,6 +798,119 @@ class EventImage(models.Model):
         return f'Image {self.id} for event {self.event.name}'
 
 
+class SpecialRequestOffering(models.Model):
+    """Pre-defined service offering that guests can request (e.g. room upgrade, birthday cake)."""
+
+    class Category(models.TextChoices):
+        UTILITARIAN = 'UTILITARIAN', 'Utilitarian'
+        PERSONALIZATION = 'PERSONALIZATION', 'Personalization'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='special_request_offerings',
+    )
+    category = models.CharField(max_length=20, choices=Category.choices)
+    name = models.CharField(max_length=200)
+    slug = models.SlugField(max_length=200)
+    description = models.TextField(blank=True, default='')
+    photo = models.ImageField(upload_to='special_requests/', blank=True)
+    cover_image = models.ImageField(upload_to='special_requests/covers/', blank=True)
+
+    # Pricing
+    price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    price_display = models.CharField(max_length=100, blank=True, default='')
+    is_complimentary = models.BooleanField(default=False)
+
+    # Routing (optional — if null, falls back to hotel.fallback_department)
+    department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='special_request_offerings',
+    )
+
+    # Constraints
+    requires_room_number = models.BooleanField(default=False)
+    lead_time_days = models.PositiveIntegerField(null=True, blank=True)
+    max_quantity = models.PositiveIntegerField(default=1)
+
+    # Content
+    highlights = models.JSONField(default=list, blank=True)
+    status = models.CharField(
+        max_length=12, choices=ContentStatus.choices, default=ContentStatus.DRAFT,
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('hotel', 'slug')]
+        ordering = ['category', 'display_order', 'name']
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if self.department_id and self.department.hotel_id != self.hotel_id:
+            raise ValidationError(
+                {'department': 'Department must belong to the same hotel as the offering.'}
+            )
+        if self.department_id and self.department.is_ops:
+            raise ValidationError(
+                {'department': 'Cannot route to an operations-only department.'}
+            )
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.name) or 'offering'
+            slug = base[:200]
+            counter = 1
+            while SpecialRequestOffering.objects.filter(
+                hotel=self.hotel, slug=slug,
+            ).exclude(pk=self.pk).exists():
+                suffix = f'-{counter}'
+                slug = f'{base[:200 - len(suffix)]}{suffix}'
+                counter += 1
+            self.slug = slug
+        super().save(*args, **kwargs)
+
+    def get_routing_department(self):
+        """Resolve department for request routing: offering.department → hotel.fallback_department.
+
+        Returns None if no valid department can be resolved. Skips cross-hotel
+        and ops-only departments even if misconfigured via admin/shell.
+        """
+        if self.department_id:
+            dept = self.department
+            if dept.hotel_id != self.hotel_id or dept.is_ops:
+                # Misconfigured — fall through to hotel fallback
+                pass
+            else:
+                return dept
+        if self.hotel.fallback_department_id:
+            fb = self.hotel.fallback_department
+            if fb.hotel_id == self.hotel_id and not fb.is_ops:
+                return fb
+        return None
+
+    def __str__(self):
+        return f'{self.name} ({self.hotel.name})'
+
+
+class SpecialRequestOfferingImage(models.Model):
+    """Gallery images for a special request offering."""
+    offering = models.ForeignKey(
+        SpecialRequestOffering, on_delete=models.CASCADE, related_name='gallery_images',
+    )
+    image = models.ImageField(upload_to='special_requests/gallery/')
+    alt_text = models.CharField(max_length=255, blank=True)
+    display_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['display_order', 'created_at']
+
+    def __str__(self):
+        return f'Image {self.id} for offering {self.offering.name}'
+
+
 class GuestStay(models.Model):
     guest = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
@@ -873,6 +993,7 @@ class ServiceRequest(models.Model):
         BOOKING = 'BOOKING', 'Booking'
         INQUIRY = 'INQUIRY', 'Inquiry'
         CUSTOM = 'CUSTOM', 'Custom'
+        SPECIAL_REQUEST = 'SPECIAL_REQUEST', 'Special Request'
 
     VALID_TRANSITIONS = {
         'CREATED': ['ACKNOWLEDGED'],
@@ -899,6 +1020,17 @@ class ServiceRequest(models.Model):
     department = models.ForeignKey(
         Department, on_delete=models.CASCADE, related_name='requests',
     )
+    special_request_offering = models.ForeignKey(
+        SpecialRequestOffering, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='requests',
+    )
+    special_request_category = models.CharField(
+        max_length=20,
+        choices=SpecialRequestOffering.Category.choices,
+        blank=True, default='',
+        help_text='Persisted from offering on SPECIAL_REQUEST, from guest on CUSTOM. Empty for BOOKING/INQUIRY.',
+    )
+    quantity = models.PositiveIntegerField(default=1)
     occurrence_date = models.DateField(
         null=True, blank=True,
         help_text='For recurring events: which occurrence the guest selected',
@@ -1275,6 +1407,10 @@ class NotificationRoute(models.Model):
         Event, on_delete=models.CASCADE, null=True, blank=True,
         related_name='notification_routes',
     )
+    special_request_offering = models.ForeignKey(
+        SpecialRequestOffering, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='notification_routes',
+    )
     experience = models.ForeignKey(
         Experience, on_delete=models.CASCADE, null=True, blank=True,
         related_name='notification_routes',
@@ -1301,39 +1437,45 @@ class NotificationRoute(models.Model):
 
     class Meta:
         constraints = [
-            # --- Department-scoped routes (existing) ---
-            # Experience-specific routes: one per (dept, exp, channel, target)
+            # --- Department-scoped routes ---
             models.UniqueConstraint(
                 fields=['department', 'experience', 'channel', 'target'],
                 condition=Q(experience__isnull=False),
                 name='unique_route_with_experience',
             ),
-            # Department-wide routes: one per (dept, channel, target) where experience IS NULL
             models.UniqueConstraint(
                 fields=['department', 'channel', 'target'],
-                condition=Q(experience__isnull=True, event__isnull=True),
+                condition=Q(experience__isnull=True, event__isnull=True, special_request_offering__isnull=True),
                 name='unique_route_dept_wide',
             ),
-            # --- Event-scoped routes (new) ---
-            # Event routes: one per (event, channel, target)
+            # --- Event-scoped routes ---
             models.UniqueConstraint(
                 fields=['event', 'channel', 'target'],
                 condition=Q(event__isnull=False),
                 name='unique_event_channel_target',
             ),
-            # --- Scope exclusivity ---
-            # Exactly one scope: department XOR event
+            # --- Offering-scoped routes ---
+            models.UniqueConstraint(
+                fields=['special_request_offering', 'channel', 'target'],
+                condition=Q(special_request_offering__isnull=False),
+                name='unique_offering_channel_target',
+            ),
+            # --- Scope exclusivity: exactly one of department, event, offering ---
             models.CheckConstraint(
                 check=(
-                    Q(department__isnull=False, event__isnull=True)
-                    | Q(department__isnull=True, event__isnull=False)
+                    Q(department__isnull=False, event__isnull=True, special_request_offering__isnull=True)
+                    | Q(department__isnull=True, event__isnull=False, special_request_offering__isnull=True)
+                    | Q(department__isnull=True, event__isnull=True, special_request_offering__isnull=False)
                 ),
-                name='route_scope_dept_xor_event',
+                name='route_scope_dept_xor_event_xor_offering',
             ),
             # Experience only valid on department-scoped routes
             models.CheckConstraint(
-                check=Q(event__isnull=True) | Q(experience__isnull=True),
-                name='route_no_experience_on_event_scope',
+                check=(
+                    Q(department__isnull=False)
+                    | Q(experience__isnull=True)
+                ),
+                name='route_experience_only_on_dept_scope',
             ),
         ]
 
@@ -1341,18 +1483,22 @@ class NotificationRoute(models.Model):
         """Cross-hotel FK consistency and scope validation."""
         from django.core.exceptions import ValidationError
         errors = {}
-        # Scope: exactly one of department or event
+        # Scope: exactly one of department, event, or offering
         has_dept = self.department_id is not None
         has_event = self.event_id is not None
-        if has_dept == has_event:
-            errors['__all__'] = 'Exactly one of department or event must be set.'
+        has_offering = self.special_request_offering_id is not None
+        scope_count = sum([has_dept, has_event, has_offering])
+        if scope_count != 1:
+            errors['__all__'] = 'Exactly one of department, event, or special_request_offering must be set.'
         if has_dept and self.department.hotel_id != self.hotel_id:
             errors['department'] = 'Department must belong to this hotel.'
         if has_event and self.event.hotel_id != self.hotel_id:
             errors['event'] = 'Event must belong to this hotel.'
-        if has_event and self.experience_id:
-            errors['experience'] = 'Experience cannot be set on event-scoped routes.'
-        if self.experience_id and self.experience.department_id != self.department_id:
+        if has_offering and self.special_request_offering.hotel_id != self.hotel_id:
+            errors['special_request_offering'] = 'Offering must belong to this hotel.'
+        if not has_dept and self.experience_id:
+            errors['experience'] = 'Experience can only be set on department-scoped routes.'
+        if self.experience_id and has_dept and self.experience.department_id != self.department_id:
             errors['experience'] = 'Experience must belong to the selected department.'
         if self.member_id and self.member.hotel_id != self.hotel_id:
             errors['member'] = 'Team member must belong to this hotel.'
@@ -1368,7 +1514,14 @@ class NotificationRoute(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        scope = self.event.name if self.event_id else self.department.name if self.department_id else '?'
+        if self.event_id:
+            scope = self.event.name
+        elif self.special_request_offering_id:
+            scope = self.special_request_offering.name
+        elif self.department_id:
+            scope = self.department.name
+        else:
+            scope = '?'
         return f'{self.channel} → {self.target} ({scope})'
 
 

@@ -8,6 +8,7 @@ from rest_framework import serializers
 from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
     ExperienceImage, DepartmentImage, Event, EventImage,
+    SpecialRequestOffering, SpecialRequestOfferingImage,
     GuestStay, ServiceRequest, RequestActivity,
     Notification, NotificationRoute, PushSubscription, QRCode, HotelInfoSection,
     BookingEmailTemplate,
@@ -200,6 +201,14 @@ class HotelPublicSerializer(serializers.ModelSerializer):
     destination_slug = serializers.SlugRelatedField(
         source='destination', slug_field='slug', read_only=True,
     )
+    custom_requests_enabled = serializers.SerializerMethodField()
+
+    def get_custom_requests_enabled(self, obj):
+        """Only advertise custom requests when a routable fallback department exists."""
+        if not obj.custom_requests_enabled or not obj.fallback_department_id:
+            return False
+        fb = obj.fallback_department
+        return fb.hotel_id == obj.id and not fb.is_ops
 
     class Meta:
         model = Hotel
@@ -218,6 +227,8 @@ class HotelPublicSerializer(serializers.ModelSerializer):
             'footer_text', 'terms_url', 'privacy_url',
             # Explore tab
             'destination_slug',
+            # Guest features
+            'custom_requests_enabled',
             # Relations
             'departments', 'info_sections',
         ]
@@ -291,6 +302,8 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             'destination_slug',
             # Notification channels
             'whatsapp_notifications_enabled', 'email_notifications_enabled',
+            # Guest features
+            'custom_requests_enabled',
             # Request routing
             'fallback_department', 'fallback_department_name',
         ]
@@ -404,11 +417,12 @@ class _ExperienceNestedSerializer(serializers.ModelSerializer):
 class DepartmentSerializer(serializers.ModelSerializer):
     experiences = _ExperienceNestedSerializer(many=True, read_only=True)
     gallery_images = DepartmentImageSerializer(many=True, read_only=True)
+    photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
 
     class Meta:
         model = Department
         fields = [
-            'id', 'name', 'slug', 'description', 'photo', 'icon',
+            'id', 'name', 'slug', 'description', 'photo', 'photo_clear', 'icon',
             'display_order', 'schedule', 'is_ops', 'is_active',
             'status', 'published_at',
             'experiences', 'gallery_images', 'created_at', 'updated_at',
@@ -503,9 +517,15 @@ class DepartmentSerializer(serializers.ModelSerializer):
         new_status = validated_data.get('status')
         if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
+        # Handle photo clearing
+        if validated_data.pop('photo_clear', False):
+            if instance.photo:
+                instance.photo.delete(save=False)
+            setattr(instance, 'photo', '')
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
+        validated_data.pop('photo_clear', None)
         if validated_data.get('status') == ContentStatus.PUBLISHED:
             validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
@@ -910,6 +930,147 @@ class EventPublicSerializer(serializers.ModelSerializer):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Special Request Offering serializers
+# ---------------------------------------------------------------------------
+
+class SpecialRequestOfferingImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SpecialRequestOfferingImage
+        fields = ['id', 'image', 'alt_text', 'display_order', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def validate_image(self, value):
+        return _clean_image(value)
+
+
+class SpecialRequestOfferingPublicSerializer(serializers.ModelSerializer):
+    """Guest-facing serializer for published offerings."""
+    gallery_images = SpecialRequestOfferingImageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SpecialRequestOffering
+        fields = [
+            'id', 'slug', 'category', 'name', 'description',
+            'photo', 'cover_image', 'price_display', 'is_complimentary',
+            'requires_room_number', 'lead_time_days', 'max_quantity',
+            'highlights', 'gallery_images',
+        ]
+
+
+class SpecialRequestOfferingSerializer(serializers.ModelSerializer):
+    """Admin serializer for Offering CRUD."""
+    photo_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    cover_image_clear = serializers.BooleanField(write_only=True, required=False, default=False)
+    gallery_images = SpecialRequestOfferingImageSerializer(many=True, read_only=True)
+    department_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SpecialRequestOffering
+        fields = [
+            'id', 'hotel', 'category', 'name', 'slug', 'description',
+            'photo', 'cover_image', 'photo_clear', 'cover_image_clear',
+            'price', 'price_display', 'is_complimentary',
+            'department', 'department_name',
+            'requires_room_number', 'lead_time_days', 'max_quantity',
+            'highlights', 'status', 'published_at', 'display_order',
+            'gallery_images', 'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'hotel', 'slug', 'published_at',
+            'created_at', 'updated_at', 'department_name',
+        ]
+
+    def get_department_name(self, obj):
+        return obj.department.name if obj.department_id else None
+
+    def validate_photo(self, value):
+        return _clean_image(value)
+
+    def validate_cover_image(self, value):
+        return _clean_image(value)
+
+    def to_internal_value(self, data):
+        # FormData cannot represent null for non-string fields.
+        # DRF IntegerField rejects "" in to_internal_value (before validate_<field>),
+        # so we must intercept here and convert "" → None for nullable int fields.
+        if 'lead_time_days' in data and data.get('lead_time_days') == '':
+            data = data.copy()
+            data['lead_time_days'] = None
+        return super().to_internal_value(data)
+
+    def validate_description(self, value):
+        if value:
+            return _sanitize_img_src(bleach.clean(
+                value, tags=ALLOWED_HTML_TAGS,
+                attributes=ALLOWED_HTML_ATTRIBUTES, strip=True,
+            ))
+        return value
+
+    def validate_department(self, value):
+        if value is None:
+            return value
+        hotel = self.context.get('hotel')
+        if hotel and value.hotel != hotel:
+            raise serializers.ValidationError('Department does not belong to this hotel.')
+        if value.is_ops:
+            raise serializers.ValidationError('Cannot route to an ops department.')
+        return value
+
+    def validate(self, data):
+        is_complimentary = data.get(
+            'is_complimentary',
+            getattr(self.instance, 'is_complimentary', False),
+        )
+        if is_complimentary:
+            data['price'] = None
+            data['price_display'] = ''
+
+        # Guard: any save that results in a PUBLISHED offering must be routable.
+        # Covers initial publish, re-saves of already-published offerings,
+        # and PATCH calls that change department on a published offering.
+        inst = self.instance
+        new_status = data.get('status')
+        effective_status = new_status or (inst.status if inst else None)
+        if effective_status == ContentStatus.PUBLISHED:
+            hotel = self.context.get('hotel') or (inst.hotel if inst else None)
+            probe = SpecialRequestOffering(
+                hotel=hotel,
+                department=data.get('department', getattr(inst, 'department', None) if inst else None),
+            )
+            if probe.get_routing_department() is None:
+                # Attribute error to the field most relevant to the caller
+                error_field = 'department' if 'department' in data else 'status'
+                raise serializers.ValidationError(
+                    {error_field: 'Cannot publish — no routable department. Assign a non-ops department '
+                     'to this offering, or configure a valid fallback department in Settings.'}
+                )
+        return data
+
+    def _handle_image_clears(self, instance, validated_data):
+        for field in ('photo', 'cover_image'):
+            if validated_data.pop(f'{field}_clear', False):
+                file_field = getattr(instance, field)
+                if file_field:
+                    file_field.delete(save=False)
+                setattr(instance, field, '')
+
+    def update(self, instance, validated_data):
+        new_status = validated_data.get('status')
+        if new_status == ContentStatus.PUBLISHED and instance.status != ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        self._handle_image_clears(instance, validated_data)
+        return super().update(instance, validated_data)
+
+    def create(self, validated_data):
+        validated_data.pop('photo_clear', None)
+        validated_data.pop('cover_image_clear', None)
+        if validated_data.get('status') == ContentStatus.PUBLISHED:
+            validated_data['published_at'] = timezone.now()
+        validated_data['hotel'] = self.context['hotel']
+        return super().create(validated_data)
+
+
 class HotelMinimalSerializer(serializers.ModelSerializer):
     """Lightweight hotel serializer for embedding in membership responses."""
 
@@ -1302,19 +1463,28 @@ class RequestActivitySerializer(serializers.ModelSerializer):
 
 class ServiceRequestCreateSerializer(serializers.ModelSerializer):
     guest_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
-    # department is optional when event is provided (backend resolves via fallback chain)
+    # department is optional when event/offering is provided (backend resolves via fallback chain)
     department = serializers.PrimaryKeyRelatedField(
         queryset=Department.objects.all(), required=False, allow_null=True,
     )
     event = serializers.PrimaryKeyRelatedField(
         queryset=Event.objects.all(), required=False, allow_null=True,
     )
+    special_request_offering = serializers.PrimaryKeyRelatedField(
+        queryset=SpecialRequestOffering.objects.all(), required=False, allow_null=True,
+    )
+    special_request_category = serializers.ChoiceField(
+        choices=SpecialRequestOffering.Category.choices,
+        required=False, allow_blank=True,
+    )
+    quantity = serializers.IntegerField(required=False, min_value=1, default=1)
     occurrence_date = serializers.DateField(required=False, allow_null=True)
 
     class Meta:
         model = ServiceRequest
         fields = [
             'experience', 'department', 'event', 'occurrence_date',
+            'special_request_offering', 'special_request_category', 'quantity',
             'request_type',
             'guest_name', 'guest_notes', 'guest_date',
             'guest_time', 'guest_count',
@@ -1325,6 +1495,91 @@ class ServiceRequestCreateSerializer(serializers.ModelSerializer):
         event = data.get('event')
         experience = data.get('experience')
         department = data.get('department')
+        offering = data.get('special_request_offering')
+        request_type = data.get('request_type')
+
+        if offering:
+            # --- Special request offering ---
+            if offering.hotel != hotel:
+                raise serializers.ValidationError(
+                    {'special_request_offering': 'Offering does not belong to this hotel.'}
+                )
+            if offering.status != ContentStatus.PUBLISHED:
+                raise serializers.ValidationError(
+                    {'special_request_offering': 'This offering is not currently published.'}
+                )
+            # Force request type
+            data['request_type'] = ServiceRequest.RequestType.SPECIAL_REQUEST
+            # Copy category from offering
+            data['special_request_category'] = offering.category
+            # Validate quantity
+            qty = data.get('quantity', 1)
+            if qty > offering.max_quantity:
+                raise serializers.ValidationError(
+                    {'quantity': f'Maximum quantity is {offering.max_quantity}.'}
+                )
+            # Enforce lead time if set
+            if offering.lead_time_days and offering.lead_time_days > 0:
+                import datetime, zoneinfo
+                guest_date = data.get('guest_date')
+                if not guest_date:
+                    raise serializers.ValidationError(
+                        {'guest_date': f'A date is required — this request needs at least '
+                         f'{offering.lead_time_days} day{"s" if offering.lead_time_days > 1 else ""} advance notice.'}
+                    )
+                # Use hotel timezone for "today" so the cutoff is correct for the hotel's locale
+                try:
+                    hotel_tz = zoneinfo.ZoneInfo(hotel.timezone) if hotel.timezone else datetime.timezone.utc
+                except (KeyError, zoneinfo.ZoneInfoNotFoundError):
+                    hotel_tz = datetime.timezone.utc
+                hotel_today = timezone.now().astimezone(hotel_tz).date()
+                min_date = hotel_today + datetime.timedelta(days=offering.lead_time_days)
+                if guest_date < min_date:
+                    raise serializers.ValidationError(
+                        {'guest_date': f'This request requires at least {offering.lead_time_days} '
+                         f'day{"s" if offering.lead_time_days > 1 else ""} advance notice.'}
+                    )
+            # Resolve department via offering fallback chain
+            resolved_dept = offering.get_routing_department()
+            if resolved_dept is None:
+                raise serializers.ValidationError(
+                    {'special_request_offering': 'This offering cannot accept requests — no department configured. '
+                     'Please configure a fallback department in Settings.'}
+                )
+            data['department'] = resolved_dept
+            # Clear event/experience — offering is mutually exclusive
+            data.pop('event', None)
+            data.pop('experience', None)
+            data.pop('occurrence_date', None)
+            return data
+
+        if request_type == ServiceRequest.RequestType.SPECIAL_REQUEST and not offering:
+            raise serializers.ValidationError(
+                {'special_request_offering': 'Offering is required for SPECIAL_REQUEST type.'}
+            )
+
+        # For CUSTOM type, verify feature is enabled and resolve department
+        if request_type == ServiceRequest.RequestType.CUSTOM:
+            if not hotel.custom_requests_enabled:
+                raise serializers.ValidationError(
+                    {'request_type': 'Custom requests are not enabled for this hotel.'}
+                )
+            if not department:
+                if hotel.fallback_department_id:
+                    department = hotel.fallback_department
+                    data['department'] = department
+                else:
+                    raise serializers.ValidationError(
+                        {'department': 'No department could be determined. '
+                         'Please configure a fallback department in Settings.'}
+                    )
+
+        # Clear offering fields for non-offering requests
+        data.pop('special_request_offering', None)
+        data['quantity'] = 1  # quantity only meaningful for special request offerings
+        # Category only valid for CUSTOM type (set above); force blank for BOOKING/INQUIRY
+        if request_type != ServiceRequest.RequestType.CUSTOM:
+            data['special_request_category'] = ''
 
         if event:
             # --- Event-based request ---
@@ -1365,8 +1620,11 @@ class ServiceRequestCreateSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {'occurrence_date': 'Occurrence date is required for recurring events.'}
                     )
-                import zoneinfo
-                hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone)
+                import datetime as dt_mod, zoneinfo
+                try:
+                    hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone) if event.hotel.timezone else dt_mod.timezone.utc
+                except (KeyError, zoneinfo.ZoneInfoNotFoundError):
+                    hotel_tz = dt_mod.timezone.utc
                 hotel_now = timezone.now().astimezone(hotel_tz)
                 hotel_today = hotel_now.date()
                 if occurrence_date < hotel_today:
@@ -1392,8 +1650,11 @@ class ServiceRequestCreateSerializer(serializers.ModelSerializer):
                 target_dt = event.resolve_target_datetime()
 
             if target_dt is not None and not event.is_bookable_for(target_dt):
-                import zoneinfo
-                hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone or 'UTC')
+                import datetime as dt_mod, zoneinfo
+                try:
+                    hotel_tz = zoneinfo.ZoneInfo(event.hotel.timezone) if event.hotel.timezone else dt_mod.timezone.utc
+                except (KeyError, zoneinfo.ZoneInfoNotFoundError):
+                    hotel_tz = dt_mod.timezone.utc
                 opens_at, closes_at = event.get_booking_window_for(target_dt)
                 bw_now = timezone.now()
                 if opens_at is not None and bw_now < opens_at:
@@ -1452,13 +1713,21 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True)
     experience_name = serializers.SerializerMethodField()
     event_name = serializers.SerializerMethodField()
+    special_request_offering_name = serializers.SerializerMethodField()
+    special_request_offering_id = serializers.IntegerField(
+        source='special_request_offering.id', read_only=True, default=None,
+    )
+    special_request_category = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
         fields = [
             'id', 'public_id', 'status', 'request_type',
             'guest_name', 'room_number', 'department_name',
-            'experience_name', 'event_name', 'guest_notes', 'guest_date',
+            'experience_name', 'event_name',
+            'special_request_offering_name', 'special_request_offering_id',
+            'special_request_category', 'quantity',
+            'guest_notes', 'guest_date',
             'guest_time', 'guest_count', 'after_hours',
             'response_due_at', 'created_at', 'acknowledged_at',
             'confirmed_at',
@@ -1474,6 +1743,12 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
 
     def get_event_name(self, obj):
         return obj.event.name if obj.event else None
+
+    def get_special_request_offering_name(self, obj):
+        return obj.special_request_offering.name if obj.special_request_offering else None
+
+    def get_special_request_category(self, obj):
+        return obj.special_request_category or None
 
 
 class ServiceRequestDetailSerializer(ServiceRequestListSerializer):
@@ -1673,17 +1948,23 @@ class NotificationRouteSerializer(serializers.ModelSerializer):
     event = serializers.PrimaryKeyRelatedField(
         queryset=Event.objects.all(), required=False, allow_null=True,
     )
+    special_request_offering = serializers.PrimaryKeyRelatedField(
+        queryset=SpecialRequestOffering.objects.all(), required=False, allow_null=True,
+    )
     member_name = serializers.SerializerMethodField()
     department_name = serializers.SerializerMethodField()
     experience_name = serializers.SerializerMethodField()
     event_name = serializers.SerializerMethodField()
+    special_request_offering_name = serializers.SerializerMethodField()
 
     class Meta:
         model = NotificationRoute
         fields = [
-            'id', 'department', 'event', 'experience', 'channel', 'member',
+            'id', 'department', 'event', 'special_request_offering',
+            'experience', 'channel', 'member',
             'target', 'label', 'is_active',
-            'member_name', 'department_name', 'experience_name', 'event_name',
+            'member_name', 'department_name', 'experience_name',
+            'event_name', 'special_request_offering_name',
             'created_at',
         ]
         read_only_fields = ['id', 'created_at']
@@ -1706,20 +1987,27 @@ class NotificationRouteSerializer(serializers.ModelSerializer):
     def get_event_name(self, obj):
         return obj.event.name if obj.event_id else None
 
+    def get_special_request_offering_name(self, obj):
+        return obj.special_request_offering.name if obj.special_request_offering_id else None
+
     def validate_target(self, value):
         return value.strip()
 
     def validate(self, data):
         hotel = self.context['hotel']
 
-        # Scope: exactly one of department or event
+        # Scope: exactly one of department, event, or offering
         department = data.get('department', self.instance.department if self.instance else None)
         event = data.get('event', self.instance.event if self.instance else None)
+        offering = data.get('special_request_offering',
+                            self.instance.special_request_offering if self.instance else None)
         has_dept = department is not None
         has_event = event is not None
-        if has_dept == has_event:
+        has_offering = offering is not None
+        scope_count = sum([has_dept, has_event, has_offering])
+        if scope_count != 1:
             raise serializers.ValidationError(
-                'Exactly one of department or event must be set.'
+                'Exactly one of department, event, or special_request_offering must be set.'
             )
 
         # Department must belong to this hotel
@@ -1730,10 +2018,14 @@ class NotificationRouteSerializer(serializers.ModelSerializer):
         if has_event and event.hotel_id != hotel.id:
             raise serializers.ValidationError({'event': 'Event must belong to this hotel.'})
 
+        # Offering must belong to this hotel
+        if has_offering and offering.hotel_id != hotel.id:
+            raise serializers.ValidationError({'special_request_offering': 'Offering must belong to this hotel.'})
+
         # Experience only valid on department-scoped routes
         experience = data.get('experience')
-        if has_event and experience is not None:
-            raise serializers.ValidationError({'experience': 'Experience cannot be set on event-scoped routes.'})
+        if not has_dept and experience is not None:
+            raise serializers.ValidationError({'experience': 'Experience can only be set on department-scoped routes.'})
 
         # Experience must belong to the department
         if experience is not None and has_dept and experience.department_id != department.id:
