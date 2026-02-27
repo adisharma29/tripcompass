@@ -821,7 +821,7 @@ class DepartmentViewSet(HotelScopedMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         return Department.objects.filter(
             hotel=self.get_hotel(),
-        ).prefetch_related('experiences', 'gallery_images')
+        ).prefetch_related('experiences__gallery_images', 'gallery_images')
 
 
 class ExperienceViewSet(HotelScopedMixin, viewsets.ModelViewSet):
@@ -845,7 +845,11 @@ class EventAdminViewSet(HotelScopedMixin, viewsets.ModelViewSet):
         return [IsAdminOrAbove()]
 
     def get_queryset(self):
-        qs = Event.objects.filter(hotel=self.get_hotel()).prefetch_related('gallery_images')
+        qs = Event.objects.filter(
+            hotel=self.get_hotel(),
+        ).select_related(
+            'department', 'experience__department', 'hotel__fallback_department',
+        ).prefetch_related('gallery_images')
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -2014,6 +2018,12 @@ class MyHotelsList(generics.ListAPIView):
             memberships__user=self.request.user,
             memberships__is_active=True,
             is_active=True,
+        ).select_related(
+            'destination', 'fallback_department',
+        ).prefetch_related(
+            'departments__experiences__gallery_images',
+            'departments__gallery_images',
+            'info_sections',
         ).distinct()
 
 
@@ -2022,7 +2032,7 @@ class NotificationList(generics.ListAPIView):
     serializer_class = NotificationSerializer
 
     def get_queryset(self):
-        qs = Notification.objects.filter(user=self.request.user)
+        qs = Notification.objects.filter(user=self.request.user).select_related('request')
         is_read = self.request.query_params.get('is_read')
         if is_read is not None:
             qs = qs.filter(is_read=is_read.lower() in ('true', '1'))

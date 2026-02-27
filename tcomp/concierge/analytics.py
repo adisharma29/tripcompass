@@ -103,21 +103,25 @@ def get_overview_stats(hotel, start_dt, end_dt, department=None):
     prev_qs = _base_qs(hotel, department, prev_start, prev_end)
 
     def _compute(qs):
-        total = qs.count()
-        confirmed = qs.filter(status=ServiceRequest.Status.CONFIRMED).count()
-        conversion = (confirmed / total * 100) if total > 0 else 0
-
-        # Avg time to acknowledge (only requests that have been acknowledged)
-        acked = qs.exclude(acknowledged_at__isnull=True)
-        avg_ack = acked.aggregate(
-            avg=Avg(F('acknowledged_at') - F('created_at'))
-        )['avg']
-        avg_ack_minutes = avg_ack.total_seconds() / 60 if avg_ack else None
-
-        # Count requests that were escalated (have at least one ESCALATED activity)
+        # Main aggregate — no activities JOIN to avoid row inflation
+        agg = qs.aggregate(
+            total=Count('id'),
+            confirmed=Count('id', filter=Q(status=ServiceRequest.Status.CONFIRMED)),
+            avg_ack=Avg(
+                F('acknowledged_at') - F('created_at'),
+                filter=Q(acknowledged_at__isnull=False),
+            ),
+        )
+        # Escalated count needs activities JOIN — keep separate to avoid inflating other counts
         escalated = qs.filter(
             activities__action=RequestActivity.Action.ESCALATED,
         ).distinct().count()
+
+        total = agg['total']
+        confirmed = agg['confirmed']
+        conversion = (confirmed / total * 100) if total > 0 else 0
+        avg_ack = agg['avg_ack']
+        avg_ack_minutes = avg_ack.total_seconds() / 60 if avg_ack else None
 
         return {
             'total': total,

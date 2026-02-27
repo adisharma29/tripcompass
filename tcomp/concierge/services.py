@@ -16,7 +16,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
-from django.db.models import F, Q
+from django.db.models import Count, F, Q
 from django.utils import timezone
 
 from .models import (
@@ -911,34 +911,55 @@ def get_dashboard_stats(hotel, department=None):
     tomorrow_start = today_start + datetime.timedelta(days=1)
     today_qs = qs.filter(created_at__gte=today_start, created_at__lt=tomorrow_start)
 
-    total = today_qs.count()
-    pending = today_qs.filter(status=ServiceRequest.Status.CREATED).count()
-    acknowledged = today_qs.filter(status=ServiceRequest.Status.ACKNOWLEDGED).count()
-    confirmed = today_qs.filter(status=ServiceRequest.Status.CONFIRMED).count()
+    # Single aggregate for all status counts
+    agg = today_qs.aggregate(
+        total=Count('id'),
+        pending=Count('id', filter=Q(status=ServiceRequest.Status.CREATED)),
+        acknowledged=Count('id', filter=Q(status=ServiceRequest.Status.ACKNOWLEDGED)),
+        confirmed=Count('id', filter=Q(status=ServiceRequest.Status.CONFIRMED)),
+    )
+    total = agg['total']
+    pending = agg['pending']
+    acknowledged = agg['acknowledged']
+    confirmed = agg['confirmed']
 
     conversion_rate = (confirmed / total * 100) if total > 0 else 0
 
-    by_department = []
-    depts = Department.objects.filter(hotel=hotel, status=ContentStatus.PUBLISHED)
-    for dept in depts:
-        count = today_qs.filter(department=dept).count()
-        by_department.append({'name': dept.name, 'count': count})
+    # Per-department counts in a single query, keyed by id to avoid name collisions
+    dept_counts = dict(
+        today_qs.filter(
+            department__status=ContentStatus.PUBLISHED,
+        ).values_list('department_id').annotate(c=Count('id')).values_list('department_id', 'c')
+    )
+    # Preserve ordering for departments that may have zero requests
+    depts = Department.objects.filter(
+        hotel=hotel, status=ContentStatus.PUBLISHED,
+    ).values_list('id', 'name')
+    by_department = [{'name': name, 'count': dept_counts.get(did, 0)} for did, name in depts]
 
+    # Single aggregate for setup flags
+    dept_qs = hotel.departments.all()
+    setup_agg = dept_qs.aggregate(
+        has_departments=Count('id'),
+        has_published=Count('id', filter=Q(status=ContentStatus.PUBLISHED)),
+        has_dept_photos=Count('id', filter=~Q(photo='')),
+    )
+    exp_agg = Experience.objects.filter(department__hotel=hotel).aggregate(
+        has_experiences=Count('id'),
+        has_exp_photos=Count('id', filter=~Q(photo='')),
+    )
     setup = {
         'settings_configured': hotel.settings_configured,
         'settings_partial': bool(
             hotel.settings_configured
             and not (hotel.timezone and hotel.whatsapp_number)
         ),
-        'has_departments': hotel.departments.exists(),
-        'has_experiences': Experience.objects.filter(department__hotel=hotel).exists(),
-        'has_photos': (
-            hotel.departments.exclude(photo='').exists()
-            or Experience.objects.filter(department__hotel=hotel).exclude(photo='').exists()
-        ),
+        'has_departments': setup_agg['has_departments'] > 0,
+        'has_experiences': exp_agg['has_experiences'] > 0,
+        'has_photos': setup_agg['has_dept_photos'] > 0 or exp_agg['has_exp_photos'] > 0,
         'has_team': hotel.memberships.filter(is_active=True).count() > 1,
         'has_qr_codes': hotel.qr_codes.exists(),
-        'has_published': hotel.departments.filter(status=ContentStatus.PUBLISHED).exists(),
+        'has_published': setup_agg['has_published'] > 0,
     }
 
     # %-d is Linux/macOS only; backend is always Docker Linux.
