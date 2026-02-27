@@ -410,26 +410,31 @@ class ServiceRequestCreate(HotelScopedMixin, generics.CreateAPIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        if not stay.room_number:
-            return Response(
-                {'detail': 'Please set your room number first.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Rate limits
+        # Rate limits (stay-level always applies)
         if not check_stay_rate_limit(stay):
             return Response(
                 {'detail': 'Too many requests. Please try again later.'},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
-        if not check_room_rate_limit(hotel, stay.room_number):
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Room number: required unless the offering explicitly opts out
+        offering = serializer.validated_data.get('special_request_offering')
+        room_required = True
+        if offering and not offering.requires_room_number:
+            room_required = False
+        if room_required and not stay.room_number:
+            return Response(
+                {'detail': 'Please set your room number first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if stay.room_number and not check_room_rate_limit(hotel, stay.room_number):
             return Response(
                 {'detail': 'Too many requests from this room. Please try again later.'},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
-
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
 
         # Handle guest_name
         guest_name = serializer.validated_data.pop('guest_name', '')
