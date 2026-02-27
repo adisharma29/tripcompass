@@ -180,6 +180,16 @@ urlpatterns = [
     path('hotels/<slug:hotel_slug>/admin/booking-email/',
          views.BookingEmailTemplateView.as_view(),
          name='admin-booking-email'),
+    # Guest invites
+    path('hotels/<slug:hotel_slug>/admin/guest-invites/',
+         views.GuestInviteListCreate.as_view(),
+         name='admin-guest-invite-list'),
+    path('hotels/<slug:hotel_slug>/admin/guest-invites/<int:pk>/resend/',
+         views.GuestInviteResend.as_view(),
+         name='admin-guest-invite-resend'),
+    path('hotels/<slug:hotel_slug>/admin/guest-invites/<int:pk>/',
+         views.GuestInviteRevoke.as_view(),
+         name='admin-guest-invite-revoke'),
 
     # --- SuperAdmin ---
     path('hotels/<slug:hotel_slug>/admin/members/',

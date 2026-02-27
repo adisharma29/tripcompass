@@ -26,10 +26,10 @@ from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
     BookingEmailTemplate, ContentStatus, Department, DepartmentImage,
-    Event, EventImage, Experience,
-    ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
-    Notification, NotificationRoute, PushSubscription, QRCode, QRScanDaily,
-    ServiceRequest, RequestActivity,
+    DeliveryRecord, Event, EventImage, Experience,
+    ExperienceImage, GuestInvite, GuestStay, Hotel, HotelInfoSection,
+    HotelMembership, Notification, NotificationRoute, PushSubscription,
+    QRCode, QRScanDaily, ServiceRequest, RequestActivity,
     SpecialRequestOffering, SpecialRequestOfferingImage,
 )
 from .permissions import (
@@ -43,13 +43,14 @@ from .serializers import (
     EventImageSerializer, EventPublicSerializer, EventSerializer,
     ExperienceImageSerializer,
     ExperiencePublicSerializer, ExperienceSerializer, TopDealSerializer,
-    GuestStaySerializer, GuestStayUpdateSerializer,
+    GuestInviteSerializer, GuestStaySerializer, GuestStayUpdateSerializer,
     HotelInfoSectionSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
     MemberSelfSerializer, MemberSerializer,
     MergeMemberSerializer, TransferMemberSerializer,
     NotificationRouteSerializer, NotificationSerializer,
     PushSubscriptionSerializer, QRCodeSerializer,
+    SendInviteSerializer,
     ServiceRequestCreateSerializer, ServiceRequestDetailSerializer,
     ServiceRequestListSerializer, ServiceRequestUpdateSerializer,
     SpecialRequestOfferingSerializer, SpecialRequestOfferingPublicSerializer,
@@ -57,9 +58,11 @@ from .serializers import (
 )
 from .notifications import NotificationEvent, dispatch_notification
 from .services import (
+    check_invite_rate_limit_hotel, check_invite_rate_limit_phone,
+    check_invite_rate_limit_staff, check_invite_resend_rate_limit,
     check_room_rate_limit, check_stay_rate_limit,
     compute_response_due_at, generate_qr,
-    get_dashboard_stats, handle_wa_delivery_event,
+    get_dashboard_stats, get_template, handle_wa_delivery_event,
     is_department_after_hours,
     publish_request_event, stream_request_events,
 )
@@ -2142,6 +2145,283 @@ class MyRequestDetail(generics.RetrieveAPIView):
         data = response.data
         data['hotel_slug'] = self.get_object().hotel.slug
         return response
+
+
+# ---------------------------------------------------------------------------
+# Guest Invite — Admin endpoints
+# ---------------------------------------------------------------------------
+
+class GuestInviteListCreate(HotelScopedMixin, generics.ListCreateAPIView):
+    """
+    GET  — List sent invites (paginated, filterable by status/delivery_status)
+    POST — Send a new WhatsApp invite
+    """
+    permission_classes = [IsAdminOrAbove]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return SendInviteSerializer
+        return GuestInviteSerializer
+
+    def get_queryset(self):
+        from django.db.models import OuterRef, Subquery
+
+        hotel = self.get_hotel()
+        qs = (
+            GuestInvite.objects
+            .filter(hotel=hotel)
+            .select_related('sent_by')
+            .order_by('-created_at')
+        )
+
+        # Annotate latest delivery status + error via Subquery
+        latest_delivery_base = (
+            DeliveryRecord.objects
+            .filter(guest_invite=OuterRef('pk'))
+            .order_by('-created_at')
+        )
+        qs = qs.annotate(
+            delivery_status=Subquery(latest_delivery_base.values('status')[:1]),
+            delivery_error=Subquery(latest_delivery_base.values('error_message')[:1]),
+        )
+
+        # Filters
+        invite_status = self.request.query_params.get('status')
+        if invite_status:
+            qs = qs.filter(status=invite_status)
+        delivery_status_filter = self.request.query_params.get('delivery_status')
+        if delivery_status_filter:
+            qs = qs.filter(delivery_status=delivery_status_filter)
+
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        hotel = self.get_hotel()
+
+        # Safety: DRF pagination wraps results in a dict ({"count":…, "results":…}).
+        # If pagination is disabled, response.data is a list — don't augment.
+        if not isinstance(response.data, dict):
+            return response
+
+        # Feature flags — lets ADMIN users know state without needing SUPERADMIN settings endpoint
+        response.data['guest_invite_enabled'] = hotel.guest_invite_enabled
+        response.data['whatsapp_notifications_enabled'] = hotel.whatsapp_notifications_enabled
+
+        # Embed wa_template in list response for frontend preview
+        wa_template = get_template(hotel, 'GUEST_INVITE')
+        if wa_template and wa_template.gupshup_template_id:
+            response.data['wa_template'] = {
+                'body_text': wa_template.body_text,
+                'footer_text': wa_template.footer_text,
+                'buttons': wa_template.buttons,
+                'variables': wa_template.variables,
+            }
+        else:
+            response.data['wa_template'] = None
+        return response
+
+    def create(self, request, *args, **kwargs):
+        from .notifications.tasks import send_guest_invite_whatsapp
+
+        hotel = self.get_hotel()
+
+        # Guard: features must be enabled
+        if not hotel.guest_invite_enabled or not hotel.whatsapp_notifications_enabled:
+            return Response(
+                {'detail': 'WhatsApp guest invites are not enabled for this hotel.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Preflight: template must be configured
+        wa_template = get_template(hotel, 'GUEST_INVITE')
+        if not wa_template or not wa_template.gupshup_template_id:
+            return Response(
+                {'detail': 'WhatsApp invite template not configured.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        serializer = SendInviteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        phone = serializer.validated_data['phone']
+        guest_name = serializer.validated_data['guest_name']
+        room_number = serializer.validated_data.get('room_number', '')
+
+        # Rate limiting
+        if not check_invite_rate_limit_staff(request.user.id):
+            return Response(
+                {'detail': 'Please wait a few seconds before sending another invite.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={'Retry-After': '10'},
+            )
+        if not check_invite_rate_limit_phone(phone):
+            return Response(
+                {'detail': 'Too many invites to this number. Try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={'Retry-After': '3600'},
+            )
+        if not check_invite_rate_limit_hotel(hotel.id):
+            return Response(
+                {'detail': 'Hotel invite limit reached. Try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={'Retry-After': '3600'},
+            )
+
+        try:
+            with transaction.atomic():
+                # Expire stale PENDING invites for this phone
+                GuestInvite.objects.filter(
+                    hotel=hotel, guest_phone=phone, status='PENDING',
+                    expires_at__lt=timezone.now(),
+                ).update(status='EXPIRED')
+
+                expiry = timezone.now() + timedelta(
+                    hours=settings.GUEST_INVITE_EXPIRY_HOURS,
+                )
+                invite = GuestInvite.objects.create(
+                    hotel=hotel,
+                    sent_by=request.user,
+                    guest_phone=phone,
+                    guest_name=guest_name,
+                    room_number=room_number,
+                    expires_at=expiry,
+                )
+                delivery = DeliveryRecord.objects.create(
+                    hotel=hotel,
+                    guest_invite=invite,
+                    channel='WHATSAPP',
+                    target=phone,
+                    event_type='guest_invite',
+                    message_type='TEMPLATE',
+                    status=DeliveryRecord.Status.QUEUED,
+                )
+
+                # Enqueue after commit to prevent orphan tasks on rollback
+                delivery_id = delivery.id
+                transaction.on_commit(
+                    lambda: send_guest_invite_whatsapp.delay(delivery_id)
+                )
+        except IntegrityError:
+            # Check if a duplicate active invite actually exists
+            duplicate = GuestInvite.objects.filter(
+                hotel=hotel, guest_phone=phone, status='PENDING',
+            ).exists()
+            if duplicate:
+                return Response(
+                    {'detail': 'An invite was already sent to this number.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            raise  # Not a duplicate — re-raise
+
+        out = GuestInviteSerializer(invite).data
+        return Response(out, status=status.HTTP_201_CREATED)
+
+
+class GuestInviteResend(HotelScopedMixin, APIView):
+    """POST — Resend a PENDING invite (extends expiry, new delivery)."""
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, hotel_slug, pk):
+        from .notifications.tasks import send_guest_invite_whatsapp
+
+        hotel = self.get_hotel()
+
+        # Guard: features must be enabled
+        if not hotel.guest_invite_enabled or not hotel.whatsapp_notifications_enabled:
+            return Response(
+                {'detail': 'WhatsApp guest invites are not enabled for this hotel.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Preflight: template must be configured
+        wa_template = get_template(hotel, 'GUEST_INVITE')
+        if not wa_template or not wa_template.gupshup_template_id:
+            return Response(
+                {'detail': 'WhatsApp invite template not configured.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        with transaction.atomic():
+            try:
+                invite = (
+                    GuestInvite.objects
+                    .select_for_update()
+                    .get(pk=pk, hotel=hotel)
+                )
+            except GuestInvite.DoesNotExist:
+                raise NotFound
+
+            if invite.status != 'PENDING':
+                return Response(
+                    {'detail': 'Only pending invites can be resent.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Rate limiting: staff debounce prevents spam-clicking resend.
+            # Uses a separate cache key from create to avoid cross-contamination.
+            # Checked after status validation so invalid resends get 409 not 429.
+            if not check_invite_resend_rate_limit(request.user.id):
+                return Response(
+                    {'detail': 'Please wait a few seconds before resending.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    headers={'Retry-After': '10'},
+                )
+
+            # Extend expiry but do NOT bump token_version. Old signed links
+            # remain valid so the guest isn't locked out if the new async
+            # send fails. Revocation (status=EXPIRED) is the correct way
+            # to invalidate all links, not resend.
+            invite.expires_at = timezone.now() + timedelta(
+                hours=settings.GUEST_INVITE_EXPIRY_HOURS,
+            )
+            invite.save(update_fields=['expires_at'])
+
+            delivery = DeliveryRecord.objects.create(
+                hotel=hotel,
+                guest_invite=invite,
+                channel='WHATSAPP',
+                target=invite.guest_phone,
+                event_type='guest_invite',
+                message_type='TEMPLATE',
+                status=DeliveryRecord.Status.QUEUED,
+            )
+
+            delivery_id = delivery.id
+            transaction.on_commit(
+                lambda: send_guest_invite_whatsapp.delay(delivery_id)
+            )
+
+        out = GuestInviteSerializer(invite).data
+        return Response(out)
+
+
+class GuestInviteRevoke(HotelScopedMixin, APIView):
+    """DELETE — Revoke a PENDING invite (marks as EXPIRED)."""
+    permission_classes = [IsAdminOrAbove]
+
+    def delete(self, request, hotel_slug, pk):
+        hotel = self.get_hotel()
+
+        with transaction.atomic():
+            try:
+                invite = (
+                    GuestInvite.objects
+                    .select_for_update()
+                    .get(pk=pk, hotel=hotel)
+                )
+            except GuestInvite.DoesNotExist:
+                raise NotFound
+
+            if invite.status != 'PENDING':
+                return Response(
+                    {'detail': 'Only pending invites can be revoked.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            invite.status = 'EXPIRED'
+            invite.save(update_fields=['status'])
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ---------------------------------------------------------------------------

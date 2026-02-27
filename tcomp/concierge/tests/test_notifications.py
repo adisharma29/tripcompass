@@ -1947,3 +1947,377 @@ class EventRouteEmailTest(EventRoutingSetupMixin, TestCase):
         targets = {r.target for r in recipients}
         self.assertIn('dept@hotel.com', targets)
         self.assertNotIn('event@hotel.com', targets)
+
+
+# ---------------------------------------------------------------------------
+# OncallAdapter
+# ---------------------------------------------------------------------------
+
+from concierge.notifications.oncall import OncallAdapter, OncallTarget
+
+
+class OncallAdapterEnabledTest(NotificationSetupMixin, TestCase):
+    """is_enabled() checks escalation_fallback_channel + contact info."""
+
+    def setUp(self):
+        self.adapter = OncallAdapter()
+
+    def test_disabled_when_channel_none(self):
+        self.hotel.escalation_fallback_channel = 'NONE'
+        self.hotel.oncall_email = 'oncall@hotel.com'
+        self.hotel.save(update_fields=['escalation_fallback_channel', 'oncall_email'])
+        self.assertFalse(self.adapter.is_enabled(self.hotel))
+
+    def test_disabled_when_no_contacts(self):
+        self.hotel.escalation_fallback_channel = 'EMAIL'
+        self.hotel.oncall_email = ''
+        self.hotel.oncall_phone = ''
+        self.hotel.save(update_fields=['escalation_fallback_channel', 'oncall_email', 'oncall_phone'])
+        self.assertFalse(self.adapter.is_enabled(self.hotel))
+
+    def test_enabled_with_email_channel_and_email(self):
+        self.hotel.escalation_fallback_channel = 'EMAIL'
+        self.hotel.oncall_email = 'oncall@hotel.com'
+        self.hotel.save(update_fields=['escalation_fallback_channel', 'oncall_email'])
+        self.assertTrue(self.adapter.is_enabled(self.hotel))
+
+    def test_enabled_with_whatsapp_channel_and_phone(self):
+        self.hotel.escalation_fallback_channel = 'WHATSAPP'
+        self.hotel.oncall_phone = '+919999999999'
+        self.hotel.save(update_fields=['escalation_fallback_channel', 'oncall_phone'])
+        self.assertTrue(self.adapter.is_enabled(self.hotel))
+
+    def test_enabled_with_both_channel_and_only_email(self):
+        """EMAIL_WHATSAPP with only email set — still enabled."""
+        self.hotel.escalation_fallback_channel = 'EMAIL_WHATSAPP'
+        self.hotel.oncall_email = 'oncall@hotel.com'
+        self.hotel.oncall_phone = ''
+        self.hotel.save(update_fields=['escalation_fallback_channel', 'oncall_email', 'oncall_phone'])
+        self.assertTrue(self.adapter.is_enabled(self.hotel))
+
+
+@override_settings(GUPSHUP_WA_API_KEY='test-key')
+class OncallAdapterRecipientsTest(NotificationSetupMixin, TestCase):
+    """get_recipients() only fires for escalation events."""
+
+    def setUp(self):
+        self.adapter = OncallAdapter()
+        self.hotel.escalation_fallback_channel = 'EMAIL_WHATSAPP'
+        self.hotel.oncall_email = 'oncall@hotel.com'
+        self.hotel.oncall_phone = '+919999999999'
+        self.hotel.save(update_fields=[
+            'escalation_fallback_channel', 'oncall_email', 'oncall_phone',
+        ])
+
+    def test_returns_empty_for_request_created(self):
+        event = self._make_event(event_type='request.created')
+        self.assertEqual(self.adapter.get_recipients(event), [])
+
+    def test_returns_empty_for_response_due(self):
+        event = self._make_event(event_type='response_due')
+        self.assertEqual(self.adapter.get_recipients(event), [])
+
+    def test_returns_empty_for_daily_digest(self):
+        event = NotificationEvent(
+            event_type='daily_digest', hotel=self.hotel,
+        )
+        self.assertEqual(self.adapter.get_recipients(event), [])
+
+    def test_returns_both_targets_for_escalation(self):
+        event = self._make_event(event_type='escalation', escalation_tier=1)
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(len(recipients), 2)
+        channels = {r.channel for r in recipients}
+        self.assertEqual(channels, {'EMAIL', 'WHATSAPP'})
+
+    def test_email_only_channel(self):
+        self.hotel.escalation_fallback_channel = 'EMAIL'
+        self.hotel.save(update_fields=['escalation_fallback_channel'])
+        event = self._make_event(event_type='escalation', escalation_tier=1)
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(len(recipients), 1)
+        self.assertEqual(recipients[0].channel, 'EMAIL')
+        self.assertEqual(recipients[0].target, 'oncall@hotel.com')
+
+    def test_whatsapp_only_channel(self):
+        self.hotel.escalation_fallback_channel = 'WHATSAPP'
+        self.hotel.save(update_fields=['escalation_fallback_channel'])
+        event = self._make_event(event_type='escalation', escalation_tier=1)
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(len(recipients), 1)
+        self.assertEqual(recipients[0].channel, 'WHATSAPP')
+        self.assertEqual(recipients[0].target, '919999999999')
+
+    def test_whatsapp_skipped_without_api_key(self):
+        """WHATSAPP channel but no Gupshup key → no WA target."""
+        with self.settings(GUPSHUP_WA_API_KEY=''):
+            event = self._make_event(event_type='escalation', escalation_tier=1)
+            recipients = self.adapter.get_recipients(event)
+            channels = {r.channel for r in recipients}
+            self.assertNotIn('WHATSAPP', channels)
+            # EMAIL should still be present
+            self.assertIn('EMAIL', channels)
+
+    def test_email_whatsapp_with_only_phone(self):
+        """EMAIL_WHATSAPP with no email → only WhatsApp target."""
+        self.hotel.oncall_email = ''
+        self.hotel.save(update_fields=['oncall_email'])
+        event = self._make_event(event_type='escalation', escalation_tier=1)
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(len(recipients), 1)
+        self.assertEqual(recipients[0].channel, 'WHATSAPP')
+
+    def test_skips_target_already_covered_by_route_adapter(self):
+        """On-call email matches an existing route DeliveryRecord → deduplicated."""
+        req = self._make_request()
+        # Simulate a route-based EmailAdapter having already created a record
+        DeliveryRecord.objects.create(
+            idempotency_key=f"email:escalation:{req.public_id}:1:99",
+            hotel=self.hotel,
+            request=req,
+            channel="EMAIL",
+            target="oncall@hotel.com",
+            event_type="escalation",
+            status=DeliveryRecord.Status.QUEUED,
+            message_type="TEMPLATE",
+        )
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+        recipients = self.adapter.get_recipients(event)
+        # Email target should be filtered out; WhatsApp should remain
+        channels = {r.channel for r in recipients}
+        self.assertNotIn('EMAIL', channels)
+        self.assertIn('WHATSAPP', channels)
+
+    def test_skips_whatsapp_target_already_covered_by_route(self):
+        """On-call phone matches an existing route DeliveryRecord → deduplicated."""
+        req = self._make_request()
+        # Route targets are digits-only (NotificationRoute.save() strips non-digits)
+        DeliveryRecord.objects.create(
+            idempotency_key=f"wa:escalation:{req.public_id}:2:42",
+            hotel=self.hotel,
+            request=req,
+            channel="WHATSAPP",
+            target="919999999999",
+            event_type="escalation",
+            status=DeliveryRecord.Status.QUEUED,
+            message_type="TEMPLATE",
+        )
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=2)
+        recipients = self.adapter.get_recipients(event)
+        channels = {r.channel for r in recipients}
+        self.assertNotIn('WHATSAPP', channels)
+        self.assertIn('EMAIL', channels)
+
+    def test_different_tier_not_deduplicated(self):
+        """Route record at tier 1 does NOT suppress on-call at tier 2."""
+        req = self._make_request()
+        DeliveryRecord.objects.create(
+            idempotency_key=f"email:escalation:{req.public_id}:1:99",
+            hotel=self.hotel,
+            request=req,
+            channel="EMAIL",
+            target="oncall@hotel.com",
+            event_type="escalation",
+            status=DeliveryRecord.Status.QUEUED,
+            message_type="TEMPLATE",
+        )
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=2)
+        recipients = self.adapter.get_recipients(event)
+        # Tier 2 should NOT be suppressed by a tier 1 record
+        channels = {r.channel for r in recipients}
+        self.assertIn('EMAIL', channels)
+        self.assertIn('WHATSAPP', channels)
+
+    def test_both_targets_covered_returns_empty(self):
+        """Both on-call targets already covered by routes → empty list."""
+        req = self._make_request()
+        DeliveryRecord.objects.create(
+            idempotency_key=f"email:escalation:{req.public_id}:1:99",
+            hotel=self.hotel, request=req, channel="EMAIL",
+            target="oncall@hotel.com", event_type="escalation",
+            status=DeliveryRecord.Status.QUEUED, message_type="TEMPLATE",
+        )
+        DeliveryRecord.objects.create(
+            idempotency_key=f"wa:escalation:{req.public_id}:1:42",
+            hotel=self.hotel, request=req, channel="WHATSAPP",
+            target="919999999999", event_type="escalation",
+            status=DeliveryRecord.Status.QUEUED, message_type="TEMPLATE",
+        )
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+        recipients = self.adapter.get_recipients(event)
+        self.assertEqual(recipients, [])
+
+    def test_phone_normalization_enables_dedupe(self):
+        """hotel.oncall_phone='+919...' matches route target='919...' after normalization."""
+        req = self._make_request()
+        # Route adapter stores digits-only (NotificationRoute.save() strips non-digits)
+        DeliveryRecord.objects.create(
+            idempotency_key=f"wa:escalation:{req.public_id}:1:42",
+            hotel=self.hotel, request=req, channel="WHATSAPP",
+            target="919999999999", event_type="escalation",
+            status=DeliveryRecord.Status.QUEUED, message_type="TEMPLATE",
+        )
+        # Hotel field stores +91... (CharField, no auto-normalization)
+        self.assertEqual(self.hotel.oncall_phone, '+919999999999')
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+        recipients = self.adapter.get_recipients(event)
+        # OncallAdapter normalizes before comparing → should dedupe
+        channels = {r.channel for r in recipients}
+        self.assertNotIn('WHATSAPP', channels)
+
+
+@override_settings(GUPSHUP_WA_API_KEY='test-key')
+class OncallAdapterSendTest(NotificationSetupMixin, TestCase):
+    """send() creates DeliveryRecord and dispatches Celery task."""
+
+    def setUp(self):
+        self.adapter = OncallAdapter()
+        self.hotel.escalation_fallback_channel = 'EMAIL_WHATSAPP'
+        self.hotel.oncall_email = 'oncall@hotel.com'
+        self.hotel.oncall_phone = '+919999999999'
+        self.hotel.save(update_fields=[
+            'escalation_fallback_channel', 'oncall_email', 'oncall_phone',
+        ])
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_email_send_creates_delivery_record(self, mock_delay):
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=2)
+        target = OncallTarget(channel='EMAIL', target='oncall@hotel.com')
+
+        record = self.adapter.send(target, event)
+
+        self.assertIsInstance(record, DeliveryRecord)
+        self.assertIsNone(record.route)
+        self.assertEqual(record.channel, 'EMAIL')
+        self.assertEqual(record.target, 'oncall@hotel.com')
+        self.assertEqual(record.event_type, 'escalation')
+        self.assertEqual(record.status, DeliveryRecord.Status.QUEUED)
+        self.assertIn('oncall:email:', record.idempotency_key)
+        self.assertIn(':2', record.idempotency_key)
+        mock_delay.assert_called_once()
+
+    @patch('concierge.notifications.tasks.send_whatsapp_template_notification.delay')
+    def test_whatsapp_send_template_no_window(self, mock_delay):
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+        target = OncallTarget(channel='WHATSAPP', target='919999999999')
+
+        record = self.adapter.send(target, event)
+
+        self.assertIsInstance(record, DeliveryRecord)
+        self.assertIsNone(record.route)
+        self.assertEqual(record.channel, 'WHATSAPP')
+        self.assertEqual(record.message_type, 'TEMPLATE')
+        mock_delay.assert_called_once()
+
+    @patch('concierge.notifications.tasks.send_whatsapp_session_notification.delay')
+    def test_whatsapp_send_session_with_active_window(self, mock_delay):
+        WhatsAppServiceWindow.objects.create(
+            hotel=self.hotel, phone='919999999999',
+            last_inbound_at=timezone.now(),
+        )
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+        target = OncallTarget(channel='WHATSAPP', target='919999999999')
+
+        record = self.adapter.send(target, event)
+
+        self.assertEqual(record.message_type, 'SESSION')
+        mock_delay.assert_called_once()
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_idempotency_prevents_duplicate(self, mock_delay):
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+        target = OncallTarget(channel='EMAIL', target='oncall@hotel.com')
+
+        record1 = self.adapter.send(target, event)
+        record2 = self.adapter.send(target, event)
+
+        self.assertEqual(record1.id, record2.id)
+        mock_delay.assert_called_once()  # Only dispatched once
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_different_tiers_create_separate_records(self, mock_delay):
+        req = self._make_request()
+        target = OncallTarget(channel='EMAIL', target='oncall@hotel.com')
+
+        event1 = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+        record1 = self.adapter.send(target, event1)
+
+        event2 = self._make_event(request=req, event_type='escalation', escalation_tier=2)
+        record2 = self.adapter.send(target, event2)
+
+        self.assertNotEqual(record1.id, record2.id)
+        self.assertEqual(mock_delay.call_count, 2)
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    def test_params_include_escalation_tier(self, mock_delay):
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=3)
+        target = OncallTarget(channel='EMAIL', target='oncall@hotel.com')
+
+        self.adapter.send(target, event)
+
+        params = mock_delay.call_args[0][1]
+        self.assertEqual(params['escalation_tier'], 3)
+        self.assertEqual(params['hotel_name'], 'Test Hotel')
+        self.assertEqual(params['room_number'], '101')
+
+
+@override_settings(GUPSHUP_WA_API_KEY='test-key')
+class OncallDispatchIntegrationTest(NotificationSetupMixin, TestCase):
+    """End-to-end: dispatch_notification routes escalation to OncallAdapter."""
+
+    def setUp(self):
+        self.hotel.escalation_fallback_channel = 'EMAIL'
+        self.hotel.oncall_email = 'oncall@hotel.com'
+        self.hotel.save(update_fields=['escalation_fallback_channel', 'oncall_email'])
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    @patch('concierge.notifications.tasks.send_push_notification_task.delay')
+    def test_escalation_dispatches_to_oncall(self, mock_push, mock_email):
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+
+        dispatch_notification(event)
+
+        # OncallAdapter should have created a DeliveryRecord
+        oncall_records = DeliveryRecord.objects.filter(
+            idempotency_key__startswith='oncall:',
+        )
+        self.assertEqual(oncall_records.count(), 1)
+        record = oncall_records.first()
+        self.assertEqual(record.target, 'oncall@hotel.com')
+        self.assertEqual(record.channel, 'EMAIL')
+        self.assertIsNone(record.route)
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    @patch('concierge.notifications.tasks.send_push_notification_task.delay')
+    def test_request_created_does_not_dispatch_to_oncall(self, mock_push, mock_email):
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='request.created')
+
+        dispatch_notification(event)
+
+        oncall_records = DeliveryRecord.objects.filter(
+            idempotency_key__startswith='oncall:',
+        )
+        self.assertEqual(oncall_records.count(), 0)
+
+    @patch('concierge.notifications.tasks.send_email_notification.delay')
+    @patch('concierge.notifications.tasks.send_push_notification_task.delay')
+    def test_oncall_disabled_does_not_dispatch(self, mock_push, mock_email):
+        self.hotel.escalation_fallback_channel = 'NONE'
+        self.hotel.save(update_fields=['escalation_fallback_channel'])
+
+        req = self._make_request()
+        event = self._make_event(request=req, event_type='escalation', escalation_tier=1)
+
+        dispatch_notification(event)
+
+        oncall_records = DeliveryRecord.objects.filter(
+            idempotency_key__startswith='oncall:',
+        )
+        self.assertEqual(oncall_records.count(), 0)

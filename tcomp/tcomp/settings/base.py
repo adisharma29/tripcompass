@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'location',
     'guides',
     'concierge',
+    'shortlinks',
 ]
 
 MIDDLEWARE = [
@@ -211,6 +212,12 @@ ESCALATION_TIER_MINUTES = [15, 30, 60]
 
 # Frontend origin (used for QR target_url generation)
 FRONTEND_ORIGIN = config('FRONTEND_ORIGIN', default='http://localhost:6001')
+
+# API origin (used for invite verify URLs, short links)
+API_ORIGIN = config('API_ORIGIN', default='http://localhost:8000')
+
+# Guest invite settings
+GUEST_INVITE_EXPIRY_HOURS = config('GUEST_INVITE_EXPIRY_HOURS', default=72, cast=int)
 
 # --- Celery ---
 CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')

@@ -11,7 +11,7 @@ from .models import (
     SpecialRequestOffering, SpecialRequestOfferingImage,
     GuestStay, ServiceRequest, RequestActivity,
     Notification, NotificationRoute, PushSubscription, QRCode, HotelInfoSection,
-    BookingEmailTemplate,
+    BookingEmailTemplate, GuestInvite, DeliveryRecord,
 )
 from .validators import validate_image_upload
 
@@ -303,7 +303,7 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             # Notification channels
             'whatsapp_notifications_enabled', 'email_notifications_enabled',
             # Guest features
-            'custom_requests_enabled',
+            'custom_requests_enabled', 'guest_invite_enabled',
             # Request routing
             'fallback_department', 'fallback_department_name',
         ]
@@ -2073,3 +2073,43 @@ class NotificationRouteSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'target': 'Enter a valid email address.'})
 
         return data
+
+
+# ---------------------------------------------------------------------------
+# Guest Invite serializers
+# ---------------------------------------------------------------------------
+
+class GuestInviteSerializer(serializers.ModelSerializer):
+    """Read serializer for GuestInvite list/detail. Annotates delivery info."""
+    sent_by_name = serializers.SerializerMethodField()
+    delivery_status = serializers.CharField(read_only=True, default=None)
+    delivery_error = serializers.CharField(read_only=True, default=None)
+
+    class Meta:
+        model = GuestInvite
+        fields = [
+            'id', 'guest_phone', 'guest_name', 'room_number',
+            'status', 'sent_by_name',
+            'delivery_status', 'delivery_error',
+            'created_at', 'expires_at', 'used_at',
+        ]
+        read_only_fields = fields
+
+    def get_sent_by_name(self, obj):
+        if obj.sent_by:
+            name = obj.sent_by.get_full_name()
+            return name if name else obj.sent_by.email or obj.sent_by.phone
+        return None
+
+
+class SendInviteSerializer(serializers.Serializer):
+    """Write serializer for creating a guest invite."""
+    phone = serializers.CharField(max_length=20)
+    guest_name = serializers.CharField(max_length=100)
+    room_number = serializers.CharField(max_length=20, required=False, default='')
+
+    def validate_phone(self, value):
+        digits = re.sub(r'\D', '', value)
+        if len(digits) < 10 or len(digits) > 15:
+            raise serializers.ValidationError('Phone number must be 10-15 digits (with country code).')
+        return digits

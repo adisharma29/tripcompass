@@ -6,6 +6,7 @@ from .models import (
     GuestStay, OTPCode, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode, EscalationHeartbeat,
     BookingEmailTemplate, SpecialRequestOffering, SpecialRequestOfferingImage,
+    WhatsAppTemplate, GuestInvite,
 )
 
 
@@ -129,3 +130,19 @@ class EscalationHeartbeatAdmin(admin.ModelAdmin):
             return False
         age = (timezone.now() - obj.last_run).total_seconds()
         return age < 600 and obj.status == 'OK'  # 10 min threshold
+
+
+@admin.register(WhatsAppTemplate)
+class WhatsAppTemplateAdmin(admin.ModelAdmin):
+    list_display = ['name', 'template_type', 'hotel', 'is_active', 'created_at']
+    list_filter = ['template_type', 'is_active']
+    search_fields = ['name', 'gupshup_template_id']
+    readonly_fields = ['created_at']
+
+
+@admin.register(GuestInvite)
+class GuestInviteAdmin(admin.ModelAdmin):
+    list_display = ['guest_phone', 'guest_name', 'hotel', 'status', 'created_at', 'expires_at']
+    list_filter = ['status', 'hotel']
+    search_fields = ['guest_phone', 'guest_name']
+    readonly_fields = ['token_version', 'created_at', 'used_at']

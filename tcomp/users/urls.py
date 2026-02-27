@@ -8,6 +8,7 @@ from .views import (
     LogoutView,
     OTPSendView,
     OTPVerifyView,
+    verify_wa_invite,
 )
 
 urlpatterns = [
@@ -18,4 +19,5 @@ urlpatterns = [
     path('otp/verify/', OTPVerifyView.as_view(), name='otp-verify'),
     path('logout/', LogoutView.as_view(), name='logout'),
     path('profile/', AuthProfileView.as_view(), name='auth-profile'),
+    path('wa-invite/<str:token>/', verify_wa_invite, name='wa-invite-verify'),
 ]

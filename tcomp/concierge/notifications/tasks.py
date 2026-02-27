@@ -6,7 +6,11 @@ from celery import shared_task
 from django.conf import settings
 
 from concierge.models import DeliveryRecord
-from concierge.services import send_push_notification
+from concierge.services import (
+    send_push_notification, generate_invite_token,
+    get_template, resolve_template_params,
+)
+from shortlinks.models import ShortLink
 
 # Transient error types that warrant a Celery retry
 _TRANSIENT_ERRORS = (
@@ -250,6 +254,111 @@ def send_whatsapp_session_notification(self, delivery_record_id, params):
         record.status = DeliveryRecord.Status.FAILED
         record.error_message = str(exc)[:500]
         record.save(update_fields=["status", "error_message"])
+        if isinstance(exc, _TRANSIENT_ERRORS):
+            raise self.retry(exc=exc)
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp — Guest invite
+# ---------------------------------------------------------------------------
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def send_guest_invite_whatsapp(self, delivery_id):
+    """Send the WhatsApp invite template via Gupshup.
+
+    Takes delivery_id (not invite_id) so each Celery task is pinned to
+    a specific DeliveryRecord. This prevents a race on quick resends
+    where two tasks share the same invite but should operate on different
+    delivery rows.
+    """
+    try:
+        delivery = (
+            DeliveryRecord.objects
+            .select_related('guest_invite', 'guest_invite__hotel')
+            .get(id=delivery_id, guest_invite__isnull=False)
+        )
+    except DeliveryRecord.DoesNotExist:
+        logger.error('DeliveryRecord %s not found or has no invite', delivery_id)
+        return
+    invite = delivery.guest_invite
+
+    if invite.status != 'PENDING':
+        return  # Already used/expired
+
+    # Resolve template: hotel-specific → global default
+    wa_template = get_template(invite.hotel, 'GUEST_INVITE')
+    if not wa_template or not wa_template.gupshup_template_id:
+        logger.error('No GUEST_INVITE template configured for hotel %s', invite.hotel.slug)
+        delivery.status = DeliveryRecord.Status.FAILED
+        delivery.error_message = 'WhatsApp invite template not configured'
+        delivery.save(update_fields=['status', 'error_message'])
+        return
+
+    # Resolve template variables dynamically from the template's variables JSON
+    try:
+        params = resolve_template_params(wa_template, invite)
+    except ValueError as e:
+        logger.error('Template variable resolution failed for delivery %s: %s', delivery_id, e)
+        delivery.status = DeliveryRecord.Status.FAILED
+        delivery.error_message = str(e)[:500]
+        delivery.save(update_fields=['status', 'error_message'])
+        return
+
+    # Build signed URL → create short link (sent later via session message, not in template)
+    token = generate_invite_token(invite.id, invite.token_version)
+    verify_url = f'{settings.API_ORIGIN}/api/v1/auth/wa-invite/{token}/'
+    short_link = ShortLink.objects.create_for_url(
+        target_url=verify_url,
+        expires_at=invite.expires_at,
+        metadata={'type': 'guest_invite', 'invite_id': invite.id, 'delivery_id': delivery.id},
+    )
+    # Two quick-reply postbacks, both keyed by delivery_id so after resends,
+    # tapping an older message resolves to the correct DeliveryRecord row.
+    postback_texts = [
+        {"index": 0, "text": f"g_inv_access:{delivery.id}"},
+        {"index": 1, "text": f"g_inv_ack:{delivery.id}"},
+    ]
+
+    try:
+        response = http_requests.post(
+            "https://api.gupshup.io/wa/api/v1/template/msg",
+            headers={"apikey": settings.GUPSHUP_WA_API_KEY},
+            data={
+                "channel": "whatsapp",
+                "source": settings.GUPSHUP_WA_SOURCE_PHONE,
+                "destination": invite.guest_phone,
+                "src.name": settings.GUPSHUP_WA_APP_NAME,
+                "template": json.dumps({
+                    "id": wa_template.gupshup_template_id,
+                    "params": params,
+                }),
+                "postbackTexts": json.dumps(postback_texts),
+            },
+            timeout=10,
+        )
+        # Branch by HTTP status first
+        status_code = response.status_code
+        if status_code >= 500 or status_code == 429:
+            raise RuntimeError(f"Gupshup server error {status_code}")
+        if status_code >= 400:
+            raise ValueError(f"Gupshup client error {status_code}: {response.text[:200]}")
+
+        # 2xx — inspect body for provider business errors
+        data = response.json()
+        if data.get("status") == "error":
+            raise ValueError(f"Gupshup API error: {data.get('message', 'Unknown')}")
+        if not data.get("messageId"):
+            raise ValueError(f"Gupshup response missing messageId: {data}")
+
+        # Update delivery record only — GuestInvite.status stays PENDING
+        # (it transitions to USED on link click, not on send)
+        delivery.provider_message_id = data["messageId"]
+        delivery.status = DeliveryRecord.Status.SENT
+        delivery.save(update_fields=["provider_message_id", "status"])
+    except Exception as exc:
+        delivery.status = DeliveryRecord.Status.FAILED
+        delivery.error_message = str(exc)[:500]
+        delivery.save(update_fields=["status", "error_message"])
         if isinstance(exc, _TRANSIENT_ERRORS):
             raise self.retry(exc=exc)
 

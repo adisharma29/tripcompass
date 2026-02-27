@@ -67,6 +67,7 @@ class Hotel(models.Model):
     # --- Notification channel toggles ---
     whatsapp_notifications_enabled = models.BooleanField(default=False)
     email_notifications_enabled = models.BooleanField(default=False)
+    guest_invite_enabled = models.BooleanField(default=False)
 
     class EscalationChannel(models.TextChoices):
         NONE = 'NONE', 'None'
@@ -1569,6 +1570,10 @@ class DeliveryRecord(models.Model):
         null=True, blank=True,
         help_text='When recipient tapped a quick-reply button (ack/esc_ack/view).',
     )
+    guest_invite = models.ForeignKey(
+        'GuestInvite', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='deliveries',
+    )
 
     class Meta:
         indexes = [
@@ -1635,3 +1640,115 @@ class WhatsAppServiceWindow(models.Model):
 
     def __str__(self):
         return f'WA window: {self.phone} @ {self.hotel.name}'
+
+
+class WhatsAppTemplate(models.Model):
+    """Maps template types to Gupshup template IDs, per hotel or globally."""
+
+    class TemplateType(models.TextChoices):
+        GUEST_INVITE = 'GUEST_INVITE', 'Guest Invite'
+
+    # null hotel = global default (used when hotel has no custom template)
+    hotel = models.ForeignKey(
+        Hotel, null=True, blank=True, on_delete=models.CASCADE,
+        related_name='wa_templates',
+    )
+    template_type = models.CharField(max_length=30, choices=TemplateType.choices)
+
+    # Gupshup / Meta
+    gupshup_template_id = models.CharField(max_length=100)
+    name = models.CharField(max_length=100)
+
+    # Template content (frontend reads these for WhatsAppPreview component)
+    body_text = models.TextField()
+    footer_text = models.CharField(max_length=60, default='Powered by Refuje')
+    buttons = models.JSONField(default=list)
+    variables = models.JSONField(default=list)
+
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Hotel-scoped: one active template per type per hotel
+            models.UniqueConstraint(
+                fields=['hotel', 'template_type'],
+                condition=Q(is_active=True, hotel__isnull=False),
+                name='unique_active_template_per_hotel_type',
+            ),
+            # Global-scoped: one active global default per type
+            # (separate constraint because NULL != NULL in SQL)
+            models.UniqueConstraint(
+                fields=['template_type'],
+                condition=Q(is_active=True, hotel__isnull=True),
+                name='unique_active_global_template_per_type',
+            ),
+        ]
+
+    def __str__(self):
+        scope = self.hotel.name if self.hotel else 'Global'
+        return f'{scope} — {self.get_template_type_display()}: {self.name}'
+
+
+class GuestInvite(models.Model):
+    """Tracks a WhatsApp invite sent to a guest before/on check-in."""
+
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        USED = 'USED', 'Used'
+        EXPIRED = 'EXPIRED', 'Expired'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='guest_invites',
+    )
+    sent_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='guest_invites_sent',
+    )
+
+    # Guest info (entered by staff)
+    guest_phone = models.CharField(max_length=20)
+    guest_name = models.CharField(max_length=100)
+    room_number = models.CharField(max_length=20, blank=True)
+
+    # Token — version is set on creation; resend extends expiry without changing version
+    token_version = models.PositiveIntegerField(default=1)
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.PENDING,
+    )
+
+    # Links created on redemption
+    guest_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='invites_received',
+    )
+    guest_stay = models.ForeignKey(
+        GuestStay, null=True, blank=True, on_delete=models.SET_NULL,
+    )
+
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['hotel', '-created_at']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['hotel', 'guest_phone'],
+                condition=Q(status='PENDING'),
+                name='unique_active_invite_per_phone_hotel',
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        import re
+        # Normalize phone to digits-only (canonical E.164 without +),
+        # matching NotificationRoute.save() so webhook phone comparisons work.
+        self.guest_phone = re.sub(r'\D', '', self.guest_phone)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.guest_name} ({self.guest_phone}) @ {self.hotel.name} [{self.status}]'

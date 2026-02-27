@@ -21,6 +21,7 @@ from concierge.models import (
     WhatsAppServiceWindow,
 )
 from concierge.services import publish_request_event
+from shortlinks.models import ShortLink
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,11 @@ def handle_inbound_message(payload):
     msg_payload = payload.get("payload", {})
     postback = _resolve_postback(msg_payload)
     now = timezone.now()
+
+    # Guest invite postbacks — handle separately and return early
+    if postback.startswith('g_inv_access:') or postback.startswith('g_inv_ack:'):
+        _handle_invite_postback(postback, payload, now)
+        return
 
     # Parse postback — extract public_id from all postback types
     public_id = _parse_public_id(postback) if postback else None
@@ -300,3 +306,112 @@ def _send_session_text(phone, text):
         },
         timeout=10,
     )
+
+
+# ---------------------------------------------------------------------------
+# Guest invite postback handlers
+# ---------------------------------------------------------------------------
+
+def _normalize_phone(raw):
+    """Strip non-digits from phone number."""
+    return re.sub(r'\D', '', raw)
+
+
+def _resolve_invite_delivery(postback, payload):
+    """Shared: resolve DeliveryRecord + verify phone. Returns (delivery, invite, phone) or None."""
+    parts = postback.split(':', 1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        logger.warning('Malformed invite postback: %s', postback)
+        return None
+    delivery_id = int(parts[1])
+    delivery = (
+        DeliveryRecord.objects
+        .select_related('guest_invite', 'guest_invite__hotel')
+        .filter(id=delivery_id, channel='WHATSAPP', guest_invite__isnull=False)
+        .first()
+    )
+    if not delivery or not delivery.guest_invite:
+        return None
+    invite = delivery.guest_invite
+
+    # Extract source phone via fallback chain
+    raw_source = payload.get('source') or payload.get('payload', {}).get('source')
+    if not raw_source:
+        logger.warning('No source phone in invite postback payload')
+        return None
+    source_phone = _normalize_phone(raw_source)
+    if source_phone != invite.guest_phone:
+        logger.warning('Phone mismatch on invite postback')
+        return None
+
+    # Open session window (both buttons do this)
+    WhatsAppServiceWindow.objects.update_or_create(
+        hotel=invite.hotel,
+        phone=source_phone,
+        defaults={'last_inbound_at': timezone.now()},
+    )
+    # Mark this delivery acknowledged
+    delivery.acknowledged_at = timezone.now()
+    delivery.save(update_fields=['acknowledged_at'])
+    return delivery, invite, source_phone
+
+
+def _handle_invite_postback(postback, payload, now):
+    """Route g_inv_access and g_inv_ack postbacks."""
+    if postback.startswith('g_inv_access:'):
+        result = _resolve_invite_delivery(postback, payload)
+        if not result:
+            return
+        delivery, invite, source_phone = result
+
+        # Guard: check both status AND expiry
+        if invite.status != 'PENDING':
+            return  # Already used/expired
+        if invite.expires_at < now:
+            invite.status = 'EXPIRED'
+            invite.save(update_fields=['status'])
+            try:
+                _send_session_text(
+                    source_phone,
+                    "This invite has expired. Please ask the hotel front desk to resend it.",
+                )
+            except Exception:
+                logger.warning('Failed to send expiry message to %s', source_phone)
+            return
+
+        # Look up the ShortLink created for this delivery
+        short_link = ShortLink.objects.filter(
+            metadata__delivery_id=delivery.id,
+            is_active=True,
+        ).first()
+        if short_link:
+            link_url = f'{settings.API_ORIGIN}/s/{short_link.code}'
+            try:
+                _send_session_text(
+                    source_phone,
+                    f"Here's your concierge link \u2014 tap to get started:\n{link_url}",
+                )
+            except Exception:
+                logger.warning('Failed to send invite link to %s', source_phone)
+        else:
+            logger.error('No active ShortLink for delivery %s', delivery.id)
+            try:
+                _send_session_text(
+                    source_phone,
+                    "Sorry, we couldn't generate your link. Please contact the hotel front desk for assistance.",
+                )
+            except Exception:
+                logger.warning('Failed to send fallback message to %s', source_phone)
+
+    elif postback.startswith('g_inv_ack:'):
+        result = _resolve_invite_delivery(postback, payload)
+        if not result:
+            return
+        delivery, invite, source_phone = result
+        try:
+            _send_session_text(
+                source_phone,
+                "You're all set! We'll keep you updated via WhatsApp.",
+            )
+        except Exception:
+            logger.warning('Failed to send ack confirmation to %s', source_phone)

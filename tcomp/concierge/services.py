@@ -14,6 +14,8 @@ import redis as redis_lib
 import requests as http_requests
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.core.signing import TimestampSigner
 from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q
@@ -499,6 +501,64 @@ def check_room_rate_limit(hotel, room_number):
         created_at__gte=one_hour_ago,
     ).count()
     return count < 5
+
+
+# ---------------------------------------------------------------------------
+# Guest invite rate limiting
+# ---------------------------------------------------------------------------
+
+def check_invite_rate_limit_phone(phone):
+    """Max 3 invites per phone per 24 hours."""
+    key = f'ratelimit:invite:phone:{phone}'
+    result = check_rate_limit(key, 3, 86400)
+    if result is not None:
+        return result
+    from .models import GuestInvite
+    cutoff = timezone.now() - timedelta(hours=24)
+    count = GuestInvite.objects.filter(guest_phone=phone, created_at__gte=cutoff).count()
+    return count < 3
+
+
+def check_invite_rate_limit_hotel(hotel_id):
+    """Max 100 invites per hotel per 24 hours."""
+    key = f'ratelimit:invite:hotel:{hotel_id}'
+    result = check_rate_limit(key, 100, 86400)
+    if result is not None:
+        return result
+    from .models import GuestInvite
+    cutoff = timezone.now() - timedelta(hours=24)
+    count = GuestInvite.objects.filter(hotel_id=hotel_id, created_at__gte=cutoff).count()
+    return count < 100
+
+
+def check_invite_rate_limit_staff(user_id):
+    """Debounce: max 1 invite per staff per 10 seconds."""
+    key = f'ratelimit:invite:staff:{user_id}'
+    result = check_rate_limit(key, 1, 10)
+    if result is not None:
+        return result
+    from .models import GuestInvite
+    cutoff = timezone.now() - timedelta(seconds=10)
+    count = GuestInvite.objects.filter(sent_by_id=user_id, created_at__gte=cutoff).count()
+    return count < 1
+
+
+def check_invite_resend_rate_limit(user_id):
+    """Debounce resend: max 1 resend per staff per 10 seconds.
+
+    Separate cache key from create so create + immediate resend don't
+    cross-contaminate each other's debounce windows.
+
+    Fails closed: if cache is unavailable, resend is denied. DeliveryRecord
+    has no created_by field, so a reliable per-actor DB fallback isn't
+    possible. A brief cache outage blocking resends is acceptable since
+    the original invite is still valid.
+    """
+    key = f'ratelimit:invite_resend:staff:{user_id}'
+    result = check_rate_limit(key, 1, 10)
+    if result is not None:
+        return result
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1163,3 +1223,85 @@ def send_staff_invite_notification(user, hotel, role, *, skip_channels=None):
         raise errors[0]
 
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# Guest Invite Token Signing
+# ---------------------------------------------------------------------------
+
+_invite_signer = TimestampSigner(salt='guest-invite')
+
+
+def generate_invite_token(invite_id: int, version: int) -> str:
+    """Sign invite_id:version. Version is fixed per invite; revoke is the invalidation path."""
+    return _invite_signer.sign(f'{invite_id}:{version}')
+
+
+def verify_invite_token(token: str) -> tuple[int, int]:
+    """Verify and return (invite_id, version). Expiry checked via invite.expires_at, not signer max_age."""
+    # No max_age on unsign — expiry is checked against invite.expires_at in the
+    # verify view. Relying on the DB field means config changes to
+    # GUEST_INVITE_EXPIRY_HOURS never conflict with already-issued tokens.
+    # The signer only validates integrity (not tampered), not time.
+    value = _invite_signer.unsign(token)
+    invite_id, version = value.split(':')
+    return int(invite_id), int(version)
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Template Resolution
+# ---------------------------------------------------------------------------
+
+def get_template(hotel, template_type):
+    """Resolve template: hotel-specific → global default → None."""
+    from .models import WhatsAppTemplate
+
+    return (
+        WhatsAppTemplate.objects.filter(
+            hotel=hotel, template_type=template_type, is_active=True
+        ).first()
+        or WhatsAppTemplate.objects.filter(
+            hotel=None, template_type=template_type, is_active=True
+        ).first()
+    )
+
+
+# Context keys available for GUEST_INVITE templates.
+# New template types (Phase 2) define their own context builders.
+GUEST_INVITE_CONTEXT_BUILDERS = {
+    'hotel_name': lambda invite: invite.hotel.name,
+    'guest_name': lambda invite: invite.guest_name,
+    'room_number': lambda invite: invite.room_number or '',
+}
+
+
+def resolve_template_params(wa_template, context_source):
+    """Build the ordered param list from a template's variables JSON.
+
+    context_source: the object to resolve keys from (e.g., GuestInvite instance).
+    Returns list of strings in index order, ready to pass to Gupshup.
+    Raises ValueError if a required variable key has no resolver.
+    """
+    if wa_template.template_type == 'GUEST_INVITE':
+        builders = GUEST_INVITE_CONTEXT_BUILDERS
+    else:
+        raise ValueError(f'No context builders for template type: {wa_template.template_type}')
+
+    variables = sorted(wa_template.variables, key=lambda v: v['index'])
+    params = []
+    for var in variables:
+        key = var['key']
+        if key not in builders:
+            raise ValueError(f'Unknown variable key "{key}" in template "{wa_template.name}"')
+        params.append(str(builders[key](context_source)))
+    return params
+
+
+def validate_template(wa_template):
+    """Ensure body_text placeholders match declared variables."""
+    placeholders = {int(m) for m in re.findall(r'\{\{(\d+)\}\}', wa_template.body_text)}
+    declared = {v['index'] for v in wa_template.variables}
+    if placeholders != declared:
+        raise ValidationError(
+            f'Placeholder mismatch: body has {placeholders}, variables declare {declared}'
+        )
