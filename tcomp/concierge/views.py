@@ -29,7 +29,7 @@ from .models import (
     DeliveryRecord, Event, EventImage, Experience,
     ExperienceImage, GuestInvite, GuestStay, Hotel, HotelInfoSection,
     HotelMembership, Notification, NotificationRoute, PushSubscription,
-    QRCode, QRScanDaily, ServiceRequest, RequestActivity,
+    QRCode, QRScanDaily, Rating, RatingPrompt, ServiceRequest, RequestActivity,
     SpecialRequestOffering, SpecialRequestOfferingImage,
 )
 from .permissions import (
@@ -55,6 +55,9 @@ from .serializers import (
     ServiceRequestListSerializer, ServiceRequestUpdateSerializer,
     SpecialRequestOfferingSerializer, SpecialRequestOfferingPublicSerializer,
     SpecialRequestOfferingImageSerializer,
+    RatingSerializer, RatingPromptSerializer, StayPromptSerializer,
+    SubmitRatingSerializer, AdminRatingSerializer, RatingSummarySerializer,
+    SendSurveySerializer,
 )
 from .notifications import NotificationEvent, dispatch_notification
 from .services import (
@@ -526,11 +529,18 @@ class MyRequestsList(generics.ListAPIView):
         return super().list(request, *args, **kwargs)
 
     def get_queryset(self):
+        from django.db.models import OuterRef, Subquery
         qs = ServiceRequest.objects.filter(
             guest_stay__guest=self.request.user,
         ).select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
             'special_request_offering',
+        ).annotate(
+            _rating_score=Subquery(
+                Rating.objects.filter(
+                    service_request=OuterRef('pk'),
+                ).values('score')[:1]
+            ),
         ).order_by('-created_at')
         hotel_slug = self.request.query_params.get('hotel')
         if hotel_slug:
@@ -553,9 +563,16 @@ class ServiceRequestList(HotelScopedMixin, generics.ListAPIView):
     ordering_fields = ['created_at', 'updated_at', 'status']
 
     def get_queryset(self):
+        from django.db.models import OuterRef, Subquery
         qs = super().get_queryset().select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
             'special_request_offering',
+        ).annotate(
+            _rating_score=Subquery(
+                Rating.objects.filter(
+                    service_request=OuterRef('pk'),
+                ).values('score')[:1]
+            ),
         )
         membership = getattr(self.request, 'membership', None)
         if membership and membership.role == HotelMembership.Role.STAFF:
@@ -599,8 +616,16 @@ class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveUpdateAPIView):
 
         if new_status:
             if new_status == ServiceRequest.Status.CONFIRMED:
-                instance.confirmed_at = timezone.now()
-                instance.save(update_fields=['confirmed_at'])
+                now = timezone.now()
+                instance.confirmed_at = now
+                update_fields = ['confirmed_at']
+                # Set rating eligibility if ratings enabled
+                hotel = instance.hotel
+                if hotel.ratings_enabled and instance.guest_stay_id:
+                    delay = timedelta(hours=hotel.rating_delay_hours)
+                    instance.rating_prompt_eligible_at = now + delay
+                    update_fields.append('rating_prompt_eligible_at')
+                instance.save(update_fields=update_fields)
 
             action = (
                 RequestActivity.Action.CONFIRMED
@@ -2463,3 +2488,270 @@ class GupshupWAWebhookView(APIView):
             logger.exception('Error processing Gupshup webhook (notification handler)')
 
         return Response(status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings — Guest-Facing Views
+# ---------------------------------------------------------------------------
+
+# Guest-visible statuses (internal states filtered out)
+_GUEST_VISIBLE_STATUSES = {'SENT', 'COMPLETED', 'DISMISSED', 'EXPIRED'}
+# Actionable statuses — the only ones a guest can still act on
+_GUEST_ACTIONABLE_STATUSES = {'SENT'}
+
+
+class MyRatingPromptList(APIView):
+    """GET /me/rating-prompts/?hotel={slug}&status=&count_only="""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        hotel_slug = request.query_params.get('hotel')
+        if not hotel_slug:
+            return Response(
+                {'detail': 'hotel query parameter is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Default to actionable prompts only; allow explicit status override
+        # for history views.
+        status_filter = request.query_params.get('status')
+        if status_filter and status_filter in _GUEST_VISIBLE_STATUSES:
+            filter_statuses = {status_filter}
+        else:
+            filter_statuses = _GUEST_ACTIONABLE_STATUSES
+
+        base_qs = RatingPrompt.objects.filter(
+            guest=request.user,
+            hotel__slug=hotel_slug,
+            status__in=filter_statuses,
+        )
+
+        count_only = request.query_params.get('count_only', '').lower() == 'true'
+        if count_only:
+            count = base_qs.filter(status='SENT').count()
+            return Response({'count': count})
+
+        request_prompts = base_qs.filter(
+            prompt_type='REQUEST',
+        ).select_related(
+            'service_request__department',
+            'service_request__experience',
+            'service_request__event',
+            'service_request__special_request_offering',
+        ).order_by('-eligible_at')
+
+        # Only one stay prompt surfaced per the singular response contract.
+        # If multiple exist, the most recently eligible one wins.
+        stay_prompt = base_qs.filter(
+            prompt_type='STAY',
+        ).order_by('-eligible_at').first()
+
+        return Response({
+            'request_prompts': RatingPromptSerializer(request_prompts, many=True).data,
+            'stay_prompt': StayPromptSerializer(stay_prompt).data if stay_prompt else None,
+        })
+
+
+class RatePrompt(APIView):
+    """POST /me/rating-prompts/{prompt_id}/rate/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, prompt_id):
+        ser = SubmitRatingSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        from .services import submit_rating
+        try:
+            rating, created = submit_rating(
+                prompt_id=prompt_id,
+                guest=request.user,
+                score=ser.validated_data['score'],
+                feedback=ser.validated_data.get('feedback', ''),
+            )
+        except serializers.ValidationError as e:
+            return Response(
+                {'detail': e.detail if hasattr(e, 'detail') else str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            RatingSerializer(rating).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class DismissPrompt(APIView):
+    """POST /me/rating-prompts/{prompt_id}/dismiss/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, prompt_id):
+        with transaction.atomic():
+            try:
+                prompt = RatingPrompt.objects.select_for_update().get(
+                    id=prompt_id,
+                    guest=request.user,
+                    status='SENT',
+                )
+            except RatingPrompt.DoesNotExist:
+                return Response(
+                    {'detail': 'Rating prompt not found or already handled.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            prompt.status = 'DISMISSED'
+            prompt.dismissed_at = timezone.now()
+            prompt.save(update_fields=['status', 'dismissed_at'])
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ReviewClicked(APIView):
+    """POST /me/ratings/{rating_id}/review-clicked/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, rating_id):
+        try:
+            rating = Rating.objects.get(
+                id=rating_id,
+                guest=request.user,
+            )
+        except Rating.DoesNotExist:
+            return Response(
+                {'detail': 'Rating not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not rating.review_clicked_at:
+            rating.review_clicked_at = timezone.now()
+            rating.save(update_fields=['review_clicked_at'])
+
+        return Response(status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings — Admin Views
+# ---------------------------------------------------------------------------
+
+class AdminSendSurvey(HotelScopedMixin, APIView):
+    """POST /hotels/{slug}/admin/stays/{stay_id}/send-survey/"""
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, hotel_slug, stay_id):
+        hotel = self.get_hotel()
+        if not hotel.ratings_enabled:
+            return Response(
+                {'detail': 'Ratings are not enabled for this hotel.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            guest_stay = GuestStay.objects.get(
+                id=stay_id, hotel=hotel,
+            )
+        except GuestStay.DoesNotExist:
+            return Response(
+                {'detail': 'Stay not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        from .services import send_stay_survey
+        try:
+            send_stay_survey(
+                hotel=hotel,
+                guest_stay=guest_stay,
+                triggered_by=request.user,
+            )
+        except serializers.ValidationError as e:
+            return Response(
+                {'detail': e.detail if hasattr(e, 'detail') else str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            {'detail': 'Checkout survey sent.'},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AdminRatingList(HotelScopedMixin, generics.ListAPIView):
+    """GET /hotels/{slug}/admin/ratings/"""
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = AdminRatingSerializer
+
+    def get_queryset(self):
+        hotel = self.get_hotel()
+        qs = Rating.objects.filter(
+            hotel=hotel,
+        ).select_related(
+            'guest', 'guest_stay', 'service_request__department',
+            'service_request__guest_stay',
+        ).order_by('-created_at')
+
+        rating_type = self.request.query_params.get('rating_type')
+        if rating_type in ('REQUEST', 'STAY'):
+            qs = qs.filter(rating_type=rating_type)
+
+        # Exact score filter (from frontend score dropdown)
+        score = self.request.query_params.get('score')
+        if score and score.isdigit() and 1 <= int(score) <= 5:
+            qs = qs.filter(score=int(score))
+
+        # Range filters (for programmatic use)
+        min_score = self.request.query_params.get('min_score')
+        if min_score and min_score.isdigit():
+            qs = qs.filter(score__gte=int(min_score))
+
+        max_score = self.request.query_params.get('max_score')
+        if max_score and max_score.isdigit():
+            qs = qs.filter(score__lte=int(max_score))
+
+        department = self.request.query_params.get('department')
+        if department:
+            qs = qs.filter(service_request__department__slug=department)
+
+        return qs
+
+
+class AdminRatingSummary(HotelScopedMixin, APIView):
+    """GET /hotels/{slug}/admin/ratings/summary/"""
+    permission_classes = [IsAdminOrAbove]
+
+    def get(self, request, hotel_slug):
+        hotel = self.get_hotel()
+        qs = Rating.objects.filter(hotel=hotel)
+
+        total = qs.count()
+        avg = qs.aggregate(avg=models.Avg('score'))['avg']
+
+        # Score distribution
+        dist_qs = qs.values('score').annotate(count=Count('id')).order_by('score')
+        distribution = {str(i): 0 for i in range(1, 6)}
+        for row in dist_qs:
+            distribution[str(row['score'])] = row['count']
+
+        # By department (request ratings only) — group by id for uniqueness
+        by_dept = (
+            qs.filter(rating_type='REQUEST', service_request__department__isnull=False)
+            .values('service_request__department__id', 'service_request__department__name')
+            .annotate(
+                count=Count('id'),
+                avg_score=models.Avg('score'),
+            )
+            .order_by('-avg_score')
+        )
+        dept_data = [
+            {
+                'department_id': row['service_request__department__id'],
+                'department_name': row['service_request__department__name'],
+                'count': row['count'],
+                'avg_score': round(row['avg_score'], 1) if row['avg_score'] else None,
+            }
+            for row in by_dept
+        ]
+
+        return Response({
+            'total_count': total,
+            'average_score': round(avg, 2) if avg else None,
+            'distribution': distribution,
+            'by_department': dept_data,
+        })

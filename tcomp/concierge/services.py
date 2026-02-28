@@ -25,6 +25,7 @@ from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
     GuestStay, OTPCode, ServiceRequest, RequestActivity, Notification,
     PushSubscription, QRCode, EscalationHeartbeat,
+    Rating, RatingPrompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -908,8 +909,9 @@ async def stream_request_events(hotel, user):
         ).select_related('department').first()
     )()
 
+    is_staff_role = membership and membership.role == HotelMembership.Role.STAFF
     staff_department_id = None
-    if membership and membership.role == HotelMembership.Role.STAFF:
+    if is_staff_role:
         staff_department_id = membership.department_id if membership.department else None
 
     r = aioredis.from_url(settings.SSE_REDIS_URL)
@@ -937,9 +939,17 @@ async def stream_request_events(hotel, user):
 
             data = json.loads(message['data'])
 
-            # Filter by department for STAFF users
-            if staff_department_id is not None:
-                if data.get('department_id') != staff_department_id:
+            # STAFF users: skip events without department_id (e.g. rating events)
+            # and filter to their assigned department.
+            # STAFF with no assigned department see no events at all.
+            if is_staff_role:
+                event_dept = data.get('department_id')
+                if event_dept is None:
+                    continue
+                if staff_department_id is None:
+                    # Unassigned STAFF: skip all dept-scoped events
+                    continue
+                if event_dept != staff_department_id:
                     continue
 
             yield f'event: {data["event"]}\ndata: {json.dumps(data)}\n\n'
@@ -1274,6 +1284,25 @@ GUEST_INVITE_CONTEXT_BUILDERS = {
     'room_number': lambda invite: invite.room_number or '',
 }
 
+GUEST_RATING_BATCH_CONTEXT_BUILDERS = {
+    'guest_name': lambda ctx: ctx['guest_name'],
+    'hotel_name': lambda ctx: ctx['hotel_name'],
+    'experience_count': lambda ctx: str(ctx['experience_count']),
+    'rate_url_suffix': lambda ctx: ctx['rate_url_suffix'],
+}
+
+GUEST_STAY_SURVEY_CONTEXT_BUILDERS = {
+    'guest_name': lambda ctx: ctx['guest_name'],
+    'hotel_name': lambda ctx: ctx['hotel_name'],
+    'rate_url_suffix': lambda ctx: ctx['rate_url_suffix'],
+}
+
+LOW_SCORE_ALERT_CONTEXT_BUILDERS = {
+    'guest_summary': lambda ctx: ctx['guest_summary'],
+    'rating_detail': lambda ctx: ctx['rating_detail'],
+    'feedback_preview': lambda ctx: ctx['feedback_preview'],
+}
+
 
 def resolve_template_params(wa_template, context_source):
     """Build the ordered param list from a template's variables JSON.
@@ -1282,9 +1311,14 @@ def resolve_template_params(wa_template, context_source):
     Returns list of strings in index order, ready to pass to Gupshup.
     Raises ValueError if a required variable key has no resolver.
     """
-    if wa_template.template_type == 'GUEST_INVITE':
-        builders = GUEST_INVITE_CONTEXT_BUILDERS
-    else:
+    _BUILDERS_MAP = {
+        'GUEST_INVITE': GUEST_INVITE_CONTEXT_BUILDERS,
+        'GUEST_RATING_BATCH': GUEST_RATING_BATCH_CONTEXT_BUILDERS,
+        'GUEST_STAY_SURVEY': GUEST_STAY_SURVEY_CONTEXT_BUILDERS,
+        'LOW_SCORE_ALERT': LOW_SCORE_ALERT_CONTEXT_BUILDERS,
+    }
+    builders = _BUILDERS_MAP.get(wa_template.template_type)
+    if builders is None:
         raise ValueError(f'No context builders for template type: {wa_template.template_type}')
 
     variables = sorted(wa_template.variables, key=lambda v: v['index'])
@@ -1305,3 +1339,179 @@ def validate_template(wa_template):
         raise ValidationError(
             f'Placeholder mismatch: body has {placeholders}, variables declare {declared}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings
+# ---------------------------------------------------------------------------
+
+def submit_rating(prompt_id, guest, score, feedback):
+    """Create Rating, update prompt, handle low-score alert.
+
+    Uses select_for_update + status precondition to prevent races.
+    Returns (rating, created) — if already completed, returns existing rating.
+    """
+    with transaction.atomic():
+        try:
+            prompt = RatingPrompt.objects.select_for_update().get(
+                id=prompt_id,
+                guest=guest,
+                status='SENT',
+            )
+        except RatingPrompt.DoesNotExist:
+            prompt = RatingPrompt.objects.filter(
+                id=prompt_id, guest=guest,
+            ).first()
+            if prompt is None:
+                raise ValidationError('Rating prompt not found.')
+            if prompt.status == 'COMPLETED':
+                existing = Rating.objects.filter(
+                    hotel=prompt.hotel,
+                    guest=guest,
+                    service_request=prompt.service_request,
+                    guest_stay=prompt.guest_stay if prompt.prompt_type == 'STAY' else None,
+                    rating_type=prompt.prompt_type,
+                ).first()
+                if existing:
+                    return existing, False
+            raise ValidationError('This rating prompt is no longer available.')
+
+        rating = Rating.objects.create(
+            hotel=prompt.hotel,
+            guest=guest,
+            service_request=prompt.service_request,
+            guest_stay=prompt.guest_stay,
+            rating_type=prompt.prompt_type,
+            score=score,
+            feedback=feedback,
+        )
+        prompt.status = 'COMPLETED'
+        prompt.completed_at = timezone.now()
+        prompt.save(update_fields=['status', 'completed_at'])
+
+        if prompt.service_request:
+            RequestActivity.objects.create(
+                request=prompt.service_request,
+                actor=guest,
+                action='RATING_SUBMITTED',
+                details={'score': score},
+            )
+
+    # Low-score alert (outside transaction — best effort)
+    if score <= 3 and feedback:
+        try:
+            dispatch_low_score_alert(prompt, rating)
+        except Exception:
+            logger.exception('Failed to dispatch low-score alert for rating %s', rating.id)
+
+    return rating, True
+
+
+def dispatch_low_score_alert(prompt, rating):
+    """Send notifications for low-score ratings to ADMIN/SUPERADMIN users."""
+    hotel = prompt.hotel
+
+    # 1. In-app notifications + push for ADMIN/SUPERADMIN
+    admin_memberships = HotelMembership.objects.filter(
+        hotel=hotel,
+        is_active=True,
+        role__in=(HotelMembership.Role.ADMIN, HotelMembership.Role.SUPERADMIN),
+    ).select_related('user')
+
+    guest_name = rating.guest.get_full_name() or rating.guest.phone or 'Guest'
+    room = ''
+    if prompt.guest_stay:
+        room = prompt.guest_stay.room_number
+    elif prompt.service_request and prompt.service_request.guest_stay:
+        room = prompt.service_request.guest_stay.room_number
+
+    title = 'Low rating alert'
+    body = f'{guest_name} rated {rating.score}/5'
+    if room:
+        body = f'Room {room} — {body}'
+
+    for membership in admin_memberships:
+        Notification.objects.create(
+            user=membership.user,
+            hotel=hotel,
+            request=prompt.service_request,
+            title=title,
+            body=body,
+            notification_type=Notification.NotificationType.LOW_RATING_ALERT,
+        )
+        # Async push delivery
+        from .notifications.tasks import send_push_notification_task
+        send_push_notification_task.delay(
+            user_id=membership.user.id,
+            title=title,
+            body=body,
+            url='/dashboard/ratings',
+        )
+
+    # 2. SSE event
+    try:
+        publish_rating_event(hotel, 'rating.low_score', rating)
+    except Exception:
+        logger.exception('Failed to publish rating SSE event')
+
+    # 3. WhatsApp to on-call phone
+    if hotel.oncall_phone:
+        from .notifications.tasks import send_low_score_whatsapp_task
+        send_low_score_whatsapp_task.delay(hotel_id=hotel.id, rating_id=rating.id)
+
+    # 4. Email to on-call email
+    if hotel.oncall_email:
+        from .notifications.tasks import send_low_score_email_task
+        send_low_score_email_task.delay(hotel_id=hotel.id, rating_id=rating.id)
+
+    # 5. Activity trail (request ratings only)
+    if prompt.service_request:
+        RequestActivity.objects.create(
+            request=prompt.service_request,
+            actor=rating.guest,
+            action='FEEDBACK_ALERT',
+            details={'score': rating.score},
+        )
+
+
+def publish_rating_event(hotel, event_type, rating):
+    """Publish rating SSE event to the existing request stream channel."""
+    channel = f'hotel:{hotel.id}:requests'
+    payload = json.dumps({
+        'event': event_type,
+        'rating_id': rating.id,
+        'public_id': str(rating.service_request.public_id) if rating.service_request_id else None,
+        'score': rating.score,
+        'hotel_id': hotel.id,
+    })
+    try:
+        r = get_sse_redis()
+        r.publish(channel, payload)
+    except Exception:
+        logger.exception('Failed to publish rating SSE event')
+
+
+def send_stay_survey(hotel, guest_stay, triggered_by):
+    """Admin triggers checkout survey. Creates prompt + enqueues WhatsApp."""
+    prompt, created = RatingPrompt.objects.get_or_create(
+        hotel=hotel,
+        guest_stay=guest_stay,
+        prompt_type='STAY',
+        defaults={
+            'guest': guest_stay.guest,
+            'status': 'QUEUED',
+            'eligible_at': timezone.now(),
+            'queued_at': timezone.now(),
+        },
+    )
+    if not created:
+        raise ValidationError('Survey already sent for this stay.')
+
+    # WhatsApp delivery — send task transitions QUEUED → SENT on 2xx,
+    # or QUEUED → FAILED on 4xx (same lifecycle as batch-sent prompts).
+    from .notifications.tasks import send_stay_survey_whatsapp_task
+    send_stay_survey_whatsapp_task.delay(
+        hotel_id=hotel.id,
+        guest_id=guest_stay.guest_id,
+        prompt_id=prompt.id,
+    )

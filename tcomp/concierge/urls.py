@@ -34,6 +34,15 @@ urlpatterns = [
          views.MyStaysList.as_view(), name='my-stays-list'),
     path('me/requests/',
          views.MyRequestsList.as_view(), name='my-requests-list'),
+    # Guest ratings
+    path('me/rating-prompts/',
+         views.MyRatingPromptList.as_view(), name='my-rating-prompts'),
+    path('me/rating-prompts/<int:prompt_id>/rate/',
+         views.RatePrompt.as_view(), name='rate-prompt'),
+    path('me/rating-prompts/<int:prompt_id>/dismiss/',
+         views.DismissPrompt.as_view(), name='dismiss-prompt'),
+    path('me/ratings/<int:rating_id>/review-clicked/',
+         views.ReviewClicked.as_view(), name='review-clicked'),
 
     # --- Staff ---
     path('hotels/<slug:hotel_slug>/requests/stream/',
@@ -180,6 +189,14 @@ urlpatterns = [
     path('hotels/<slug:hotel_slug>/admin/booking-email/',
          views.BookingEmailTemplateView.as_view(),
          name='admin-booking-email'),
+    # Guest ratings (admin)
+    path('hotels/<slug:hotel_slug>/admin/stays/<int:stay_id>/send-survey/',
+         views.AdminSendSurvey.as_view(), name='admin-send-survey'),
+    path('hotels/<slug:hotel_slug>/admin/ratings/',
+         views.AdminRatingList.as_view(), name='admin-rating-list'),
+    path('hotels/<slug:hotel_slug>/admin/ratings/summary/',
+         views.AdminRatingSummary.as_view(), name='admin-rating-summary'),
+
     # Guest invites
     path('hotels/<slug:hotel_slug>/admin/guest-invites/',
          views.GuestInviteListCreate.as_view(),

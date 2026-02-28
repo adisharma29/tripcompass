@@ -64,6 +64,29 @@ class Hotel(models.Model):
         help_text='Allow guests to submit freeform custom requests',
     )
 
+    # --- Guest ratings ---
+    ratings_enabled = models.BooleanField(default=False)
+    rating_delay_hours = models.PositiveSmallIntegerField(
+        default=2,
+        help_text='Hours after CONFIRMED before rating prompt is queued',
+    )
+    rating_batch_hour = models.PositiveSmallIntegerField(
+        default=20,
+        help_text='Hour of day (0-23) in hotel timezone to send batch',
+    )
+    rating_max_per_batch = models.PositiveSmallIntegerField(
+        default=3,
+        help_text='Max request prompts per batch WhatsApp message',
+    )
+    external_review_url = models.URLField(
+        blank=True,
+        help_text='Google/TripAdvisor link shown to guests who rate 4-5',
+    )
+    external_review_threshold = models.PositiveSmallIntegerField(
+        default=4,
+        help_text='Minimum score (4 or 5) to show external review prompt',
+    )
+
     # --- Notification channel toggles ---
     whatsapp_notifications_enabled = models.BooleanField(default=False)
     email_notifications_enabled = models.BooleanField(default=False)
@@ -1058,6 +1081,10 @@ class ServiceRequest(models.Model):
     reminder_sent_at = models.DateTimeField(null=True, blank=True)
     acknowledged_at = models.DateTimeField(null=True, blank=True)
     confirmed_at = models.DateTimeField(null=True, blank=True)
+    rating_prompt_eligible_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Set to confirmed_at + delay when CONFIRMED and ratings enabled. Used by queue task.',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1086,12 +1113,15 @@ class RequestActivity(models.Model):
         OWNERSHIP_TAKEN = 'OWNERSHIP_TAKEN', 'Ownership Taken'
         EXPIRED = 'EXPIRED', 'Expired'
         REASSIGNED = 'REASSIGNED', 'Reassigned'
+        RATING_SUBMITTED = 'RATING_SUBMITTED', 'Rating Submitted'
+        FEEDBACK_ALERT = 'FEEDBACK_ALERT', 'Feedback Alert'
 
     ALLOWED_DETAIL_KEYS = {
         'status_from', 'status_to', 'note_length',
         'assigned_to_id', 'department_id',
         'channel', 'phone',  # For WhatsApp ack activities
         'from_user_id', 'from_name', 'to_user_id', 'to_name', 'reason',
+        'score',  # For RATING_SUBMITTED activities
     }
 
     request = models.ForeignKey(
@@ -1160,6 +1190,7 @@ class Notification(models.Model):
         ESCALATION = 'ESCALATION', 'Escalation'
         DAILY_DIGEST = 'DAILY_DIGEST', 'Daily Digest'
         SYSTEM = 'SYSTEM', 'System'
+        LOW_RATING_ALERT = 'LOW_RATING_ALERT', 'Low Rating Alert'
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
@@ -1647,6 +1678,9 @@ class WhatsAppTemplate(models.Model):
 
     class TemplateType(models.TextChoices):
         GUEST_INVITE = 'GUEST_INVITE', 'Guest Invite'
+        GUEST_RATING_BATCH = 'GUEST_RATING_BATCH', 'Guest Rating Batch'
+        GUEST_STAY_SURVEY = 'GUEST_STAY_SURVEY', 'Guest Stay Survey'
+        LOW_SCORE_ALERT = 'LOW_SCORE_ALERT', 'Low Score Alert'
 
     # null hotel = global default (used when hotel has no custom template)
     hotel = models.ForeignKey(
@@ -1752,3 +1786,150 @@ class GuestInvite(models.Model):
 
     def __str__(self):
         return f'{self.guest_name} ({self.guest_phone}) @ {self.hotel.name} [{self.status}]'
+
+
+class Rating(models.Model):
+    """Guest rating for a service request (per-request) or stay (per-stay)."""
+
+    class RatingType(models.TextChoices):
+        REQUEST = 'REQUEST', 'Request'
+        STAY = 'STAY', 'Stay'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='ratings',
+    )
+    guest = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='ratings',
+    )
+    guest_stay = models.ForeignKey(
+        GuestStay, on_delete=models.CASCADE,
+        null=True, blank=True, related_name='ratings',
+    )
+    service_request = models.ForeignKey(
+        ServiceRequest, on_delete=models.CASCADE,
+        null=True, blank=True, related_name='ratings',
+    )
+    rating_type = models.CharField(
+        max_length=10, choices=RatingType.choices,
+    )
+    score = models.PositiveSmallIntegerField()
+    feedback = models.TextField(blank=True)
+    review_clicked_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['hotel', 'created_at']),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=Q(score__gte=1, score__lte=5),
+                name='rating_score_range',
+            ),
+            models.UniqueConstraint(
+                fields=['service_request'],
+                condition=Q(service_request__isnull=False),
+                name='unique_rating_per_request',
+            ),
+            models.UniqueConstraint(
+                fields=['guest_stay'],
+                condition=Q(rating_type='STAY'),
+                name='unique_stay_rating_per_stay',
+            ),
+            models.CheckConstraint(
+                check=(
+                    Q(rating_type='REQUEST', service_request__isnull=False, guest_stay__isnull=True)
+                    | Q(rating_type='STAY', guest_stay__isnull=False, service_request__isnull=True)
+                ),
+                name='rating_type_xor_fk',
+            ),
+        ]
+
+    def __str__(self):
+        return f'Rating {self.id}: {self.score}/5 ({self.rating_type})'
+
+
+class RatingPrompt(models.Model):
+    """Tracks the lifecycle of a rating ask — eligibility through delivery to completion."""
+
+    class PromptType(models.TextChoices):
+        REQUEST = 'REQUEST', 'Request'
+        STAY = 'STAY', 'Stay'
+
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        QUEUED = 'QUEUED', 'Queued'
+        SENT = 'SENT', 'Sent'
+        COMPLETED = 'COMPLETED', 'Completed'
+        DISMISSED = 'DISMISSED', 'Dismissed'
+        EXPIRED = 'EXPIRED', 'Expired'
+        FAILED = 'FAILED', 'Failed'
+
+    hotel = models.ForeignKey(
+        Hotel, on_delete=models.CASCADE, related_name='rating_prompts',
+    )
+    guest = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='rating_prompts',
+    )
+    service_request = models.ForeignKey(
+        ServiceRequest, on_delete=models.CASCADE,
+        null=True, blank=True, related_name='rating_prompts',
+    )
+    guest_stay = models.ForeignKey(
+        GuestStay, on_delete=models.CASCADE,
+        null=True, blank=True, related_name='rating_prompts',
+    )
+    prompt_type = models.CharField(
+        max_length=10, choices=PromptType.choices,
+    )
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.PENDING,
+    )
+    eligible_at = models.DateTimeField()
+    queued_at = models.DateTimeField(null=True, blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    dismissed_at = models.DateTimeField(null=True, blank=True)
+    batch_key = models.CharField(max_length=40, null=True, blank=True)
+    failure_count = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=['hotel', 'status', 'prompt_type', 'eligible_at'],
+                name='rp_batch_query_idx',
+            ),
+            models.Index(
+                fields=['hotel', 'batch_key', 'guest'],
+                name='rp_dedup_idx',
+            ),
+            models.Index(
+                fields=['hotel', 'guest', 'status'],
+                name='rp_guest_read_idx',
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['service_request'],
+                condition=Q(service_request__isnull=False),
+                name='unique_prompt_per_request',
+            ),
+            models.UniqueConstraint(
+                fields=['guest_stay'],
+                condition=Q(prompt_type='STAY'),
+                name='unique_stay_prompt_per_stay',
+            ),
+            models.CheckConstraint(
+                check=(
+                    Q(prompt_type='REQUEST', service_request__isnull=False, guest_stay__isnull=True)
+                    | Q(prompt_type='STAY', guest_stay__isnull=False, service_request__isnull=True)
+                ),
+                name='prompt_type_xor_fk',
+            ),
+        ]
+
+    def __str__(self):
+        return f'RatingPrompt {self.id}: {self.prompt_type} [{self.status}]'

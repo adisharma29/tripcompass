@@ -271,6 +271,18 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'concierge.tasks.cleanup_orphaned_content_images_task',
         'schedule': 7 * 24 * 60 * 60,  # weekly
     },
+    'queue-rating-prompts': {
+        'task': 'concierge.tasks.queue_rating_prompts_task',
+        'schedule': 15 * 60,  # every 15 minutes
+    },
+    'send-rating-batches': {
+        'task': 'concierge.tasks.send_rating_batches_task',
+        'schedule': 15 * 60,  # every 15 minutes
+    },
+    'expire-stale-prompts': {
+        'task': 'concierge.tasks.expire_stale_prompts_task',
+        'schedule': 24 * 60 * 60,  # daily
+    },
 }
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_REJECT_ON_WORKER_LOST = True

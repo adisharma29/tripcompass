@@ -367,3 +367,189 @@ def cleanup_orphaned_content_images_task():
             'Deleted %d orphaned content images (%d total scanned)',
             deleted, total,
         )
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings — Beat tasks
+# ---------------------------------------------------------------------------
+
+def _hotel_tz(hotel):
+    """Return ZoneInfo for hotel, falling back to UTC."""
+    try:
+        return zoneinfo.ZoneInfo(hotel.timezone) if hotel.timezone else zoneinfo.ZoneInfo('UTC')
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError):
+        return zoneinfo.ZoneInfo('UTC')
+
+
+@shared_task
+def queue_rating_prompts_task():
+    """Runs every 15 min. Creates PENDING RatingPrompts for eligible confirmed requests."""
+    from .models import Hotel, RatingPrompt, ServiceRequest
+
+    now = timezone.now()
+    eligible = ServiceRequest.objects.filter(
+        status=ServiceRequest.Status.CONFIRMED,
+        rating_prompt_eligible_at__lte=now,
+        rating_prompt_eligible_at__isnull=False,
+        guest_stay__isnull=False,
+        hotel__ratings_enabled=True,
+    ).exclude(
+        rating_prompts__isnull=False,
+    ).select_related('hotel', 'guest_stay__guest')
+
+    prompts = []
+    for req in eligible:
+        prompts.append(RatingPrompt(
+            hotel=req.hotel,
+            guest=req.guest_stay.guest,
+            service_request=req,
+            prompt_type='REQUEST',
+            status='PENDING',
+            eligible_at=req.rating_prompt_eligible_at,
+        ))
+
+    if prompts:
+        created = RatingPrompt.objects.bulk_create(prompts, ignore_conflicts=True)
+        logger.info('Queued %d rating prompts', len(created))
+
+
+@shared_task
+def send_rating_batches_task():
+    """Runs every 15 min. Sends batched rating prompts at each hotel's configured hour."""
+    from django.db.models import Q, Case, When, Value, IntegerField
+
+    from .models import Hotel, RatingPrompt
+    from .services import get_template
+
+    now = timezone.now()
+
+    for hotel in Hotel.objects.filter(ratings_enabled=True):
+        hotel_tz_obj = _hotel_tz(hotel)
+        hotel_now = now.astimezone(hotel_tz_obj)
+        hotel_today = hotel_now.date()
+
+        is_batch_hour = hotel_now.hour == hotel.rating_batch_hour
+
+        # Catch-up: find stale PENDING prompts >25h old
+        catchup_cutoff = now - timedelta(hours=25)
+        has_stale = (
+            not is_batch_hour
+            and RatingPrompt.objects.filter(
+                hotel=hotel, status='PENDING', batch_key__isnull=True,
+                eligible_at__lte=catchup_cutoff,
+            ).exists()
+        )
+
+        if not is_batch_hour and not has_stale:
+            continue
+
+        batch_key = f'{hotel.id}:{hotel_today}'
+
+        # Preflight template check
+        wa_template = get_template(hotel, 'GUEST_RATING_BATCH')
+        if not wa_template:
+            logger.warning('No GUEST_RATING_BATCH template for hotel %s — skipping batch', hotel.slug)
+            continue
+
+        base_qs = (
+            RatingPrompt.objects.filter(
+                hotel=hotel,
+                status__in=('PENDING', 'FAILED'),
+                prompt_type='REQUEST',
+                failure_count__lt=3,
+            ).filter(
+                Q(batch_key__isnull=True) | ~Q(batch_key=batch_key)
+            ).exclude(
+                guest_id__in=RatingPrompt.objects.filter(
+                    hotel=hotel, batch_key=batch_key,
+                ).values_list('guest_id', flat=True)
+            )
+        )
+
+        if has_stale and not is_batch_hour:
+            base_qs = base_qs.filter(eligible_at__lte=catchup_cutoff)
+
+        pending_guests = base_qs.values_list('guest_id', flat=True).distinct()
+
+        type_priority = Case(
+            When(service_request__request_type='BOOKING', then=Value(0)),
+            When(service_request__request_type='INQUIRY', then=Value(1)),
+            When(service_request__request_type='SPECIAL_REQUEST', then=Value(2)),
+            When(service_request__request_type='CUSTOM', then=Value(3)),
+            default=Value(4),
+            output_field=IntegerField(),
+        )
+
+        for guest_id in pending_guests:
+            prompts_qs = base_qs.filter(
+                guest_id=guest_id,
+            ).select_related('service_request').annotate(
+                type_rank=type_priority,
+            ).order_by(
+                'type_rank', 'eligible_at',
+            )[:hotel.rating_max_per_batch]
+
+            prompt_ids = list(prompts_qs.values_list('id', flat=True))
+            if not prompt_ids:
+                continue
+
+            # Atomically update only prompts still in PENDING/FAILED,
+            # then read back the ids that were actually queued so
+            # experience_count is accurate (no read-then-write race).
+            updated = RatingPrompt.objects.filter(
+                id__in=prompt_ids, status__in=('PENDING', 'FAILED'),
+            ).update(status='QUEUED', queued_at=now, batch_key=batch_key)
+
+            if not updated:
+                continue
+
+            queued_ids = list(
+                RatingPrompt.objects.filter(
+                    id__in=prompt_ids, batch_key=batch_key, guest_id=guest_id,
+                ).values_list('id', flat=True)
+            )
+
+            from .notifications.tasks import send_rating_whatsapp_task
+            send_rating_whatsapp_task.delay(
+                hotel_id=hotel.id,
+                guest_id=guest_id,
+                prompt_ids=queued_ids,
+                batch_key=batch_key,
+            )
+
+
+@shared_task
+def expire_stale_prompts_task():
+    """Runs daily. Three cleanup passes for stale RatingPrompts."""
+    from django.db.models import F
+
+    from .models import RatingPrompt
+
+    now = timezone.now()
+
+    # Pass 1: SENT prompts older than 7 days → EXPIRED
+    sent_cutoff = now - timedelta(days=7)
+    expired_sent = RatingPrompt.objects.filter(
+        status='SENT',
+        sent_at__lte=sent_cutoff,
+    ).update(status='EXPIRED')
+
+    # Pass 2: Stale QUEUED prompts older than 24h → FAILED
+    queued_cutoff = now - timedelta(hours=24)
+    stale_queued = RatingPrompt.objects.filter(
+        status='QUEUED',
+        queued_at__lte=queued_cutoff,
+    ).update(status='FAILED', failure_count=F('failure_count') + 1)
+
+    # Pass 3: FAILED prompts with failure_count >= 3 → EXPIRED (terminal)
+    terminal_failed = RatingPrompt.objects.filter(
+        status='FAILED',
+        failure_count__gte=3,
+    ).update(status='EXPIRED')
+
+    total = expired_sent + stale_queued + terminal_failed
+    if total:
+        logger.info(
+            'Rating prompt cleanup: %d sent→expired, %d queued→failed, %d failed→expired',
+            expired_sent, stale_queued, terminal_failed,
+        )

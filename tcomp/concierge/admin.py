@@ -6,7 +6,7 @@ from .models import (
     GuestStay, OTPCode, ServiceRequest, RequestActivity,
     Notification, PushSubscription, QRCode, EscalationHeartbeat,
     BookingEmailTemplate, SpecialRequestOffering, SpecialRequestOfferingImage,
-    WhatsAppTemplate, GuestInvite,
+    WhatsAppTemplate, GuestInvite, Rating, RatingPrompt,
 )
 
 
@@ -146,3 +146,17 @@ class GuestInviteAdmin(admin.ModelAdmin):
     list_filter = ['status', 'hotel']
     search_fields = ['guest_phone', 'guest_name']
     readonly_fields = ['token_version', 'created_at', 'used_at']
+
+
+@admin.register(Rating)
+class RatingAdmin(admin.ModelAdmin):
+    list_display = ['id', 'hotel', 'guest', 'rating_type', 'score', 'created_at']
+    list_filter = ['rating_type', 'score', 'hotel']
+    readonly_fields = ['created_at']
+
+
+@admin.register(RatingPrompt)
+class RatingPromptAdmin(admin.ModelAdmin):
+    list_display = ['id', 'hotel', 'guest', 'prompt_type', 'status', 'eligible_at', 'created_at']
+    list_filter = ['status', 'prompt_type', 'hotel']
+    readonly_fields = ['created_at']
