@@ -1065,6 +1065,23 @@ def publish_request_event(hotel, event_type, request_obj):
         logger.exception('Failed to publish SSE event')
 
 
+def publish_invite_event(hotel_id, delivery_id, invite_id, status):
+    """Publish an invite delivery status update to the hotel's SSE channel."""
+    channel = f'hotel:{hotel_id}:requests'
+    payload = json.dumps({
+        'event': 'invite.delivery_updated',
+        'delivery_id': delivery_id,
+        'invite_id': invite_id,
+        'status': status,
+        'updated_at': timezone.now().isoformat(),
+    })
+    try:
+        r = get_sse_redis()
+        r.publish(channel, payload)
+    except Exception:
+        logger.exception('Failed to publish invite SSE event')
+
+
 async def stream_request_events(hotel, user):
     """Async SSE generator. Subscribes to Redis pub/sub, yields events.
 

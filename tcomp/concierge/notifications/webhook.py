@@ -20,7 +20,7 @@ from concierge.models import (
     ServiceRequest,
     WhatsAppServiceWindow,
 )
-from concierge.services import publish_request_event
+from concierge.services import publish_invite_event, publish_request_event
 from shortlinks.models import ShortLink
 
 logger = logging.getLogger(__name__)
@@ -284,10 +284,27 @@ def handle_message_event(payload):
         error = inner.get("payload", {}) if isinstance(inner.get("payload"), dict) else inner
         update_fields["error_message"] = f"{error.get('code', '')}: {error.get('reason', '')}"[:500]
 
-    DeliveryRecord.objects.filter(
-        provider_message_id=message_id,
-        channel="WHATSAPP",
-    ).update(**update_fields)
+    # Fetch record before update to check idempotency and get context for SSE
+    record = (
+        DeliveryRecord.objects
+        .filter(provider_message_id=message_id, channel="WHATSAPP")
+        .select_related('guest_invite')
+        .first()
+    )
+    if not record:
+        return
+    status_changed = record.status != new_status
+    if not status_changed and 'error_message' not in update_fields:
+        return  # Truly idempotent — same status, no new error info
+
+    DeliveryRecord.objects.filter(pk=record.pk).update(**update_fields)
+
+    # Emit SSE event for guest invite deliveries so dashboard updates in real time
+    if status_changed and record.guest_invite_id:
+        hotel_id = record.guest_invite.hotel_id
+        transaction.on_commit(lambda: publish_invite_event(
+            hotel_id, record.id, record.guest_invite_id, new_status,
+        ))
 
 
 def _send_session_text(phone, text):

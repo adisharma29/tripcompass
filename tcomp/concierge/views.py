@@ -427,10 +427,16 @@ class ServiceRequestCreate(HotelScopedMixin, generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Room number: required unless the offering explicitly opts out
+        # Room number: required unless the experience/event/offering opts out
         offering = serializer.validated_data.get('special_request_offering')
+        experience = serializer.validated_data.get('experience')
+        event = serializer.validated_data.get('event')
         room_required = True
         if offering and not offering.requires_room_number:
+            room_required = False
+        elif event and not event.requires_room_number:
+            room_required = False
+        elif experience and not experience.requires_room_number:
             room_required = False
         if room_required and not stay.room_number:
             return Response(

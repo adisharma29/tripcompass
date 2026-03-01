@@ -370,6 +370,9 @@ class Experience(models.Model):
     published_at = models.DateTimeField(null=True, blank=True)
     display_order = models.IntegerField(default=0)
 
+    # --- Guest requirements ---
+    requires_room_number = models.BooleanField(default=True)
+
     # --- Top Deals ---
     is_top_deal = models.BooleanField(default=False)
     deal_price_display = models.CharField(max_length=100, blank=True, default='')
@@ -492,6 +495,9 @@ class Event(models.Model):
         default=True,
         help_text='When True, also notify the resolved department contacts for requests on this event.',
     )
+
+    # Guest requirements
+    requires_room_number = models.BooleanField(default=True)
 
     # Visibility & status
     is_featured = models.BooleanField(default=False)
