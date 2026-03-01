@@ -19,6 +19,8 @@ from rest_framework.test import APIClient
 from concierge.models import (
     ContentStatus,
     Department,
+    Event,
+    Experience,
     Hotel,
     HotelMembership,
     GuestStay,
@@ -321,6 +323,101 @@ class SpecialRequestCreateTest(SpecialRequestSetupMixin, TestCase):
         self.assertEqual(resp.status_code, 201)
         req = ServiceRequest.objects.get(public_id=resp.json()['public_id'])
         self.assertEqual(req.special_request_category, 'PERSONALIZATION')
+
+
+# ---------------------------------------------------------------------------
+# Room number requirement tests (experience / event)
+# ---------------------------------------------------------------------------
+
+class RoomNumberRequirementTest(SpecialRequestSetupMixin, TestCase):
+    """Tests for requires_room_number on Experience and Event."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.guest_user)
+        self.url = '/api/v1/hotels/test-hotel/requests/'
+        # Bypass rate limiting
+        p1 = patch('concierge.views.check_stay_rate_limit', return_value=True)
+        p2 = patch('concierge.views.check_room_rate_limit', return_value=True)
+        p1.start()
+        p2.start()
+        self.addCleanup(p1.stop)
+        self.addCleanup(p2.stop)
+
+        # Experience that does not require room number
+        self.exp_no_room = Experience.objects.create(
+            department=self.dept, name='Pool Access',
+            category='ACTIVITY', requires_room_number=False,
+            status=ContentStatus.PUBLISHED,
+        )
+
+        # Experience that requires room number (default)
+        self.exp_room = Experience.objects.create(
+            department=self.dept, name='In-Room Dining',
+            category='OTHER', requires_room_number=True,
+            status=ContentStatus.PUBLISHED,
+        )
+
+        # Event that does not require room number
+        self.event_no_room = Event.objects.create(
+            hotel=self.hotel, name='Sunset Yoga',
+            category='ACTIVITY', requires_room_number=False,
+            event_start=timezone.now() + timedelta(days=1),
+            status=ContentStatus.PUBLISHED,
+        )
+
+        # Guest without room number
+        self.guest_no_room = User.objects.create_user(
+            email='noroom@test.com', password='pass', user_type='GUEST',
+        )
+        self.stay_no_room = GuestStay.objects.create(
+            guest=self.guest_no_room, hotel=self.hotel,
+            room_number='',
+            expires_at=timezone.now() + timedelta(days=3),
+        )
+
+    def test_experience_no_room_required_succeeds_without_room(self):
+        """Guest without room can book experience that doesn't require it."""
+        self.client.force_authenticate(self.guest_no_room)
+        resp = self.client.post(self.url, {
+            'experience': self.exp_no_room.id,
+            'department': self.dept.id,
+            'request_type': 'BOOKING',
+            'guest_name': 'No Room Guest',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201)
+
+    def test_experience_room_required_fails_without_room(self):
+        """Guest without room cannot book experience that requires it."""
+        self.client.force_authenticate(self.guest_no_room)
+        resp = self.client.post(self.url, {
+            'experience': self.exp_room.id,
+            'department': self.dept.id,
+            'request_type': 'BOOKING',
+            'guest_name': 'No Room Guest',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('room number', resp.json()['detail'].lower())
+
+    def test_event_no_room_required_succeeds_without_room(self):
+        """Guest without room can book event that doesn't require it."""
+        self.client.force_authenticate(self.guest_no_room)
+        resp = self.client.post(self.url, {
+            'event': self.event_no_room.id,
+            'request_type': 'BOOKING',
+            'guest_name': 'No Room Guest',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201)
+
+    def test_experience_room_required_succeeds_with_room(self):
+        """Guest with room can book experience that requires it."""
+        resp = self.client.post(self.url, {
+            'experience': self.exp_room.id,
+            'department': self.dept.id,
+            'request_type': 'BOOKING',
+            'guest_name': 'Guest User',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201)
 
 
 # ---------------------------------------------------------------------------
