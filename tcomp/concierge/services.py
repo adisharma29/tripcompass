@@ -1589,6 +1589,20 @@ LOW_SCORE_ALERT_CONTEXT_BUILDERS = {
     'dashboard_path': lambda ctx: ctx['dashboard_path'],
 }
 
+_STATUS_LABELS = {
+    'CONFIRMED': 'confirmed',
+    'NOT_AVAILABLE': 'not available at this time',
+    'NO_SHOW': 'marked as no-show',
+    'ALREADY_BOOKED_OFFLINE': 'already booked offline',
+}
+
+REQUEST_STATUS_UPDATE_CONTEXT_BUILDERS = {
+    'guest_name': lambda ctx: ctx['guest_name'],
+    'item_name': lambda ctx: ctx['item_name'],
+    'hotel_name': lambda ctx: ctx['hotel_name'],
+    'status_label': lambda ctx: ctx['status_label'],
+}
+
 
 def resolve_template_params(wa_template, context_source):
     """Build the ordered param list from a template's variables JSON.
@@ -1602,6 +1616,7 @@ def resolve_template_params(wa_template, context_source):
         'GUEST_RATING_BATCH': GUEST_RATING_BATCH_CONTEXT_BUILDERS,
         'GUEST_STAY_SURVEY': GUEST_STAY_SURVEY_CONTEXT_BUILDERS,
         'LOW_SCORE_ALERT': LOW_SCORE_ALERT_CONTEXT_BUILDERS,
+        'REQUEST_STATUS_UPDATE': REQUEST_STATUS_UPDATE_CONTEXT_BUILDERS,
     }
     builders = _BUILDERS_MAP.get(wa_template.template_type)
     if builders is None:
@@ -1625,6 +1640,68 @@ def validate_template(wa_template):
         raise ValidationError(
             f'Placeholder mismatch: body has {placeholders}, variables declare {declared}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Guest status update WhatsApp
+# ---------------------------------------------------------------------------
+
+def send_guest_status_update(request_obj, new_status):
+    """Queue a WhatsApp status-update message to the guest.
+
+    Silently skips if the guest has no phone or no stay.
+    """
+    from .models import DeliveryRecord
+
+    stay = request_obj.guest_stay
+    if not stay:
+        return
+    guest = stay.guest
+    phone = _normalize_phone(getattr(guest, 'phone', '') or '')
+    if not phone:
+        return
+
+    # Resolve the item name from the request
+    if request_obj.experience_id:
+        item_name = request_obj.experience.name
+    elif request_obj.event_id:
+        item_name = request_obj.event.name
+    elif request_obj.special_request_offering_id:
+        item_name = request_obj.special_request_offering.name
+    else:
+        item_name = request_obj.subject or 'your request'
+
+    status_label = _STATUS_LABELS.get(new_status, new_status.lower())
+    hotel = request_obj.hotel
+
+    context = {
+        'guest_name': guest.first_name or guest.get_full_name() or 'Guest',
+        'item_name': item_name,
+        'hotel_name': hotel.name,
+        'status_label': status_label,
+    }
+
+    idem_key = f'request_status:{request_obj.public_id}:{new_status}'
+    record, created = DeliveryRecord.objects.get_or_create(
+        idempotency_key=idem_key,
+        defaults={
+            'hotel': hotel,
+            'request': request_obj,
+            'channel': 'WHATSAPP',
+            'target': phone,
+            'event_type': 'request.status_update',
+            'message_type': 'TEMPLATE',
+            'status': DeliveryRecord.Status.QUEUED,
+        },
+    )
+    if not created:
+        return  # Already queued/sent
+
+    from .notifications.tasks import send_request_status_whatsapp_task
+    try:
+        send_request_status_whatsapp_task.delay(record.id, context)
+    except Exception:
+        logger.exception('Failed to enqueue status update task for request %s', request_obj.pk)
 
 
 # ---------------------------------------------------------------------------

@@ -134,6 +134,11 @@ def handle_inbound_message(payload):
         _handle_invite_postback(postback, payload, now)
         return
 
+    # Guest request status update — "View details" button
+    if postback.startswith('g_req_view:'):
+        _handle_request_view_postback(postback, phone)
+        return
+
     # Parse postback — extract public_id from all postback types
     public_id = _parse_public_id(postback) if postback else None
 
@@ -433,3 +438,21 @@ def _handle_invite_postback(postback, payload, now):
             )
         except Exception:
             logger.warning('Failed to send ack confirmation to %s', source_phone)
+
+
+def _handle_request_view_postback(postback, phone):
+    """Guest tapped 'View details' on a request status update."""
+    from concierge.models import ServiceRequest
+
+    public_id = postback.split(':', 1)[1] if ':' in postback else None
+    if not public_id:
+        return
+    try:
+        req = ServiceRequest.objects.select_related('hotel').get(public_id=public_id)
+    except ServiceRequest.DoesNotExist:
+        return
+    url = f"{settings.FRONTEND_ORIGIN}/h/{req.hotel.slug}/requests"
+    try:
+        _send_session_text(phone, f"Here are your request details:\n{url}")
+    except Exception:
+        logger.warning('Failed to send request view link to %s', phone)

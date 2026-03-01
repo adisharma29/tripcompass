@@ -649,6 +649,12 @@ class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveUpdateAPIView):
                 },
             )
 
+            # Notify guest via WhatsApp on terminal status
+            _GUEST_NOTIFY_STATUSES = {'CONFIRMED', 'NOT_AVAILABLE', 'NO_SHOW', 'ALREADY_BOOKED_OFFLINE'}
+            if new_status in _GUEST_NOTIFY_STATUSES:
+                from .services import send_guest_status_update
+                send_guest_status_update(instance, new_status)
+
             publish_request_event(instance.hotel, 'request.updated', instance)
 
         # Staff notes activity

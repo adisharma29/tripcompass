@@ -2409,3 +2409,98 @@ class OncallDispatchIntegrationTest(NotificationSetupMixin, TestCase):
             idempotency_key__startswith='oncall:',
         )
         self.assertEqual(oncall_records.count(), 0)
+
+
+# ---------------------------------------------------------------------------
+# Guest status update WhatsApp
+# ---------------------------------------------------------------------------
+
+class GuestStatusUpdateTest(NotificationSetupMixin, TestCase):
+    """Tests for WhatsApp guest notification on request status change."""
+
+    @patch('concierge.notifications.tasks.send_request_status_whatsapp_task.delay')
+    def test_confirmed_sends_whatsapp(self, mock_delay):
+        """Confirming a request queues a WhatsApp status update."""
+        self.guest_user.phone = '919000000001'
+        self.guest_user.save(update_fields=['phone'])
+
+        req = self._make_request(experience=self.experience)
+        from concierge.services import send_guest_status_update
+        send_guest_status_update(req, 'CONFIRMED')
+
+        record = DeliveryRecord.objects.get(
+            idempotency_key=f'request_status:{req.public_id}:CONFIRMED',
+        )
+        self.assertEqual(record.event_type, 'request.status_update')
+        self.assertEqual(record.target, '919000000001')
+        self.assertEqual(record.channel, 'WHATSAPP')
+        mock_delay.assert_called_once_with(record.id, {
+            'guest_name': self.guest_user.first_name,
+            'item_name': 'Deep Tissue Massage',
+            'hotel_name': 'Test Hotel',
+            'status_label': 'confirmed',
+        })
+
+    @patch('concierge.notifications.tasks.send_request_status_whatsapp_task.delay')
+    def test_not_available_sends_whatsapp(self, mock_delay):
+        """NOT_AVAILABLE status queues with correct label."""
+        self.guest_user.phone = '919000000001'
+        self.guest_user.save(update_fields=['phone'])
+
+        req = self._make_request(experience=self.experience)
+        from concierge.services import send_guest_status_update
+        send_guest_status_update(req, 'NOT_AVAILABLE')
+
+        record = DeliveryRecord.objects.get(
+            idempotency_key=f'request_status:{req.public_id}:NOT_AVAILABLE',
+        )
+        mock_delay.assert_called_once()
+        ctx = mock_delay.call_args[0][1]
+        self.assertEqual(ctx['status_label'], 'not available at this time')
+
+    @patch('concierge.notifications.tasks.send_request_status_whatsapp_task.delay')
+    def test_no_phone_skips_silently(self, mock_delay):
+        """Guest without phone → no DeliveryRecord created."""
+        self.guest_user.phone = ''
+        self.guest_user.save(update_fields=['phone'])
+
+        req = self._make_request(experience=self.experience)
+        from concierge.services import send_guest_status_update
+        send_guest_status_update(req, 'CONFIRMED')
+
+        self.assertFalse(
+            DeliveryRecord.objects.filter(
+                idempotency_key=f'request_status:{req.public_id}:CONFIRMED',
+            ).exists()
+        )
+        mock_delay.assert_not_called()
+
+    @patch('concierge.notifications.tasks.send_request_status_whatsapp_task.delay')
+    def test_idempotent_no_duplicate(self, mock_delay):
+        """Calling send_guest_status_update twice creates only one record."""
+        self.guest_user.phone = '919000000001'
+        self.guest_user.save(update_fields=['phone'])
+
+        req = self._make_request(experience=self.experience)
+        from concierge.services import send_guest_status_update
+        send_guest_status_update(req, 'CONFIRMED')
+        send_guest_status_update(req, 'CONFIRMED')
+
+        self.assertEqual(
+            DeliveryRecord.objects.filter(
+                idempotency_key=f'request_status:{req.public_id}:CONFIRMED',
+            ).count(),
+            1,
+        )
+        self.assertEqual(mock_delay.call_count, 1)
+
+    @patch('concierge.notifications.webhook._send_session_text')
+    def test_view_details_postback(self, mock_send):
+        """g_req_view postback sends guest request URL."""
+        req = self._make_request(experience=self.experience)
+        from concierge.notifications.webhook import _handle_request_view_postback
+        _handle_request_view_postback(f'g_req_view:{req.public_id}', '919876543210')
+
+        mock_send.assert_called_once()
+        text = mock_send.call_args[0][1]
+        self.assertIn(f'/h/{self.hotel.slug}/requests', text)

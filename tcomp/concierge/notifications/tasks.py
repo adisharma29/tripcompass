@@ -364,6 +364,91 @@ def send_guest_invite_whatsapp(self, delivery_id):
 
 
 # ---------------------------------------------------------------------------
+# Guest request status update — WhatsApp template
+# ---------------------------------------------------------------------------
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def send_request_status_whatsapp_task(self, delivery_id, context):
+    """Send request status update template to guest via Gupshup."""
+    try:
+        record = (
+            DeliveryRecord.objects
+            .select_related('request__hotel')
+            .get(pk=delivery_id)
+        )
+    except DeliveryRecord.DoesNotExist:
+        logger.error('DeliveryRecord %s not found', delivery_id)
+        return
+
+    if record.status == DeliveryRecord.Status.SENT:
+        return  # Already sent
+
+    hotel = record.request.hotel
+    wa_template = get_template(hotel, 'REQUEST_STATUS_UPDATE')
+    if not wa_template or not wa_template.gupshup_template_id:
+        logger.warning(
+            'No active REQUEST_STATUS_UPDATE template for hotel %s — skipping',
+            hotel.pk,
+        )
+        record.status = DeliveryRecord.Status.SKIPPED
+        record.error_message = 'No template configured'
+        record.save(update_fields=['status', 'error_message'])
+        return
+
+    try:
+        params = resolve_template_params(wa_template, context)
+    except ValueError as e:
+        logger.error('Template param resolution failed for delivery %s: %s', delivery_id, e)
+        record.status = DeliveryRecord.Status.FAILED
+        record.error_message = str(e)[:500]
+        record.save(update_fields=['status', 'error_message'])
+        return
+
+    postback_texts = [
+        {"index": 0, "text": f"g_req_view:{record.request.public_id}"},
+    ]
+
+    try:
+        response = http_requests.post(
+            "https://api.gupshup.io/wa/api/v1/template/msg",
+            headers={"apikey": settings.GUPSHUP_WA_API_KEY},
+            data={
+                "channel": "whatsapp",
+                "source": settings.GUPSHUP_WA_SOURCE_PHONE,
+                "destination": record.target,
+                "src.name": settings.GUPSHUP_WA_APP_NAME,
+                "template": json.dumps({
+                    "id": wa_template.gupshup_template_id,
+                    "params": params,
+                }),
+                "postbackTexts": json.dumps(postback_texts),
+            },
+            timeout=10,
+        )
+        status_code = response.status_code
+        if status_code >= 500 or status_code == 429:
+            raise RuntimeError(f"Gupshup server error {status_code}")
+        if status_code >= 400:
+            raise ValueError(f"Gupshup client error {status_code}: {response.text[:200]}")
+
+        data = response.json()
+        if data.get("status") == "error":
+            raise ValueError(f"Gupshup API error: {data.get('message', 'Unknown')}")
+        if not data.get("messageId"):
+            raise ValueError(f"Gupshup response missing messageId: {data}")
+
+        record.provider_message_id = data["messageId"]
+        record.status = DeliveryRecord.Status.SENT
+        record.save(update_fields=["provider_message_id", "status"])
+    except Exception as exc:
+        record.status = DeliveryRecord.Status.FAILED
+        record.error_message = str(exc)[:500]
+        record.save(update_fields=["status", "error_message"])
+        if isinstance(exc, _TRANSIENT_ERRORS):
+            raise self.retry(exc=exc)
+
+
+# ---------------------------------------------------------------------------
 # Email — via Resend API
 # ---------------------------------------------------------------------------
 

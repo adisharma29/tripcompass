@@ -1691,6 +1691,7 @@ class WhatsAppTemplate(models.Model):
         GUEST_RATING_BATCH = 'GUEST_RATING_BATCH', 'Guest Rating Batch'
         GUEST_STAY_SURVEY = 'GUEST_STAY_SURVEY', 'Guest Stay Survey'
         LOW_SCORE_ALERT = 'LOW_SCORE_ALERT', 'Low Score Alert'
+        REQUEST_STATUS_UPDATE = 'REQUEST_STATUS_UPDATE', 'Request Status Update'
 
     # null hotel = global default (used when hotel has no custom template)
     hotel = models.ForeignKey(
