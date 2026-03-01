@@ -8,7 +8,7 @@ def seed_template(apps, schema_editor):
         template_type='REQUEST_STATUS_UPDATE',
         is_active=True,
         defaults={
-            'gupshup_template_id': '',
+            'gupshup_template_id': 'fd1f77b3-8e6c-45e9-8bc1-b0765bb6d901',
             'name': 'Request Status Update - Default',
             'body_text': (
                 "Hi {{1}}, here's an update on your request.\n\n"
