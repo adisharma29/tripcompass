@@ -22,6 +22,7 @@ from concierge.models import (
     DeliveryRecord,
     Event,
     Experience,
+    GuestInvite,
     GuestStay,
     Hotel,
     HotelMembership,
@@ -628,6 +629,93 @@ class WebhookDeliveryStatusTest(NotificationSetupMixin, TestCase):
         handle_message_event({
             'payload': {'gsId': 'nonexistent', 'type': 'delivered'},
         })
+
+
+@override_settings(GUPSHUP_WA_API_KEY='test-key')
+class WebhookDeliverySSETest(NotificationSetupMixin, TestCase):
+    """Tests for SSE emission and idempotency in delivery status updates."""
+
+    def _make_invite_record(self, status='SENT', msg_id='gs-inv-001'):
+        invite = GuestInvite.objects.create(
+            hotel=self.hotel, guest_phone='919876543210', guest_name='Test',
+            expires_at=timezone.now() + timedelta(hours=48),
+        )
+        record = DeliveryRecord.objects.create(
+            hotel=self.hotel, channel='WHATSAPP', target='919876543210',
+            event_type='guest_invite', message_type='TEMPLATE',
+            status=status, provider_message_id=msg_id,
+            guest_invite=invite,
+        )
+        return invite, record
+
+    @patch('concierge.notifications.webhook.publish_invite_event')
+    @patch('concierge.notifications.webhook.transaction.on_commit', lambda fn: fn())
+    def test_invite_delivery_emits_sse(self, mock_publish):
+        """Delivery status update for invite-linked record should emit SSE."""
+        from concierge.notifications.webhook import handle_message_event
+
+        invite, record = self._make_invite_record()
+
+        handle_message_event({
+            'payload': {'gsId': 'gs-inv-001', 'type': 'delivered'},
+        })
+
+        record.refresh_from_db()
+        self.assertEqual(record.status, 'DELIVERED')
+        mock_publish.assert_called_once_with(
+            self.hotel.id, record.id, invite.id, 'DELIVERED',
+        )
+
+    @patch('concierge.notifications.webhook.publish_invite_event')
+    def test_non_invite_delivery_no_sse(self, mock_publish):
+        """Delivery status update for non-invite record should NOT emit SSE."""
+        from concierge.notifications.webhook import handle_message_event
+
+        DeliveryRecord.objects.create(
+            hotel=self.hotel, channel='WHATSAPP', target='919876543210',
+            event_type='request.created', status='SENT',
+            provider_message_id='gs-req-001',
+        )
+
+        handle_message_event({
+            'payload': {'gsId': 'gs-req-001', 'type': 'delivered'},
+        })
+
+        mock_publish.assert_not_called()
+
+    @patch('concierge.notifications.webhook.publish_invite_event')
+    def test_idempotent_same_status_skips_update_and_sse(self, mock_publish):
+        """Repeated webhook with same status should skip update and SSE."""
+        from concierge.notifications.webhook import handle_message_event
+
+        _invite, record = self._make_invite_record(status='DELIVERED')
+
+        handle_message_event({
+            'payload': {'gsId': 'gs-inv-001', 'type': 'delivered'},
+        })
+
+        mock_publish.assert_not_called()
+
+    @patch('concierge.notifications.webhook.publish_invite_event')
+    def test_repeated_failure_updates_error_message(self, mock_publish):
+        """Repeated FAILED webhook with new error info should update error_message."""
+        from concierge.notifications.webhook import handle_message_event
+
+        _invite, record = self._make_invite_record(status='FAILED', msg_id='gs-inv-err')
+        record.error_message = '470: Old reason'
+        record.save(update_fields=['error_message'])
+
+        handle_message_event({
+            'payload': {
+                'gsId': 'gs-inv-err', 'type': 'failed',
+                'code': '471', 'reason': 'New specific reason',
+            },
+        })
+
+        record.refresh_from_db()
+        self.assertIn('471', record.error_message)
+        # Same status — no SSE emit
+        mock_publish.assert_not_called()
 
 
 class WebhookButtonTypeTest(NotificationSetupMixin, TestCase):
