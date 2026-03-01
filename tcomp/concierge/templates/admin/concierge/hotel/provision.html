@@ -1,0 +1,138 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block title %}Provision New Hotel | {{ site_title|default:"Django site admin" }}{% endblock %}
+
+{% block breadcrumbs %}
+  <div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a>
+    &rsaquo; <a href="{% url 'admin:concierge_hotel_changelist' %}">Hotels</a>
+    &rsaquo; Provision New Hotel
+  </div>
+{% endblock %}
+
+{% block extrahead %}
+{{ block.super }}
+<style>
+  .phone-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .phone-row select {
+    width: 120px;
+    flex-shrink: 0;
+  }
+  .phone-row input[type="text"] {
+    flex: 1;
+    min-width: 0;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<form method="post" novalidate>
+  {% csrf_token %}
+
+  {% if form.non_field_errors %}
+  <p class="errornote">
+    {% for error in form.non_field_errors %}
+      {{ error }}{% if not forloop.last %}<br>{% endif %}
+    {% endfor %}
+  </p>
+  {% endif %}
+
+  <fieldset class="module aligned">
+    <h2>Hotel Details</h2>
+    <div class="form-row{% if form.name.errors %} errors{% endif %}">
+      <div>
+        {{ form.name.errors }}
+        <label for="{{ form.name.id_for_label }}" class="required">Name:</label>
+        {{ form.name }}
+        {% if form.name.help_text %}<p class="help">{{ form.name.help_text }}</p>{% endif %}
+      </div>
+    </div>
+    <div class="form-row{% if form.slug.errors %} errors{% endif %}">
+      <div>
+        {{ form.slug.errors }}
+        <label for="{{ form.slug.id_for_label }}">Slug:</label>
+        {{ form.slug }}
+        {% if form.slug.help_text %}<p class="help">{{ form.slug.help_text }}</p>{% endif %}
+      </div>
+    </div>
+    <div class="form-row{% if form.city.errors %} errors{% endif %}">
+      <div>
+        {{ form.city.errors }}
+        <label for="{{ form.city.id_for_label }}">City:</label>
+        {{ form.city }}
+      </div>
+    </div>
+    <div class="form-row{% if form.timezone.errors %} errors{% endif %}">
+      <div>
+        {{ form.timezone.errors }}
+        <label for="{{ form.timezone.id_for_label }}">Timezone:</label>
+        {{ form.timezone }}
+        {% if form.timezone.help_text %}<p class="help">{{ form.timezone.help_text }}</p>{% endif %}
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset class="module aligned">
+    <h2>Owner (First SUPERADMIN)</h2>
+    <div class="description">
+      <p>The owner will be created as SUPERADMIN. If a user with this email or phone
+      already exists, they will be reused (and promoted from GUEST to STAFF if needed).</p>
+    </div>
+    <div class="form-row{% if form.owner_email.errors %} errors{% endif %}">
+      <div>
+        {{ form.owner_email.errors }}
+        <label for="{{ form.owner_email.id_for_label }}">Email:</label>
+        {{ form.owner_email }}
+        {% if form.owner_email.help_text %}<p class="help">{{ form.owner_email.help_text }}</p>{% endif %}
+      </div>
+    </div>
+    <div class="form-row{% if form.owner_phone_number.errors %} errors{% endif %}">
+      <div>
+        {{ form.owner_phone_number.errors }}
+        <label for="{{ form.owner_phone_number.id_for_label }}">Phone:</label>
+        <div class="phone-row">
+          {{ form.owner_phone_code }}
+          {{ form.owner_phone_number }}
+        </div>
+        {% if form.owner_phone_number.help_text %}<p class="help">{{ form.owner_phone_number.help_text }}</p>{% endif %}
+      </div>
+    </div>
+    <div class="form-row{% if form.owner_first_name.errors %} errors{% endif %}">
+      <div>
+        {{ form.owner_first_name.errors }}
+        <label for="{{ form.owner_first_name.id_for_label }}">First name:</label>
+        {{ form.owner_first_name }}
+      </div>
+    </div>
+    <div class="form-row{% if form.owner_last_name.errors %} errors{% endif %}">
+      <div>
+        {{ form.owner_last_name.errors }}
+        <label for="{{ form.owner_last_name.id_for_label }}">Last name:</label>
+        {{ form.owner_last_name }}
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset class="module aligned">
+    <h2>Options</h2>
+    <div class="form-row">
+      <div>
+        <label for="{{ form.send_invite.id_for_label }}">
+          {{ form.send_invite }} Send invite notification
+        </label>
+        {% if form.send_invite.help_text %}<p class="help">{{ form.send_invite.help_text }}</p>{% endif %}
+      </div>
+    </div>
+  </fieldset>
+
+  <div class="submit-row">
+    <input type="submit" value="Provision Hotel" class="default">
+    <a href="{% url 'admin:concierge_hotel_changelist' %}">Cancel</a>
+  </div>
+</form>
+{% endblock %}

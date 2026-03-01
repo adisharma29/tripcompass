@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import zoneinfo
 from datetime import timedelta
 
@@ -1653,11 +1654,14 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
         # Find existing user by email or phone, or create new
         from django.db import IntegrityError
         user = None
+        temp_pw = None
 
         # Look up by email first (staff typically have email)
         if data['email']:
             try:
-                user = User.objects.get(email=data['email'])
+                user = User.objects.get(email__iexact=data['email'])
+            except User.MultipleObjectsReturned:
+                user = User.objects.filter(email__iexact=data['email']).order_by('date_joined').first()
             except User.DoesNotExist:
                 pass
 
@@ -1674,8 +1678,11 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                     pass
 
         if user is not None:
-            # Promote to staff and backfill missing fields
+            # Reactivate, promote to staff, and backfill missing fields
             changed_fields = []
+            if not user.is_active:
+                user.is_active = True
+                changed_fields.append('is_active')
             if user.user_type == 'GUEST':
                 user.user_type = 'STAFF'
                 changed_fields.append('user_type')
@@ -1685,6 +1692,12 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
             if not user.email and data['email']:
                 user.email = data['email']
                 changed_fields.append('email')
+            # Email-only reused user with no usable password — set temp password
+            if data['email'] and not (user.phone or data['phone']) and not user.has_usable_password():
+                temp_pw = secrets.token_urlsafe(12)  # noqa: S105
+                user.set_password(temp_pw)
+                changed_fields.append('password')
+                logger.info('Email-only invite (reused): temp password generated for %s', user.email)
             if changed_fields:
                 try:
                     user.save(update_fields=changed_fields)
@@ -1694,7 +1707,6 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                         status=status.HTTP_400_BAD_REQUEST,
                     )
         else:
-            # Invited staff — no password set. They log in via phone+OTP.
             user = User(
                 email=data['email'],
                 phone=data['phone'],
@@ -1702,7 +1714,15 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                 last_name=data.get('last_name', ''),
                 user_type='STAFF',
             )
-            user.set_unusable_password()
+            if data['email'] and not data['phone']:
+                # Email-only invite: set temp password as break-glass fallback.
+                # Primary onboarding is via set-password link in the invite email.
+                temp_pw = secrets.token_urlsafe(12)  # noqa: S105
+                user.set_password(temp_pw)
+                logger.info('Email-only invite: temp password generated for %s', data['email'])
+            else:
+                # Phone users log in via OTP — no password needed.
+                user.set_unusable_password()
             try:
                 user.save()
             except IntegrityError:
@@ -1735,10 +1755,10 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                 logger.warning('Failed to enqueue staff invite notification (broker down?)', exc_info=True)
         db_transaction.on_commit(_enqueue_invite)
 
-        return Response(
-            MemberSerializer(membership).data,
-            status=status.HTTP_201_CREATED,
-        )
+        resp_data = MemberSerializer(membership).data
+        if temp_pw:
+            resp_data['temp_password'] = temp_pw
+        return Response(resp_data, status=status.HTTP_201_CREATED)
 
 
 class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1756,6 +1776,24 @@ class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
                 distinct=True,
             ),
         )
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        new_role = serializer.validated_data.get('role', instance.role)
+        new_active = serializer.validated_data.get('is_active', instance.is_active)
+
+        # Guard: demoting or deactivating the last active SUPERADMIN
+        if instance.role == 'SUPERADMIN' and (new_role != 'SUPERADMIN' or not new_active):
+            remaining = HotelMembership.objects.filter(
+                hotel=instance.hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=instance.pk).count()
+            if remaining == 0:
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError(
+                    {'detail': 'Cannot demote or deactivate the last active superadmin.'}
+                )
+
+        serializer.save()
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1998,13 +2036,31 @@ class MemberResendInvite(HotelScopedMixin, generics.GenericAPIView):
                     {'detail': f'Please wait {int(remaining.total_seconds())} seconds before resending.'},
                     status=429,
                 )
+        resp_data = {'detail': 'Invite sent.'}
+
+        # Email-only user who has never logged in: (re)generate temp password
+        # so superadmin has a manual fallback if email delivery fails.
+        # Must happen BEFORE enqueuing the task so the invite email token
+        # is minted from the new password hash (avoids race invalidation).
+        user = member.user
+        if user.email and not user.phone and user.last_login is None:
+            temp_pw = secrets.token_urlsafe(12)
+            user.set_password(temp_pw)
+            user.save(update_fields=['password'])
+            resp_data['temp_password'] = temp_pw
+
         from .tasks import send_staff_invite_notification_task
-        send_staff_invite_notification_task.delay(
-            member.user.id, member.hotel.id, member.role,
-        )
+        try:
+            send_staff_invite_notification_task.delay(
+                member.user.id, member.hotel.id, member.role,
+            )
+        except Exception:
+            logger.exception('Failed to enqueue invite task for member %s', member.pk)
+            # Still return temp_password so superadmin has the manual fallback.
+
         member.last_invite_sent_at = timezone.now()
         member.save(update_fields=['last_invite_sent_at'])
-        return Response({'detail': 'Invite sent.'})
+        return Response(resp_data)
 
 
 class MemberSelfView(HotelScopedMixin, generics.RetrieveUpdateAPIView):

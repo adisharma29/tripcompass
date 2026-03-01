@@ -973,8 +973,10 @@ class OTPCode(models.Model):
     class Channel(models.TextChoices):
         WHATSAPP = 'WHATSAPP', 'WhatsApp'
         SMS = 'SMS', 'SMS'
+        EMAIL = 'EMAIL', 'Email'
 
-    phone = models.CharField(max_length=20, db_index=True)
+    phone = models.CharField(max_length=20, blank=True, db_index=True)
+    email = models.CharField(max_length=254, blank=True, db_index=True)
     code_hash = models.CharField(max_length=128)
     hotel = models.ForeignKey(
         Hotel, on_delete=models.CASCADE,
@@ -997,10 +999,12 @@ class OTPCode(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=['phone', 'created_at']),
+            models.Index(fields=['email', 'created_at']),
         ]
 
     def __str__(self):
-        return f'OTP for {self.phone} ({self.channel})'
+        identifier = self.email or self.phone
+        return f'OTP for {identifier} ({self.channel})'
 
 
 class ServiceRequest(models.Model):

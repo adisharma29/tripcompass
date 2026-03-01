@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.middleware.csrf import get_token
+from django.utils import timezone
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -8,6 +9,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .serializers import (
     AuthProfileSerializer, AuthProfileUpdateSerializer,
+    EmailOTPSendSerializer, EmailOTPVerifySerializer,
+    ForgotPasswordSerializer, SetPasswordSerializer,
     OTPSendSerializer, OTPVerifySerializer,
     UserSerializer,
 )
@@ -15,8 +18,11 @@ from .serializers import (
 User = get_user_model()
 
 
-def _set_auth_cookies(response, user):
+def _set_auth_cookies(response, user, *, update_last_login=False):
     """Set httpOnly JWT cookies on the response."""
+    if update_last_login:
+        user.last_login = timezone.now()
+        user.save(update_fields=['last_login'])
     refresh = RefreshToken.for_user(user)
     access_token = str(refresh.access_token)
     refresh_token = str(refresh)
@@ -89,8 +95,10 @@ class CookieTokenObtainPairView(APIView):
             )
 
         try:
-            user = User.objects.get(email=email)
-        except (User.DoesNotExist, User.MultipleObjectsReturned):
+            user = User.objects.get(email__iexact=email)
+        except User.MultipleObjectsReturned:
+            user = User.objects.filter(email__iexact=email).order_by('date_joined').first()
+        except User.DoesNotExist:
             return Response(
                 {'detail': 'Invalid credentials.'},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -110,7 +118,7 @@ class CookieTokenObtainPairView(APIView):
 
         data = AuthProfileSerializer(user).data
         response = Response(data)
-        return _set_auth_cookies(response, user)
+        return _set_auth_cookies(response, user, update_last_login=True)
 
 
 class CookieTokenRefreshView(APIView):
@@ -277,7 +285,160 @@ class OTPVerifyView(APIView):
             data['stay_expires_at'] = stay.expires_at.isoformat()
 
         response = Response(data)
-        return _set_auth_cookies(response, user)
+        return _set_auth_cookies(response, user, update_last_login=True)
+
+
+class EmailOTPSendView(APIView):
+    """Email login step 1. Sends OTP code via email."""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = EmailOTPSendSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data['email'].lower()
+
+        from concierge.services import check_otp_rate_limit_email, check_otp_rate_limit_ip, _hash_ip
+        if not check_otp_rate_limit_email(email, settings.OTP_SEND_RATE_PER_EMAIL, 3600):
+            return Response(
+                {'detail': 'Too many requests. Try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        ip = request.META.get('REMOTE_ADDR', '')
+        if ip:
+            ip_hash = _hash_ip(ip)
+            if not check_otp_rate_limit_ip(ip_hash, settings.OTP_SEND_RATE_PER_IP, 3600):
+                return Response(
+                    {'detail': 'Too many requests. Try again later.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+        from concierge.services import send_email_otp, OTPDeliveryError
+        try:
+            send_email_otp(email, ip_address=ip)
+        except OTPDeliveryError:
+            return Response(
+                {'detail': 'Unable to send verification code. Please try again later.'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # Always return generic message to prevent email enumeration
+        return Response({'detail': 'If this email is registered, a verification code has been sent.'})
+
+
+class EmailOTPVerifyView(APIView):
+    """Email login step 2. Verifies email OTP code, sets auth cookies."""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = EmailOTPVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data['email'].lower()
+        code = serializer.validated_data['code']
+
+        from concierge.services import verify_email_otp
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            user = verify_email_otp(email, code)
+        except (DRFValidationError, DjangoValidationError) as e:
+            detail = e.detail if hasattr(e, 'detail') else e.messages
+            return Response(
+                {'detail': detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            return Response(
+                {'detail': 'Verification failed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = AuthProfileSerializer(user).data
+        response = Response(data)
+        return _set_auth_cookies(response, user, update_last_login=True)
+
+
+class SetPasswordView(APIView):
+    """Set password using a signed token (from invite or reset email)."""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = SetPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        from concierge.services import verify_password_token
+        user = verify_password_token(
+            serializer.validated_data['uid'],
+            serializer.validated_data['token'],
+        )
+        if not user:
+            return Response(
+                {'detail': 'This link has expired or already been used.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not user.is_active:
+            return Response(
+                {'detail': 'Account is disabled.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.set_password(serializer.validated_data['password'])
+        user.save()
+
+        data = AuthProfileSerializer(user).data
+        response = Response(data)
+        return _set_auth_cookies(response, user, update_last_login=True)
+
+
+class ForgotPasswordView(APIView):
+    """Request a password reset email."""
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = ForgotPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data['email'].lower()
+
+        # Rate limit by email
+        from concierge.services import check_otp_rate_limit_email, check_otp_rate_limit_ip, _hash_ip
+        if not check_otp_rate_limit_email(email, settings.OTP_SEND_RATE_PER_EMAIL, 3600):
+            return Response(
+                {'detail': 'Too many requests. Try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        ip = request.META.get('REMOTE_ADDR', '')
+        if ip:
+            ip_hash = _hash_ip(ip)
+            if not check_otp_rate_limit_ip(ip_hash, settings.OTP_SEND_RATE_PER_IP, 3600):
+                return Response(
+                    {'detail': 'Too many requests. Try again later.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+        # Create a tracking row so DB-fallback rate limiting works when Redis is down.
+        from concierge.models import OTPCode
+        from concierge.services import _hash_ip
+        OTPCode.objects.create(
+            email=email,
+            code_hash='',
+            channel=OTPCode.Channel.EMAIL,
+            ip_hash=_hash_ip(ip) if ip else '',
+            is_used=True,   # not a real OTP — just a counter row
+            expires_at=timezone.now(),
+        )
+
+        # Look up staff user — send email if found, silent no-op if not
+        user = User.objects.filter(email__iexact=email, user_type='STAFF', is_active=True).order_by('date_joined').first()
+        if user:
+            from concierge.services import send_password_reset_email
+            send_password_reset_email(user)
+
+        # Always return generic message to prevent email enumeration
+        return Response({'detail': 'If this email is registered, a reset link has been sent.'})
 
 
 class AuthProfileView(generics.RetrieveUpdateAPIView):
@@ -470,7 +631,7 @@ def verify_wa_invite(request, token):
     # Issue JWT + redirect (outside atomic — cookies don't need rollback)
     redirect_url = f'{settings.FRONTEND_ORIGIN}/h/{invite.hotel.slug}/'
     response = HttpResponseRedirect(redirect_url)
-    _set_auth_cookies(response, user)
+    _set_auth_cookies(response, user, update_last_login=True)
     return response
 
 

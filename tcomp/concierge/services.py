@@ -15,7 +15,10 @@ import requests as http_requests
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
+from django.contrib.auth.tokens import default_token_generator
 from django.core.signing import TimestampSigner
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q
@@ -472,6 +475,183 @@ def check_otp_rate_limit_ip(ip_hash, limit, window_seconds):
     cutoff = timezone.now() - timedelta(seconds=window_seconds)
     count = OTPCode.objects.filter(ip_hash=ip_hash, created_at__gte=cutoff).count()
     return count < limit
+
+
+def check_otp_rate_limit_email(email, limit, window_seconds):
+    """Rate limit OTP sends per email, with DB fallback."""
+    key = f'ratelimit:otp:email:{email}'
+    result = check_rate_limit(key, limit, window_seconds)
+    if result is not None:
+        return result
+    cutoff = timezone.now() - timedelta(seconds=window_seconds)
+    count = OTPCode.objects.filter(email=email, created_at__gte=cutoff).count()
+    return count < limit
+
+
+def send_email_otp(email, ip_address=''):
+    """Generate OTP, store hashed, send via email.
+
+    Silently succeeds even if no staff user exists with this email
+    (prevents email enumeration).
+    """
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+
+    # Check if a staff user exists with this email — if not, create a tracking
+    # row for DB-fallback rate limiting and silently return.
+    user = User.objects.filter(email__iexact=email, user_type='STAFF').order_by('date_joined').first()
+    if not user:
+        logger.info('Email OTP requested for non-existent staff email %s — silent no-op', email)
+        OTPCode.objects.create(
+            email=email.lower(),
+            code_hash='',
+            channel=OTPCode.Channel.EMAIL,
+            ip_hash=_hash_ip(ip_address) if ip_address else '',
+            is_used=True,
+            expires_at=timezone.now(),
+        )
+        return None
+
+    code = generate_otp_code()
+    now = timezone.now()
+    expires = now + timedelta(seconds=settings.OTP_EXPIRY_SECONDS)
+
+    if settings.DEBUG:
+        logger.info('DEV EMAIL OTP for %s: %s', email, code)
+
+    otp = OTPCode.objects.create(
+        email=email.lower(),
+        code_hash=_hash_code(code),
+        channel=OTPCode.Channel.EMAIL,
+        ip_hash=_hash_ip(ip_address) if ip_address else '',
+        expires_at=expires,
+    )
+
+    # In DEBUG mode, skip delivery unless Resend key is configured
+    if settings.DEBUG and not settings.RESEND_API_KEY:
+        return otp
+
+    success = _send_otp_email(email, code)
+    if not success:
+        otp.is_used = True
+        otp.save(update_fields=['is_used'])
+        raise OTPDeliveryError('Unable to send verification code. Please try again later.')
+
+    return otp
+
+
+def _send_otp_email(email, code):
+    """Send OTP code via Resend email. Returns True on success."""
+    api_key = settings.RESEND_API_KEY
+    if not api_key:
+        logger.warning('Resend API key not configured, skipping email OTP')
+        return False
+
+    import resend
+    resend.api_key = api_key
+
+    html = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
+      <h2 style="color: #1a1a1a; font-size: 22px; margin-bottom: 8px;">Your verification code</h2>
+      <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 24px;">
+        Use the code below to log in to your Refuje dashboard.
+        This code expires in 10 minutes.
+      </p>
+      <div style="background: #f5f5f5; border-radius: 8px; padding: 20px; text-align: center; margin-bottom: 24px;">
+        <span style="font-size: 32px; font-weight: 700; letter-spacing: 6px; color: #1a1a1a;">{code}</span>
+      </div>
+      <p style="color: #888; font-size: 13px; line-height: 1.5;">
+        If you didn't request this code, you can safely ignore this email.
+      </p>
+      <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
+      <p style="color: #aaa; font-size: 12px;">Powered by Refuje</p>
+    </div>
+    """
+
+    from resend.exceptions import (
+        ValidationError, MissingRequiredFieldsError,
+        MissingApiKeyError, InvalidApiKeyError,
+    )
+    _PERMANENT = (ValidationError, MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError)
+
+    try:
+        response = resend.Emails.send({
+            'from': settings.RESEND_FROM_EMAIL,
+            'to': [email],
+            'subject': 'Your Refuje verification code',
+            'html': html,
+            'tags': [
+                {'name': 'type', 'value': 'email_otp'},
+            ],
+        })
+        logger.info('Email OTP sent to %s (id=%s)', email, response.get('id'))
+        return True
+    except _PERMANENT as exc:
+        logger.warning('Email OTP permanently rejected for %s: %s', email, exc)
+        return False
+    except Exception as exc:
+        logger.error('Email OTP delivery failed for %s: %s', email, exc)
+        return False
+
+
+def verify_email_otp(email, code):
+    """Verify email OTP code. Returns user or raises ValidationError.
+
+    Staff-only: rejects if user has no active staff membership.
+    """
+    from django.contrib.auth import get_user_model
+    from rest_framework.exceptions import ValidationError
+
+    User = get_user_model()
+    now = timezone.now()
+
+    otp_error = None
+
+    with transaction.atomic():
+        otp_qs = OTPCode.objects.select_for_update().filter(
+            email=email.lower(),
+            channel=OTPCode.Channel.EMAIL,
+            is_used=False,
+            expires_at__gt=now,
+            attempts__lt=settings.OTP_MAX_ATTEMPTS,
+        )
+
+        otp = otp_qs.order_by('-created_at').first()
+
+        if not otp:
+            raise ValidationError('Invalid or expired code.')
+
+        if _hash_code(code) != otp.code_hash:
+            OTPCode.objects.filter(pk=otp.pk).update(attempts=F('attempts') + 1)
+            new_attempts = OTPCode.objects.filter(pk=otp.pk).values_list('attempts', flat=True).first()
+            if new_attempts >= settings.OTP_MAX_ATTEMPTS:
+                otp_error = 'Too many attempts. Please request a new code.'
+            else:
+                otp_error = 'Invalid code.'
+
+    if otp_error:
+        raise ValidationError(otp_error)
+
+    with transaction.atomic():
+        otp = OTPCode.objects.select_for_update().filter(
+            pk=otp.pk, is_used=False,
+        ).first()
+        if not otp:
+            raise ValidationError('Invalid or expired code.')
+
+        user = User.objects.filter(email__iexact=email, user_type='STAFF').order_by('date_joined').first()
+        if not user:
+            raise ValidationError('No staff account found for this email.')
+        if not user.is_active:
+            raise ValidationError('Account is disabled.')
+
+        # Verify user has at least one active hotel membership
+        if not HotelMembership.objects.filter(user=user, is_active=True).exists():
+            raise ValidationError('No active hotel membership found.')
+
+        otp.is_used = True
+        otp.save(update_fields=['is_used'])
+        return user
 
 
 def check_stay_rate_limit(stay):
@@ -1124,8 +1304,34 @@ def send_staff_invite_whatsapp(phone, first_name, hotel_name, role_display):
     return False
 
 
-def send_staff_invite_email(email, first_name, hotel_name, role_display):
-    """Send email invitation to newly added staff member via Resend."""
+def generate_password_token(user):
+    """Generate a uid + token pair for set-password / reset-password flows.
+
+    Uses Django's PasswordResetTokenGenerator — the token is HMAC-signed
+    against user.pk + password hash + last_login, so it auto-invalidates
+    the moment the user sets/changes their password.
+    """
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    return uid, token
+
+
+def verify_password_token(uidb64, token):
+    """Verify a password-set/reset token. Returns user or None."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    try:
+        uid = force_str(urlsafe_base64_decode(uidb64))
+        user = User.objects.get(pk=uid)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        return None
+    if default_token_generator.check_token(user, token):
+        return user
+    return None
+
+
+def send_staff_invite_email(user, hotel_name, role_display):
+    """Send email invitation with set-password link to newly added staff member."""
     api_key = settings.RESEND_API_KEY
     if not api_key:
         logger.warning('Staff invite email skipped: missing RESEND_API_KEY')
@@ -1134,8 +1340,10 @@ def send_staff_invite_email(email, first_name, hotel_name, role_display):
     import resend
     resend.api_key = api_key
 
-    login_url = 'https://refuje.com/login'
-    greeting = first_name or 'there'
+    uid, token = generate_password_token(user)
+    set_password_url = f'{settings.FRONTEND_ORIGIN}/set-password?uid={uid}&token={token}'
+    greeting = user.first_name or 'there'
+    email = user.email
 
     html = f"""
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
@@ -1143,15 +1351,14 @@ def send_staff_invite_email(email, first_name, hotel_name, role_display):
       <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 20px;">
         Hi {greeting}, the team at <strong>{hotel_name}</strong> has added you as
         <strong>{role_display}</strong> on their concierge platform.
-        You can now view and manage guest requests from your dashboard.
+        Set up your password to get started.
       </p>
-      <a href="{login_url}"
+      <a href="{set_password_url}"
          style="display: inline-block; background: #1a1a1a; color: #ffffff; text-decoration: none;
                 padding: 12px 28px; border-radius: 6px; font-size: 15px; font-weight: 500;">
-        Log In to Your Dashboard
+        Set Up Your Password
       </a>
       <p style="color: #888; font-size: 13px; margin-top: 28px; line-height: 1.5;">
-        Use your phone number or email to log in.
         If you didn't expect this invitation, you can safely ignore this email.
       </p>
       <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
@@ -1188,6 +1395,67 @@ def send_staff_invite_email(email, first_name, hotel_name, role_display):
     # transient ResendError subclasses, network/DNS errors) propagate → Celery retry.
 
 
+def send_password_reset_email(user):
+    """Send password reset email with token link."""
+    api_key = settings.RESEND_API_KEY
+    if not api_key:
+        logger.warning('Password reset email skipped: missing RESEND_API_KEY')
+        return False
+
+    import resend
+    resend.api_key = api_key
+
+    uid, token = generate_password_token(user)
+    reset_url = f'{settings.FRONTEND_ORIGIN}/reset-password?uid={uid}&token={token}'
+    greeting = user.first_name or 'there'
+
+    html = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
+      <h2 style="color: #1a1a1a; font-size: 22px; margin-bottom: 8px;">Reset your password</h2>
+      <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 20px;">
+        Hi {greeting}, we received a request to reset your Refuje password.
+        Click the button below to choose a new password.
+      </p>
+      <a href="{reset_url}"
+         style="display: inline-block; background: #1a1a1a; color: #ffffff; text-decoration: none;
+                padding: 12px 28px; border-radius: 6px; font-size: 15px; font-weight: 500;">
+        Reset Password
+      </a>
+      <p style="color: #888; font-size: 13px; margin-top: 28px; line-height: 1.5;">
+        If you didn't request this, you can safely ignore this email.
+        This link will expire when your password is changed.
+      </p>
+      <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
+      <p style="color: #aaa; font-size: 12px;">Powered by Refuje</p>
+    </div>
+    """
+
+    from resend.exceptions import (
+        ValidationError as ResendValidationError,
+        MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError,
+    )
+    _PERMANENT = (ResendValidationError, MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError)
+
+    try:
+        response = resend.Emails.send({
+            'from': settings.RESEND_FROM_EMAIL,
+            'to': [user.email],
+            'subject': 'Reset your Refuje password',
+            'html': html,
+            'tags': [
+                {'name': 'type', 'value': 'password_reset'},
+            ],
+        })
+        logger.info('Password reset email sent to %s (id=%s)', user.email, response.get('id'))
+        return True
+    except _PERMANENT as exc:
+        logger.warning('Password reset email permanently rejected for %s: %s', user.email, exc)
+        return False
+    except Exception as exc:
+        logger.error('Password reset email failed for %s: %s', user.email, exc)
+        return False
+
+
 def send_staff_invite_notification(user, hotel, role, *, skip_channels=None):
     """Send invitation notifications to a newly added staff member.
 
@@ -1219,7 +1487,7 @@ def send_staff_invite_notification(user, hotel, role, *, skip_channels=None):
 
     if user.email and 'email' not in skip:
         try:
-            send_staff_invite_email(user.email, first_name, hotel_name, role_display)
+            send_staff_invite_email(user, hotel_name, role_display)
             # True = sent, False = permanent Resend rejection
             resolved.add('email')
         except Exception as exc:
@@ -1301,6 +1569,7 @@ LOW_SCORE_ALERT_CONTEXT_BUILDERS = {
     'guest_summary': lambda ctx: ctx['guest_summary'],
     'rating_detail': lambda ctx: ctx['rating_detail'],
     'feedback_preview': lambda ctx: ctx['feedback_preview'],
+    'dashboard_path': lambda ctx: ctx['dashboard_path'],
 }
 
 

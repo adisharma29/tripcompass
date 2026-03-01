@@ -83,6 +83,25 @@ class AuthProfileUpdateSerializer(serializers.ModelSerializer):
         return digits
 
 
+class EmailOTPSendSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class EmailOTPVerifySerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    code = serializers.CharField(max_length=10, write_only=True)
+
+
+class SetPasswordSerializer(serializers.Serializer):
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    password = serializers.CharField(min_length=8, write_only=True)
+
+
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
 class OTPSendSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=20)
     hotel_slug = serializers.CharField(required=False, allow_blank=True, default='')

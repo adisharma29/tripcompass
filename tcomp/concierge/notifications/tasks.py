@@ -560,12 +560,12 @@ def send_rating_whatsapp_task(self, hotel_id, guest_id, prompt_ids, batch_key):
         return  # Already sent
 
     # Build params — rate_url_suffix is the dynamic CTA button suffix
-    # appended to the base URL (https://refuje.com/h/) at send time.
+    # appended to the base URL (https://refuje.com/) configured in Gupshup.
     context = {
         'guest_name': guest_name,
         'hotel_name': hotel.name,
         'experience_count': len(prompt_ids),
-        'rate_url_suffix': f'{hotel.slug}/rate',
+        'rate_url_suffix': f'h/{hotel.slug}/rate',
     }
     template_params = resolve_template_params(wa_template, context)
 
@@ -678,7 +678,7 @@ def send_stay_survey_whatsapp_task(self, hotel_id, guest_id, prompt_id):
     context = {
         'guest_name': guest_name,
         'hotel_name': hotel.name,
-        'rate_url_suffix': f'{hotel.slug}/rate?type=stay',
+        'rate_url_suffix': f'h/{hotel.slug}/rate?type=stay',
     }
     template_params = resolve_template_params(wa_template, context)
 
@@ -886,6 +886,7 @@ def send_low_score_whatsapp_task(self, hotel_id, rating_id):
         'guest_summary': guest_summary,
         'rating_detail': rating_detail,
         'feedback_preview': (rating.feedback or 'No feedback')[:100],
+        'dashboard_path': 'dashboard/ratings',
     }
     template_params = resolve_template_params(wa_template, context)
 
