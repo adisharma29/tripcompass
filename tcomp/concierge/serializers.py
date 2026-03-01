@@ -2158,7 +2158,7 @@ class SendInviteSerializer(serializers.Serializer):
     """Write serializer for creating a guest invite."""
     phone = serializers.CharField(max_length=20)
     guest_name = serializers.CharField(max_length=100)
-    room_number = serializers.CharField(max_length=20, required=False, default='')
+    room_number = serializers.CharField(max_length=20, required=False, allow_blank=True, default='')
 
     def validate_phone(self, value):
         digits = re.sub(r'\D', '', value)
