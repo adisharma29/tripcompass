@@ -2007,6 +2007,7 @@ class NotificationRouteSerializer(serializers.ModelSerializer):
     special_request_offering = serializers.PrimaryKeyRelatedField(
         queryset=SpecialRequestOffering.objects.all(), required=False, allow_null=True,
     )
+    target = serializers.CharField(required=False, allow_blank=True)
     member_name = serializers.SerializerMethodField()
     department_name = serializers.SerializerMethodField()
     experience_name = serializers.SerializerMethodField()
