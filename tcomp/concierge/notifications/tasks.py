@@ -306,7 +306,7 @@ def send_guest_invite_whatsapp(self, delivery_id):
 
     # Build signed URL → create short link (sent later via session message, not in template)
     token = generate_invite_token(invite.id, invite.token_version)
-    verify_url = f'{settings.API_ORIGIN}/api/v1/auth/wa-invite/{token}/'
+    verify_url = f'{settings.FRONTEND_ORIGIN}/wa-invite/{token}'
     short_link = ShortLink.objects.create_for_url(
         target_url=verify_url,
         expires_at=invite.expires_at,
