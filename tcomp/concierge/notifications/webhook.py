@@ -385,7 +385,7 @@ def _handle_invite_postback(postback, payload, now):
             is_active=True,
         ).first()
         if short_link:
-            link_url = f'{settings.API_ORIGIN}/s/{short_link.code}'
+            link_url = f'{settings.FRONTEND_ORIGIN}/s/{short_link.code}'
             try:
                 _send_session_text(
                     source_phone,
