@@ -280,7 +280,8 @@ def handle_message_event(payload):
     if new_status == DeliveryRecord.Status.DELIVERED:
         update_fields["delivered_at"] = timezone.now()
     elif new_status == DeliveryRecord.Status.FAILED:
-        error = payload.get("payload", {})
+        inner = payload.get("payload", {})
+        error = inner.get("payload", {}) if isinstance(inner.get("payload"), dict) else inner
         update_fields["error_message"] = f"{error.get('code', '')}: {error.get('reason', '')}"[:500]
 
     DeliveryRecord.objects.filter(
