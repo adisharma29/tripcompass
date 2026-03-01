@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'location',
     'guides',
     'concierge',
+    'shortlinks',
 ]
 
 MIDDLEWARE = [
@@ -200,6 +201,7 @@ OTP_EXPIRY_SECONDS = 600   # 10 minutes
 OTP_CODE_LENGTH = 6
 OTP_MAX_ATTEMPTS = 5
 OTP_SEND_RATE_PER_PHONE = 3
+OTP_SEND_RATE_PER_EMAIL = 3
 OTP_SEND_RATE_PER_IP = 5
 
 # SSE (Server-Sent Events via Redis pub/sub)
@@ -211,6 +213,12 @@ ESCALATION_TIER_MINUTES = [15, 30, 60]
 
 # Frontend origin (used for QR target_url generation)
 FRONTEND_ORIGIN = config('FRONTEND_ORIGIN', default='http://localhost:6001')
+
+# API origin (used for invite verify URLs, short links)
+API_ORIGIN = config('API_ORIGIN', default='http://localhost:8000')
+
+# Guest invite settings
+GUEST_INVITE_EXPIRY_HOURS = config('GUEST_INVITE_EXPIRY_HOURS', default=72, cast=int)
 
 # --- Celery ---
 CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')
@@ -263,6 +271,18 @@ CELERY_BEAT_SCHEDULE = {
     'cleanup-orphaned-content-images': {
         'task': 'concierge.tasks.cleanup_orphaned_content_images_task',
         'schedule': 7 * 24 * 60 * 60,  # weekly
+    },
+    'queue-rating-prompts': {
+        'task': 'concierge.tasks.queue_rating_prompts_task',
+        'schedule': 15 * 60,  # every 15 minutes
+    },
+    'send-rating-batches': {
+        'task': 'concierge.tasks.send_rating_batches_task',
+        'schedule': 15 * 60,  # every 15 minutes
+    },
+    'expire-stale-prompts': {
+        'task': 'concierge.tasks.expire_stale_prompts_task',
+        'schedule': 24 * 60 * 60,  # daily
     },
 }
 CELERY_TASK_ACKS_LATE = True

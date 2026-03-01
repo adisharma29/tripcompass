@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import zoneinfo
 from datetime import timedelta
 
@@ -26,10 +27,10 @@ from .filters import ServiceRequestFilter
 from .mixins import HotelScopedMixin
 from .models import (
     BookingEmailTemplate, ContentStatus, Department, DepartmentImage,
-    Event, EventImage, Experience,
-    ExperienceImage, GuestStay, Hotel, HotelInfoSection, HotelMembership,
-    Notification, NotificationRoute, PushSubscription, QRCode, QRScanDaily,
-    ServiceRequest, RequestActivity,
+    DeliveryRecord, Event, EventImage, Experience,
+    ExperienceImage, GuestInvite, GuestStay, Hotel, HotelInfoSection,
+    HotelMembership, Notification, NotificationRoute, PushSubscription,
+    QRCode, QRScanDaily, Rating, RatingPrompt, ServiceRequest, RequestActivity,
     SpecialRequestOffering, SpecialRequestOfferingImage,
 )
 from .permissions import (
@@ -43,23 +44,29 @@ from .serializers import (
     EventImageSerializer, EventPublicSerializer, EventSerializer,
     ExperienceImageSerializer,
     ExperiencePublicSerializer, ExperienceSerializer, TopDealSerializer,
-    GuestStaySerializer, GuestStayUpdateSerializer,
+    GuestInviteSerializer, GuestStaySerializer, GuestStayUpdateSerializer,
     HotelInfoSectionSerializer, HotelPublicSerializer,
     HotelSettingsSerializer, MemberCreateSerializer,
     MemberSelfSerializer, MemberSerializer,
     MergeMemberSerializer, TransferMemberSerializer,
     NotificationRouteSerializer, NotificationSerializer,
     PushSubscriptionSerializer, QRCodeSerializer,
+    SendInviteSerializer,
     ServiceRequestCreateSerializer, ServiceRequestDetailSerializer,
     ServiceRequestListSerializer, ServiceRequestUpdateSerializer,
     SpecialRequestOfferingSerializer, SpecialRequestOfferingPublicSerializer,
     SpecialRequestOfferingImageSerializer,
+    RatingSerializer, RatingPromptSerializer, StayPromptSerializer,
+    SubmitRatingSerializer, AdminRatingSerializer, RatingSummarySerializer,
+    SendSurveySerializer,
 )
 from .notifications import NotificationEvent, dispatch_notification
 from .services import (
+    check_invite_rate_limit_hotel, check_invite_rate_limit_phone,
+    check_invite_rate_limit_staff, check_invite_resend_rate_limit,
     check_room_rate_limit, check_stay_rate_limit,
     compute_response_due_at, generate_qr,
-    get_dashboard_stats, handle_wa_delivery_event,
+    get_dashboard_stats, get_template, handle_wa_delivery_event,
     is_department_after_hours,
     publish_request_event, stream_request_events,
 )
@@ -523,11 +530,18 @@ class MyRequestsList(generics.ListAPIView):
         return super().list(request, *args, **kwargs)
 
     def get_queryset(self):
+        from django.db.models import OuterRef, Subquery
         qs = ServiceRequest.objects.filter(
             guest_stay__guest=self.request.user,
         ).select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
             'special_request_offering',
+        ).annotate(
+            _rating_score=Subquery(
+                Rating.objects.filter(
+                    service_request=OuterRef('pk'),
+                ).values('score')[:1]
+            ),
         ).order_by('-created_at')
         hotel_slug = self.request.query_params.get('hotel')
         if hotel_slug:
@@ -550,9 +564,16 @@ class ServiceRequestList(HotelScopedMixin, generics.ListAPIView):
     ordering_fields = ['created_at', 'updated_at', 'status']
 
     def get_queryset(self):
+        from django.db.models import OuterRef, Subquery
         qs = super().get_queryset().select_related(
             'department', 'experience', 'event', 'guest_stay__guest',
             'special_request_offering',
+        ).annotate(
+            _rating_score=Subquery(
+                Rating.objects.filter(
+                    service_request=OuterRef('pk'),
+                ).values('score')[:1]
+            ),
         )
         membership = getattr(self.request, 'membership', None)
         if membership and membership.role == HotelMembership.Role.STAFF:
@@ -596,8 +617,16 @@ class ServiceRequestDetail(HotelScopedMixin, generics.RetrieveUpdateAPIView):
 
         if new_status:
             if new_status == ServiceRequest.Status.CONFIRMED:
-                instance.confirmed_at = timezone.now()
-                instance.save(update_fields=['confirmed_at'])
+                now = timezone.now()
+                instance.confirmed_at = now
+                update_fields = ['confirmed_at']
+                # Set rating eligibility if ratings enabled
+                hotel = instance.hotel
+                if hotel.ratings_enabled and instance.guest_stay_id:
+                    delay = timedelta(hours=hotel.rating_delay_hours)
+                    instance.rating_prompt_eligible_at = now + delay
+                    update_fields.append('rating_prompt_eligible_at')
+                instance.save(update_fields=update_fields)
 
             action = (
                 RequestActivity.Action.CONFIRMED
@@ -1625,11 +1654,14 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
         # Find existing user by email or phone, or create new
         from django.db import IntegrityError
         user = None
+        temp_pw = None
 
         # Look up by email first (staff typically have email)
         if data['email']:
             try:
-                user = User.objects.get(email=data['email'])
+                user = User.objects.get(email__iexact=data['email'])
+            except User.MultipleObjectsReturned:
+                user = User.objects.filter(email__iexact=data['email']).order_by('date_joined').first()
             except User.DoesNotExist:
                 pass
 
@@ -1646,8 +1678,11 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                     pass
 
         if user is not None:
-            # Promote to staff and backfill missing fields
+            # Reactivate, promote to staff, and backfill missing fields
             changed_fields = []
+            if not user.is_active:
+                user.is_active = True
+                changed_fields.append('is_active')
             if user.user_type == 'GUEST':
                 user.user_type = 'STAFF'
                 changed_fields.append('user_type')
@@ -1657,6 +1692,12 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
             if not user.email and data['email']:
                 user.email = data['email']
                 changed_fields.append('email')
+            # Email-only reused user with no usable password — set temp password
+            if data['email'] and not (user.phone or data['phone']) and not user.has_usable_password():
+                temp_pw = secrets.token_urlsafe(12)  # noqa: S105
+                user.set_password(temp_pw)
+                changed_fields.append('password')
+                logger.info('Email-only invite (reused): temp password generated for %s', user.email)
             if changed_fields:
                 try:
                     user.save(update_fields=changed_fields)
@@ -1666,7 +1707,6 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                         status=status.HTTP_400_BAD_REQUEST,
                     )
         else:
-            # Invited staff — no password set. They log in via phone+OTP.
             user = User(
                 email=data['email'],
                 phone=data['phone'],
@@ -1674,7 +1714,15 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                 last_name=data.get('last_name', ''),
                 user_type='STAFF',
             )
-            user.set_unusable_password()
+            if data['email'] and not data['phone']:
+                # Email-only invite: set temp password as break-glass fallback.
+                # Primary onboarding is via set-password link in the invite email.
+                temp_pw = secrets.token_urlsafe(12)  # noqa: S105
+                user.set_password(temp_pw)
+                logger.info('Email-only invite: temp password generated for %s', data['email'])
+            else:
+                # Phone users log in via OTP — no password needed.
+                user.set_unusable_password()
             try:
                 user.save()
             except IntegrityError:
@@ -1707,10 +1755,10 @@ class MemberList(HotelScopedMixin, generics.ListCreateAPIView):
                 logger.warning('Failed to enqueue staff invite notification (broker down?)', exc_info=True)
         db_transaction.on_commit(_enqueue_invite)
 
-        return Response(
-            MemberSerializer(membership).data,
-            status=status.HTTP_201_CREATED,
-        )
+        resp_data = MemberSerializer(membership).data
+        if temp_pw:
+            resp_data['temp_password'] = temp_pw
+        return Response(resp_data, status=status.HTTP_201_CREATED)
 
 
 class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1728,6 +1776,24 @@ class MemberDetail(HotelScopedMixin, generics.RetrieveUpdateDestroyAPIView):
                 distinct=True,
             ),
         )
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        new_role = serializer.validated_data.get('role', instance.role)
+        new_active = serializer.validated_data.get('is_active', instance.is_active)
+
+        # Guard: demoting or deactivating the last active SUPERADMIN
+        if instance.role == 'SUPERADMIN' and (new_role != 'SUPERADMIN' or not new_active):
+            remaining = HotelMembership.objects.filter(
+                hotel=instance.hotel, role='SUPERADMIN', is_active=True,
+            ).exclude(pk=instance.pk).count()
+            if remaining == 0:
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError(
+                    {'detail': 'Cannot demote or deactivate the last active superadmin.'}
+                )
+
+        serializer.save()
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1970,13 +2036,31 @@ class MemberResendInvite(HotelScopedMixin, generics.GenericAPIView):
                     {'detail': f'Please wait {int(remaining.total_seconds())} seconds before resending.'},
                     status=429,
                 )
+        resp_data = {'detail': 'Invite sent.'}
+
+        # Email-only user who has never logged in: (re)generate temp password
+        # so superadmin has a manual fallback if email delivery fails.
+        # Must happen BEFORE enqueuing the task so the invite email token
+        # is minted from the new password hash (avoids race invalidation).
+        user = member.user
+        if user.email and not user.phone and user.last_login is None:
+            temp_pw = secrets.token_urlsafe(12)
+            user.set_password(temp_pw)
+            user.save(update_fields=['password'])
+            resp_data['temp_password'] = temp_pw
+
         from .tasks import send_staff_invite_notification_task
-        send_staff_invite_notification_task.delay(
-            member.user.id, member.hotel.id, member.role,
-        )
+        try:
+            send_staff_invite_notification_task.delay(
+                member.user.id, member.hotel.id, member.role,
+            )
+        except Exception:
+            logger.exception('Failed to enqueue invite task for member %s', member.pk)
+            # Still return temp_password so superadmin has the manual fallback.
+
         member.last_invite_sent_at = timezone.now()
         member.save(update_fields=['last_invite_sent_at'])
-        return Response({'detail': 'Invite sent.'})
+        return Response(resp_data)
 
 
 class MemberSelfView(HotelScopedMixin, generics.RetrieveUpdateAPIView):
@@ -2145,6 +2229,283 @@ class MyRequestDetail(generics.RetrieveAPIView):
 
 
 # ---------------------------------------------------------------------------
+# Guest Invite — Admin endpoints
+# ---------------------------------------------------------------------------
+
+class GuestInviteListCreate(HotelScopedMixin, generics.ListCreateAPIView):
+    """
+    GET  — List sent invites (paginated, filterable by status/delivery_status)
+    POST — Send a new WhatsApp invite
+    """
+    permission_classes = [IsAdminOrAbove]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return SendInviteSerializer
+        return GuestInviteSerializer
+
+    def get_queryset(self):
+        from django.db.models import OuterRef, Subquery
+
+        hotel = self.get_hotel()
+        qs = (
+            GuestInvite.objects
+            .filter(hotel=hotel)
+            .select_related('sent_by')
+            .order_by('-created_at')
+        )
+
+        # Annotate latest delivery status + error via Subquery
+        latest_delivery_base = (
+            DeliveryRecord.objects
+            .filter(guest_invite=OuterRef('pk'))
+            .order_by('-created_at')
+        )
+        qs = qs.annotate(
+            delivery_status=Subquery(latest_delivery_base.values('status')[:1]),
+            delivery_error=Subquery(latest_delivery_base.values('error_message')[:1]),
+        )
+
+        # Filters
+        invite_status = self.request.query_params.get('status')
+        if invite_status:
+            qs = qs.filter(status=invite_status)
+        delivery_status_filter = self.request.query_params.get('delivery_status')
+        if delivery_status_filter:
+            qs = qs.filter(delivery_status=delivery_status_filter)
+
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        hotel = self.get_hotel()
+
+        # Safety: DRF pagination wraps results in a dict ({"count":…, "results":…}).
+        # If pagination is disabled, response.data is a list — don't augment.
+        if not isinstance(response.data, dict):
+            return response
+
+        # Feature flags — lets ADMIN users know state without needing SUPERADMIN settings endpoint
+        response.data['guest_invite_enabled'] = hotel.guest_invite_enabled
+        response.data['whatsapp_notifications_enabled'] = hotel.whatsapp_notifications_enabled
+
+        # Embed wa_template in list response for frontend preview
+        wa_template = get_template(hotel, 'GUEST_INVITE')
+        if wa_template and wa_template.gupshup_template_id:
+            response.data['wa_template'] = {
+                'body_text': wa_template.body_text,
+                'footer_text': wa_template.footer_text,
+                'buttons': wa_template.buttons,
+                'variables': wa_template.variables,
+            }
+        else:
+            response.data['wa_template'] = None
+        return response
+
+    def create(self, request, *args, **kwargs):
+        from .notifications.tasks import send_guest_invite_whatsapp
+
+        hotel = self.get_hotel()
+
+        # Guard: features must be enabled
+        if not hotel.guest_invite_enabled or not hotel.whatsapp_notifications_enabled:
+            return Response(
+                {'detail': 'WhatsApp guest invites are not enabled for this hotel.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Preflight: template must be configured
+        wa_template = get_template(hotel, 'GUEST_INVITE')
+        if not wa_template or not wa_template.gupshup_template_id:
+            return Response(
+                {'detail': 'WhatsApp invite template not configured.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        serializer = SendInviteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        phone = serializer.validated_data['phone']
+        guest_name = serializer.validated_data['guest_name']
+        room_number = serializer.validated_data.get('room_number', '')
+
+        # Rate limiting
+        if not check_invite_rate_limit_staff(request.user.id):
+            return Response(
+                {'detail': 'Please wait a few seconds before sending another invite.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={'Retry-After': '10'},
+            )
+        if not check_invite_rate_limit_phone(phone):
+            return Response(
+                {'detail': 'Too many invites to this number. Try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={'Retry-After': '3600'},
+            )
+        if not check_invite_rate_limit_hotel(hotel.id):
+            return Response(
+                {'detail': 'Hotel invite limit reached. Try again later.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={'Retry-After': '3600'},
+            )
+
+        try:
+            with transaction.atomic():
+                # Expire stale PENDING invites for this phone
+                GuestInvite.objects.filter(
+                    hotel=hotel, guest_phone=phone, status='PENDING',
+                    expires_at__lt=timezone.now(),
+                ).update(status='EXPIRED')
+
+                expiry = timezone.now() + timedelta(
+                    hours=settings.GUEST_INVITE_EXPIRY_HOURS,
+                )
+                invite = GuestInvite.objects.create(
+                    hotel=hotel,
+                    sent_by=request.user,
+                    guest_phone=phone,
+                    guest_name=guest_name,
+                    room_number=room_number,
+                    expires_at=expiry,
+                )
+                delivery = DeliveryRecord.objects.create(
+                    hotel=hotel,
+                    guest_invite=invite,
+                    channel='WHATSAPP',
+                    target=phone,
+                    event_type='guest_invite',
+                    message_type='TEMPLATE',
+                    status=DeliveryRecord.Status.QUEUED,
+                )
+
+                # Enqueue after commit to prevent orphan tasks on rollback
+                delivery_id = delivery.id
+                transaction.on_commit(
+                    lambda: send_guest_invite_whatsapp.delay(delivery_id)
+                )
+        except IntegrityError:
+            # Check if a duplicate active invite actually exists
+            duplicate = GuestInvite.objects.filter(
+                hotel=hotel, guest_phone=phone, status='PENDING',
+            ).exists()
+            if duplicate:
+                return Response(
+                    {'detail': 'An invite was already sent to this number.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            raise  # Not a duplicate — re-raise
+
+        out = GuestInviteSerializer(invite).data
+        return Response(out, status=status.HTTP_201_CREATED)
+
+
+class GuestInviteResend(HotelScopedMixin, APIView):
+    """POST — Resend a PENDING invite (extends expiry, new delivery)."""
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, hotel_slug, pk):
+        from .notifications.tasks import send_guest_invite_whatsapp
+
+        hotel = self.get_hotel()
+
+        # Guard: features must be enabled
+        if not hotel.guest_invite_enabled or not hotel.whatsapp_notifications_enabled:
+            return Response(
+                {'detail': 'WhatsApp guest invites are not enabled for this hotel.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Preflight: template must be configured
+        wa_template = get_template(hotel, 'GUEST_INVITE')
+        if not wa_template or not wa_template.gupshup_template_id:
+            return Response(
+                {'detail': 'WhatsApp invite template not configured.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        with transaction.atomic():
+            try:
+                invite = (
+                    GuestInvite.objects
+                    .select_for_update()
+                    .get(pk=pk, hotel=hotel)
+                )
+            except GuestInvite.DoesNotExist:
+                raise NotFound
+
+            if invite.status != 'PENDING':
+                return Response(
+                    {'detail': 'Only pending invites can be resent.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Rate limiting: staff debounce prevents spam-clicking resend.
+            # Uses a separate cache key from create to avoid cross-contamination.
+            # Checked after status validation so invalid resends get 409 not 429.
+            if not check_invite_resend_rate_limit(request.user.id):
+                return Response(
+                    {'detail': 'Please wait a few seconds before resending.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    headers={'Retry-After': '10'},
+                )
+
+            # Extend expiry but do NOT bump token_version. Old signed links
+            # remain valid so the guest isn't locked out if the new async
+            # send fails. Revocation (status=EXPIRED) is the correct way
+            # to invalidate all links, not resend.
+            invite.expires_at = timezone.now() + timedelta(
+                hours=settings.GUEST_INVITE_EXPIRY_HOURS,
+            )
+            invite.save(update_fields=['expires_at'])
+
+            delivery = DeliveryRecord.objects.create(
+                hotel=hotel,
+                guest_invite=invite,
+                channel='WHATSAPP',
+                target=invite.guest_phone,
+                event_type='guest_invite',
+                message_type='TEMPLATE',
+                status=DeliveryRecord.Status.QUEUED,
+            )
+
+            delivery_id = delivery.id
+            transaction.on_commit(
+                lambda: send_guest_invite_whatsapp.delay(delivery_id)
+            )
+
+        out = GuestInviteSerializer(invite).data
+        return Response(out)
+
+
+class GuestInviteRevoke(HotelScopedMixin, APIView):
+    """DELETE — Revoke a PENDING invite (marks as EXPIRED)."""
+    permission_classes = [IsAdminOrAbove]
+
+    def delete(self, request, hotel_slug, pk):
+        hotel = self.get_hotel()
+
+        with transaction.atomic():
+            try:
+                invite = (
+                    GuestInvite.objects
+                    .select_for_update()
+                    .get(pk=pk, hotel=hotel)
+                )
+            except GuestInvite.DoesNotExist:
+                raise NotFound
+
+            if invite.status != 'PENDING':
+                return Response(
+                    {'detail': 'Only pending invites can be revoked.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            invite.status = 'EXPIRED'
+            invite.save(update_fields=['status'])
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
 # Webhook
 # ---------------------------------------------------------------------------
 
@@ -2183,3 +2544,270 @@ class GupshupWAWebhookView(APIView):
             logger.exception('Error processing Gupshup webhook (notification handler)')
 
         return Response(status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings — Guest-Facing Views
+# ---------------------------------------------------------------------------
+
+# Guest-visible statuses (internal states filtered out)
+_GUEST_VISIBLE_STATUSES = {'SENT', 'COMPLETED', 'DISMISSED', 'EXPIRED'}
+# Actionable statuses — the only ones a guest can still act on
+_GUEST_ACTIONABLE_STATUSES = {'SENT'}
+
+
+class MyRatingPromptList(APIView):
+    """GET /me/rating-prompts/?hotel={slug}&status=&count_only="""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        hotel_slug = request.query_params.get('hotel')
+        if not hotel_slug:
+            return Response(
+                {'detail': 'hotel query parameter is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Default to actionable prompts only; allow explicit status override
+        # for history views.
+        status_filter = request.query_params.get('status')
+        if status_filter and status_filter in _GUEST_VISIBLE_STATUSES:
+            filter_statuses = {status_filter}
+        else:
+            filter_statuses = _GUEST_ACTIONABLE_STATUSES
+
+        base_qs = RatingPrompt.objects.filter(
+            guest=request.user,
+            hotel__slug=hotel_slug,
+            status__in=filter_statuses,
+        )
+
+        count_only = request.query_params.get('count_only', '').lower() == 'true'
+        if count_only:
+            count = base_qs.filter(status='SENT').count()
+            return Response({'count': count})
+
+        request_prompts = base_qs.filter(
+            prompt_type='REQUEST',
+        ).select_related(
+            'service_request__department',
+            'service_request__experience',
+            'service_request__event',
+            'service_request__special_request_offering',
+        ).order_by('-eligible_at')
+
+        # Only one stay prompt surfaced per the singular response contract.
+        # If multiple exist, the most recently eligible one wins.
+        stay_prompt = base_qs.filter(
+            prompt_type='STAY',
+        ).order_by('-eligible_at').first()
+
+        return Response({
+            'request_prompts': RatingPromptSerializer(request_prompts, many=True).data,
+            'stay_prompt': StayPromptSerializer(stay_prompt).data if stay_prompt else None,
+        })
+
+
+class RatePrompt(APIView):
+    """POST /me/rating-prompts/{prompt_id}/rate/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, prompt_id):
+        ser = SubmitRatingSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        from .services import submit_rating
+        try:
+            rating, created = submit_rating(
+                prompt_id=prompt_id,
+                guest=request.user,
+                score=ser.validated_data['score'],
+                feedback=ser.validated_data.get('feedback', ''),
+            )
+        except serializers.ValidationError as e:
+            return Response(
+                {'detail': e.detail if hasattr(e, 'detail') else str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            RatingSerializer(rating).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class DismissPrompt(APIView):
+    """POST /me/rating-prompts/{prompt_id}/dismiss/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, prompt_id):
+        with transaction.atomic():
+            try:
+                prompt = RatingPrompt.objects.select_for_update().get(
+                    id=prompt_id,
+                    guest=request.user,
+                    status='SENT',
+                )
+            except RatingPrompt.DoesNotExist:
+                return Response(
+                    {'detail': 'Rating prompt not found or already handled.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            prompt.status = 'DISMISSED'
+            prompt.dismissed_at = timezone.now()
+            prompt.save(update_fields=['status', 'dismissed_at'])
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ReviewClicked(APIView):
+    """POST /me/ratings/{rating_id}/review-clicked/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, rating_id):
+        try:
+            rating = Rating.objects.get(
+                id=rating_id,
+                guest=request.user,
+            )
+        except Rating.DoesNotExist:
+            return Response(
+                {'detail': 'Rating not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not rating.review_clicked_at:
+            rating.review_clicked_at = timezone.now()
+            rating.save(update_fields=['review_clicked_at'])
+
+        return Response(status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings — Admin Views
+# ---------------------------------------------------------------------------
+
+class AdminSendSurvey(HotelScopedMixin, APIView):
+    """POST /hotels/{slug}/admin/stays/{stay_id}/send-survey/"""
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, hotel_slug, stay_id):
+        hotel = self.get_hotel()
+        if not hotel.ratings_enabled:
+            return Response(
+                {'detail': 'Ratings are not enabled for this hotel.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            guest_stay = GuestStay.objects.get(
+                id=stay_id, hotel=hotel,
+            )
+        except GuestStay.DoesNotExist:
+            return Response(
+                {'detail': 'Stay not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        from .services import send_stay_survey
+        try:
+            send_stay_survey(
+                hotel=hotel,
+                guest_stay=guest_stay,
+                triggered_by=request.user,
+            )
+        except serializers.ValidationError as e:
+            return Response(
+                {'detail': e.detail if hasattr(e, 'detail') else str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            {'detail': 'Checkout survey sent.'},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AdminRatingList(HotelScopedMixin, generics.ListAPIView):
+    """GET /hotels/{slug}/admin/ratings/"""
+    permission_classes = [IsAdminOrAbove]
+    serializer_class = AdminRatingSerializer
+
+    def get_queryset(self):
+        hotel = self.get_hotel()
+        qs = Rating.objects.filter(
+            hotel=hotel,
+        ).select_related(
+            'guest', 'guest_stay', 'service_request__department',
+            'service_request__guest_stay',
+        ).order_by('-created_at')
+
+        rating_type = self.request.query_params.get('rating_type')
+        if rating_type in ('REQUEST', 'STAY'):
+            qs = qs.filter(rating_type=rating_type)
+
+        # Exact score filter (from frontend score dropdown)
+        score = self.request.query_params.get('score')
+        if score and score.isdigit() and 1 <= int(score) <= 5:
+            qs = qs.filter(score=int(score))
+
+        # Range filters (for programmatic use)
+        min_score = self.request.query_params.get('min_score')
+        if min_score and min_score.isdigit():
+            qs = qs.filter(score__gte=int(min_score))
+
+        max_score = self.request.query_params.get('max_score')
+        if max_score and max_score.isdigit():
+            qs = qs.filter(score__lte=int(max_score))
+
+        department = self.request.query_params.get('department')
+        if department:
+            qs = qs.filter(service_request__department__slug=department)
+
+        return qs
+
+
+class AdminRatingSummary(HotelScopedMixin, APIView):
+    """GET /hotels/{slug}/admin/ratings/summary/"""
+    permission_classes = [IsAdminOrAbove]
+
+    def get(self, request, hotel_slug):
+        hotel = self.get_hotel()
+        qs = Rating.objects.filter(hotel=hotel)
+
+        total = qs.count()
+        avg = qs.aggregate(avg=models.Avg('score'))['avg']
+
+        # Score distribution
+        dist_qs = qs.values('score').annotate(count=Count('id')).order_by('score')
+        distribution = {str(i): 0 for i in range(1, 6)}
+        for row in dist_qs:
+            distribution[str(row['score'])] = row['count']
+
+        # By department (request ratings only) — group by id for uniqueness
+        by_dept = (
+            qs.filter(rating_type='REQUEST', service_request__department__isnull=False)
+            .values('service_request__department__id', 'service_request__department__name')
+            .annotate(
+                count=Count('id'),
+                avg_score=models.Avg('score'),
+            )
+            .order_by('-avg_score')
+        )
+        dept_data = [
+            {
+                'department_id': row['service_request__department__id'],
+                'department_name': row['service_request__department__name'],
+                'count': row['count'],
+                'avg_score': round(row['avg_score'], 1) if row['avg_score'] else None,
+            }
+            for row in by_dept
+        ]
+
+        return Response({
+            'total_count': total,
+            'average_score': round(avg, 2) if avg else None,
+            'distribution': distribution,
+            'by_department': dept_data,
+        })

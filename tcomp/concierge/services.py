@@ -14,6 +14,11 @@ import redis as redis_lib
 import requests as http_requests
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.contrib.auth.tokens import default_token_generator
+from django.core.signing import TimestampSigner
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q
@@ -23,6 +28,7 @@ from .models import (
     ContentStatus, Hotel, HotelMembership, Department, Experience,
     GuestStay, OTPCode, ServiceRequest, RequestActivity, Notification,
     PushSubscription, QRCode, EscalationHeartbeat,
+    Rating, RatingPrompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -471,6 +477,183 @@ def check_otp_rate_limit_ip(ip_hash, limit, window_seconds):
     return count < limit
 
 
+def check_otp_rate_limit_email(email, limit, window_seconds):
+    """Rate limit OTP sends per email, with DB fallback."""
+    key = f'ratelimit:otp:email:{email}'
+    result = check_rate_limit(key, limit, window_seconds)
+    if result is not None:
+        return result
+    cutoff = timezone.now() - timedelta(seconds=window_seconds)
+    count = OTPCode.objects.filter(email=email, created_at__gte=cutoff).count()
+    return count < limit
+
+
+def send_email_otp(email, ip_address=''):
+    """Generate OTP, store hashed, send via email.
+
+    Silently succeeds even if no staff user exists with this email
+    (prevents email enumeration).
+    """
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+
+    # Check if a staff user exists with this email — if not, create a tracking
+    # row for DB-fallback rate limiting and silently return.
+    user = User.objects.filter(email__iexact=email, user_type='STAFF').order_by('date_joined').first()
+    if not user:
+        logger.info('Email OTP requested for non-existent staff email %s — silent no-op', email)
+        OTPCode.objects.create(
+            email=email.lower(),
+            code_hash='',
+            channel=OTPCode.Channel.EMAIL,
+            ip_hash=_hash_ip(ip_address) if ip_address else '',
+            is_used=True,
+            expires_at=timezone.now(),
+        )
+        return None
+
+    code = generate_otp_code()
+    now = timezone.now()
+    expires = now + timedelta(seconds=settings.OTP_EXPIRY_SECONDS)
+
+    if settings.DEBUG:
+        logger.info('DEV EMAIL OTP for %s: %s', email, code)
+
+    otp = OTPCode.objects.create(
+        email=email.lower(),
+        code_hash=_hash_code(code),
+        channel=OTPCode.Channel.EMAIL,
+        ip_hash=_hash_ip(ip_address) if ip_address else '',
+        expires_at=expires,
+    )
+
+    # In DEBUG mode, skip delivery unless Resend key is configured
+    if settings.DEBUG and not settings.RESEND_API_KEY:
+        return otp
+
+    success = _send_otp_email(email, code)
+    if not success:
+        otp.is_used = True
+        otp.save(update_fields=['is_used'])
+        raise OTPDeliveryError('Unable to send verification code. Please try again later.')
+
+    return otp
+
+
+def _send_otp_email(email, code):
+    """Send OTP code via Resend email. Returns True on success."""
+    api_key = settings.RESEND_API_KEY
+    if not api_key:
+        logger.warning('Resend API key not configured, skipping email OTP')
+        return False
+
+    import resend
+    resend.api_key = api_key
+
+    html = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
+      <h2 style="color: #1a1a1a; font-size: 22px; margin-bottom: 8px;">Your verification code</h2>
+      <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 24px;">
+        Use the code below to log in to your Refuje dashboard.
+        This code expires in 10 minutes.
+      </p>
+      <div style="background: #f5f5f5; border-radius: 8px; padding: 20px; text-align: center; margin-bottom: 24px;">
+        <span style="font-size: 32px; font-weight: 700; letter-spacing: 6px; color: #1a1a1a;">{code}</span>
+      </div>
+      <p style="color: #888; font-size: 13px; line-height: 1.5;">
+        If you didn't request this code, you can safely ignore this email.
+      </p>
+      <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
+      <p style="color: #aaa; font-size: 12px;">Powered by Refuje</p>
+    </div>
+    """
+
+    from resend.exceptions import (
+        ValidationError, MissingRequiredFieldsError,
+        MissingApiKeyError, InvalidApiKeyError,
+    )
+    _PERMANENT = (ValidationError, MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError)
+
+    try:
+        response = resend.Emails.send({
+            'from': settings.RESEND_FROM_EMAIL,
+            'to': [email],
+            'subject': 'Your Refuje verification code',
+            'html': html,
+            'tags': [
+                {'name': 'type', 'value': 'email_otp'},
+            ],
+        })
+        logger.info('Email OTP sent to %s (id=%s)', email, response.get('id'))
+        return True
+    except _PERMANENT as exc:
+        logger.warning('Email OTP permanently rejected for %s: %s', email, exc)
+        return False
+    except Exception as exc:
+        logger.error('Email OTP delivery failed for %s: %s', email, exc)
+        return False
+
+
+def verify_email_otp(email, code):
+    """Verify email OTP code. Returns user or raises ValidationError.
+
+    Staff-only: rejects if user has no active staff membership.
+    """
+    from django.contrib.auth import get_user_model
+    from rest_framework.exceptions import ValidationError
+
+    User = get_user_model()
+    now = timezone.now()
+
+    otp_error = None
+
+    with transaction.atomic():
+        otp_qs = OTPCode.objects.select_for_update().filter(
+            email=email.lower(),
+            channel=OTPCode.Channel.EMAIL,
+            is_used=False,
+            expires_at__gt=now,
+            attempts__lt=settings.OTP_MAX_ATTEMPTS,
+        )
+
+        otp = otp_qs.order_by('-created_at').first()
+
+        if not otp:
+            raise ValidationError('Invalid or expired code.')
+
+        if _hash_code(code) != otp.code_hash:
+            OTPCode.objects.filter(pk=otp.pk).update(attempts=F('attempts') + 1)
+            new_attempts = OTPCode.objects.filter(pk=otp.pk).values_list('attempts', flat=True).first()
+            if new_attempts >= settings.OTP_MAX_ATTEMPTS:
+                otp_error = 'Too many attempts. Please request a new code.'
+            else:
+                otp_error = 'Invalid code.'
+
+    if otp_error:
+        raise ValidationError(otp_error)
+
+    with transaction.atomic():
+        otp = OTPCode.objects.select_for_update().filter(
+            pk=otp.pk, is_used=False,
+        ).first()
+        if not otp:
+            raise ValidationError('Invalid or expired code.')
+
+        user = User.objects.filter(email__iexact=email, user_type='STAFF').order_by('date_joined').first()
+        if not user:
+            raise ValidationError('No staff account found for this email.')
+        if not user.is_active:
+            raise ValidationError('Account is disabled.')
+
+        # Verify user has at least one active hotel membership
+        if not HotelMembership.objects.filter(user=user, is_active=True).exists():
+            raise ValidationError('No active hotel membership found.')
+
+        otp.is_used = True
+        otp.save(update_fields=['is_used'])
+        return user
+
+
 def check_stay_rate_limit(stay):
     """Max 10 requests per stay per hour."""
     key = f'ratelimit:stay:{stay.id}'
@@ -499,6 +682,64 @@ def check_room_rate_limit(hotel, room_number):
         created_at__gte=one_hour_ago,
     ).count()
     return count < 5
+
+
+# ---------------------------------------------------------------------------
+# Guest invite rate limiting
+# ---------------------------------------------------------------------------
+
+def check_invite_rate_limit_phone(phone):
+    """Max 3 invites per phone per 24 hours."""
+    key = f'ratelimit:invite:phone:{phone}'
+    result = check_rate_limit(key, 3, 86400)
+    if result is not None:
+        return result
+    from .models import GuestInvite
+    cutoff = timezone.now() - timedelta(hours=24)
+    count = GuestInvite.objects.filter(guest_phone=phone, created_at__gte=cutoff).count()
+    return count < 3
+
+
+def check_invite_rate_limit_hotel(hotel_id):
+    """Max 100 invites per hotel per 24 hours."""
+    key = f'ratelimit:invite:hotel:{hotel_id}'
+    result = check_rate_limit(key, 100, 86400)
+    if result is not None:
+        return result
+    from .models import GuestInvite
+    cutoff = timezone.now() - timedelta(hours=24)
+    count = GuestInvite.objects.filter(hotel_id=hotel_id, created_at__gte=cutoff).count()
+    return count < 100
+
+
+def check_invite_rate_limit_staff(user_id):
+    """Debounce: max 1 invite per staff per 10 seconds."""
+    key = f'ratelimit:invite:staff:{user_id}'
+    result = check_rate_limit(key, 1, 10)
+    if result is not None:
+        return result
+    from .models import GuestInvite
+    cutoff = timezone.now() - timedelta(seconds=10)
+    count = GuestInvite.objects.filter(sent_by_id=user_id, created_at__gte=cutoff).count()
+    return count < 1
+
+
+def check_invite_resend_rate_limit(user_id):
+    """Debounce resend: max 1 resend per staff per 10 seconds.
+
+    Separate cache key from create so create + immediate resend don't
+    cross-contaminate each other's debounce windows.
+
+    Fails closed: if cache is unavailable, resend is denied. DeliveryRecord
+    has no created_by field, so a reliable per-actor DB fallback isn't
+    possible. A brief cache outage blocking resends is acceptable since
+    the original invite is still valid.
+    """
+    key = f'ratelimit:invite_resend:staff:{user_id}'
+    result = check_rate_limit(key, 1, 10)
+    if result is not None:
+        return result
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -848,8 +1089,9 @@ async def stream_request_events(hotel, user):
         ).select_related('department').first()
     )()
 
+    is_staff_role = membership and membership.role == HotelMembership.Role.STAFF
     staff_department_id = None
-    if membership and membership.role == HotelMembership.Role.STAFF:
+    if is_staff_role:
         staff_department_id = membership.department_id if membership.department else None
 
     r = aioredis.from_url(settings.SSE_REDIS_URL)
@@ -877,9 +1119,17 @@ async def stream_request_events(hotel, user):
 
             data = json.loads(message['data'])
 
-            # Filter by department for STAFF users
-            if staff_department_id is not None:
-                if data.get('department_id') != staff_department_id:
+            # STAFF users: skip events without department_id (e.g. rating events)
+            # and filter to their assigned department.
+            # STAFF with no assigned department see no events at all.
+            if is_staff_role:
+                event_dept = data.get('department_id')
+                if event_dept is None:
+                    continue
+                if staff_department_id is None:
+                    # Unassigned STAFF: skip all dept-scoped events
+                    continue
+                if event_dept != staff_department_id:
                     continue
 
             yield f'event: {data["event"]}\ndata: {json.dumps(data)}\n\n'
@@ -1054,8 +1304,34 @@ def send_staff_invite_whatsapp(phone, first_name, hotel_name, role_display):
     return False
 
 
-def send_staff_invite_email(email, first_name, hotel_name, role_display):
-    """Send email invitation to newly added staff member via Resend."""
+def generate_password_token(user):
+    """Generate a uid + token pair for set-password / reset-password flows.
+
+    Uses Django's PasswordResetTokenGenerator — the token is HMAC-signed
+    against user.pk + password hash + last_login, so it auto-invalidates
+    the moment the user sets/changes their password.
+    """
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    return uid, token
+
+
+def verify_password_token(uidb64, token):
+    """Verify a password-set/reset token. Returns user or None."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    try:
+        uid = force_str(urlsafe_base64_decode(uidb64))
+        user = User.objects.get(pk=uid)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        return None
+    if default_token_generator.check_token(user, token):
+        return user
+    return None
+
+
+def send_staff_invite_email(user, hotel_name, role_display):
+    """Send email invitation with set-password link to newly added staff member."""
     api_key = settings.RESEND_API_KEY
     if not api_key:
         logger.warning('Staff invite email skipped: missing RESEND_API_KEY')
@@ -1064,8 +1340,10 @@ def send_staff_invite_email(email, first_name, hotel_name, role_display):
     import resend
     resend.api_key = api_key
 
-    login_url = 'https://refuje.com/login'
-    greeting = first_name or 'there'
+    uid, token = generate_password_token(user)
+    set_password_url = f'{settings.FRONTEND_ORIGIN}/set-password?uid={uid}&token={token}'
+    greeting = user.first_name or 'there'
+    email = user.email
 
     html = f"""
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
@@ -1073,15 +1351,14 @@ def send_staff_invite_email(email, first_name, hotel_name, role_display):
       <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 20px;">
         Hi {greeting}, the team at <strong>{hotel_name}</strong> has added you as
         <strong>{role_display}</strong> on their concierge platform.
-        You can now view and manage guest requests from your dashboard.
+        Set up your password to get started.
       </p>
-      <a href="{login_url}"
+      <a href="{set_password_url}"
          style="display: inline-block; background: #1a1a1a; color: #ffffff; text-decoration: none;
                 padding: 12px 28px; border-radius: 6px; font-size: 15px; font-weight: 500;">
-        Log In to Your Dashboard
+        Set Up Your Password
       </a>
       <p style="color: #888; font-size: 13px; margin-top: 28px; line-height: 1.5;">
-        Use your phone number or email to log in.
         If you didn't expect this invitation, you can safely ignore this email.
       </p>
       <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
@@ -1118,6 +1395,67 @@ def send_staff_invite_email(email, first_name, hotel_name, role_display):
     # transient ResendError subclasses, network/DNS errors) propagate → Celery retry.
 
 
+def send_password_reset_email(user):
+    """Send password reset email with token link."""
+    api_key = settings.RESEND_API_KEY
+    if not api_key:
+        logger.warning('Password reset email skipped: missing RESEND_API_KEY')
+        return False
+
+    import resend
+    resend.api_key = api_key
+
+    uid, token = generate_password_token(user)
+    reset_url = f'{settings.FRONTEND_ORIGIN}/reset-password?uid={uid}&token={token}'
+    greeting = user.first_name or 'there'
+
+    html = f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 24px;">
+      <h2 style="color: #1a1a1a; font-size: 22px; margin-bottom: 8px;">Reset your password</h2>
+      <p style="color: #555; font-size: 15px; line-height: 1.6; margin-bottom: 20px;">
+        Hi {greeting}, we received a request to reset your Refuje password.
+        Click the button below to choose a new password.
+      </p>
+      <a href="{reset_url}"
+         style="display: inline-block; background: #1a1a1a; color: #ffffff; text-decoration: none;
+                padding: 12px 28px; border-radius: 6px; font-size: 15px; font-weight: 500;">
+        Reset Password
+      </a>
+      <p style="color: #888; font-size: 13px; margin-top: 28px; line-height: 1.5;">
+        If you didn't request this, you can safely ignore this email.
+        This link will expire when your password is changed.
+      </p>
+      <hr style="border: none; border-top: 1px solid #eee; margin: 28px 0 16px;" />
+      <p style="color: #aaa; font-size: 12px;">Powered by Refuje</p>
+    </div>
+    """
+
+    from resend.exceptions import (
+        ValidationError as ResendValidationError,
+        MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError,
+    )
+    _PERMANENT = (ResendValidationError, MissingRequiredFieldsError, MissingApiKeyError, InvalidApiKeyError)
+
+    try:
+        response = resend.Emails.send({
+            'from': settings.RESEND_FROM_EMAIL,
+            'to': [user.email],
+            'subject': 'Reset your Refuje password',
+            'html': html,
+            'tags': [
+                {'name': 'type', 'value': 'password_reset'},
+            ],
+        })
+        logger.info('Password reset email sent to %s (id=%s)', user.email, response.get('id'))
+        return True
+    except _PERMANENT as exc:
+        logger.warning('Password reset email permanently rejected for %s: %s', user.email, exc)
+        return False
+    except Exception as exc:
+        logger.error('Password reset email failed for %s: %s', user.email, exc)
+        return False
+
+
 def send_staff_invite_notification(user, hotel, role, *, skip_channels=None):
     """Send invitation notifications to a newly added staff member.
 
@@ -1149,7 +1487,7 @@ def send_staff_invite_notification(user, hotel, role, *, skip_channels=None):
 
     if user.email and 'email' not in skip:
         try:
-            send_staff_invite_email(user.email, first_name, hotel_name, role_display)
+            send_staff_invite_email(user, hotel_name, role_display)
             # True = sent, False = permanent Resend rejection
             resolved.add('email')
         except Exception as exc:
@@ -1163,3 +1501,286 @@ def send_staff_invite_notification(user, hotel, role, *, skip_channels=None):
         raise errors[0]
 
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# Guest Invite Token Signing
+# ---------------------------------------------------------------------------
+
+_invite_signer = TimestampSigner(salt='guest-invite')
+
+
+def generate_invite_token(invite_id: int, version: int) -> str:
+    """Sign invite_id:version. Version is fixed per invite; revoke is the invalidation path."""
+    return _invite_signer.sign(f'{invite_id}:{version}')
+
+
+def verify_invite_token(token: str) -> tuple[int, int]:
+    """Verify and return (invite_id, version). Expiry checked via invite.expires_at, not signer max_age."""
+    # No max_age on unsign — expiry is checked against invite.expires_at in the
+    # verify view. Relying on the DB field means config changes to
+    # GUEST_INVITE_EXPIRY_HOURS never conflict with already-issued tokens.
+    # The signer only validates integrity (not tampered), not time.
+    value = _invite_signer.unsign(token)
+    invite_id, version = value.split(':')
+    return int(invite_id), int(version)
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Template Resolution
+# ---------------------------------------------------------------------------
+
+def get_template(hotel, template_type):
+    """Resolve template: hotel-specific → global default → None."""
+    from .models import WhatsAppTemplate
+
+    return (
+        WhatsAppTemplate.objects.filter(
+            hotel=hotel, template_type=template_type, is_active=True
+        ).first()
+        or WhatsAppTemplate.objects.filter(
+            hotel=None, template_type=template_type, is_active=True
+        ).first()
+    )
+
+
+# Context keys available for GUEST_INVITE templates.
+# New template types (Phase 2) define their own context builders.
+GUEST_INVITE_CONTEXT_BUILDERS = {
+    'hotel_name': lambda invite: invite.hotel.name,
+    'guest_name': lambda invite: invite.guest_name,
+    'room_number': lambda invite: invite.room_number or '',
+}
+
+GUEST_RATING_BATCH_CONTEXT_BUILDERS = {
+    'guest_name': lambda ctx: ctx['guest_name'],
+    'hotel_name': lambda ctx: ctx['hotel_name'],
+    'experience_count': lambda ctx: str(ctx['experience_count']),
+    'rate_url_suffix': lambda ctx: ctx['rate_url_suffix'],
+}
+
+GUEST_STAY_SURVEY_CONTEXT_BUILDERS = {
+    'guest_name': lambda ctx: ctx['guest_name'],
+    'hotel_name': lambda ctx: ctx['hotel_name'],
+    'rate_url_suffix': lambda ctx: ctx['rate_url_suffix'],
+}
+
+LOW_SCORE_ALERT_CONTEXT_BUILDERS = {
+    'guest_summary': lambda ctx: ctx['guest_summary'],
+    'rating_detail': lambda ctx: ctx['rating_detail'],
+    'feedback_preview': lambda ctx: ctx['feedback_preview'],
+    'dashboard_path': lambda ctx: ctx['dashboard_path'],
+}
+
+
+def resolve_template_params(wa_template, context_source):
+    """Build the ordered param list from a template's variables JSON.
+
+    context_source: the object to resolve keys from (e.g., GuestInvite instance).
+    Returns list of strings in index order, ready to pass to Gupshup.
+    Raises ValueError if a required variable key has no resolver.
+    """
+    _BUILDERS_MAP = {
+        'GUEST_INVITE': GUEST_INVITE_CONTEXT_BUILDERS,
+        'GUEST_RATING_BATCH': GUEST_RATING_BATCH_CONTEXT_BUILDERS,
+        'GUEST_STAY_SURVEY': GUEST_STAY_SURVEY_CONTEXT_BUILDERS,
+        'LOW_SCORE_ALERT': LOW_SCORE_ALERT_CONTEXT_BUILDERS,
+    }
+    builders = _BUILDERS_MAP.get(wa_template.template_type)
+    if builders is None:
+        raise ValueError(f'No context builders for template type: {wa_template.template_type}')
+
+    variables = sorted(wa_template.variables, key=lambda v: v['index'])
+    params = []
+    for var in variables:
+        key = var['key']
+        if key not in builders:
+            raise ValueError(f'Unknown variable key "{key}" in template "{wa_template.name}"')
+        params.append(str(builders[key](context_source)))
+    return params
+
+
+def validate_template(wa_template):
+    """Ensure body_text placeholders match declared variables."""
+    placeholders = {int(m) for m in re.findall(r'\{\{(\d+)\}\}', wa_template.body_text)}
+    declared = {v['index'] for v in wa_template.variables}
+    if placeholders != declared:
+        raise ValidationError(
+            f'Placeholder mismatch: body has {placeholders}, variables declare {declared}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings
+# ---------------------------------------------------------------------------
+
+def submit_rating(prompt_id, guest, score, feedback):
+    """Create Rating, update prompt, handle low-score alert.
+
+    Uses select_for_update + status precondition to prevent races.
+    Returns (rating, created) — if already completed, returns existing rating.
+    """
+    with transaction.atomic():
+        try:
+            prompt = RatingPrompt.objects.select_for_update().get(
+                id=prompt_id,
+                guest=guest,
+                status='SENT',
+            )
+        except RatingPrompt.DoesNotExist:
+            prompt = RatingPrompt.objects.filter(
+                id=prompt_id, guest=guest,
+            ).first()
+            if prompt is None:
+                raise ValidationError('Rating prompt not found.')
+            if prompt.status == 'COMPLETED':
+                existing = Rating.objects.filter(
+                    hotel=prompt.hotel,
+                    guest=guest,
+                    service_request=prompt.service_request,
+                    guest_stay=prompt.guest_stay if prompt.prompt_type == 'STAY' else None,
+                    rating_type=prompt.prompt_type,
+                ).first()
+                if existing:
+                    return existing, False
+            raise ValidationError('This rating prompt is no longer available.')
+
+        rating = Rating.objects.create(
+            hotel=prompt.hotel,
+            guest=guest,
+            service_request=prompt.service_request,
+            guest_stay=prompt.guest_stay,
+            rating_type=prompt.prompt_type,
+            score=score,
+            feedback=feedback,
+        )
+        prompt.status = 'COMPLETED'
+        prompt.completed_at = timezone.now()
+        prompt.save(update_fields=['status', 'completed_at'])
+
+        if prompt.service_request:
+            RequestActivity.objects.create(
+                request=prompt.service_request,
+                actor=guest,
+                action='RATING_SUBMITTED',
+                details={'score': score},
+            )
+
+    # Low-score alert (outside transaction — best effort)
+    if score <= 3 and feedback:
+        try:
+            dispatch_low_score_alert(prompt, rating)
+        except Exception:
+            logger.exception('Failed to dispatch low-score alert for rating %s', rating.id)
+
+    return rating, True
+
+
+def dispatch_low_score_alert(prompt, rating):
+    """Send notifications for low-score ratings to ADMIN/SUPERADMIN users."""
+    hotel = prompt.hotel
+
+    # 1. In-app notifications + push for ADMIN/SUPERADMIN
+    admin_memberships = HotelMembership.objects.filter(
+        hotel=hotel,
+        is_active=True,
+        role__in=(HotelMembership.Role.ADMIN, HotelMembership.Role.SUPERADMIN),
+    ).select_related('user')
+
+    guest_name = rating.guest.get_full_name() or rating.guest.phone or 'Guest'
+    room = ''
+    if prompt.guest_stay:
+        room = prompt.guest_stay.room_number
+    elif prompt.service_request and prompt.service_request.guest_stay:
+        room = prompt.service_request.guest_stay.room_number
+
+    title = 'Low rating alert'
+    body = f'{guest_name} rated {rating.score}/5'
+    if room:
+        body = f'Room {room} — {body}'
+
+    for membership in admin_memberships:
+        Notification.objects.create(
+            user=membership.user,
+            hotel=hotel,
+            request=prompt.service_request,
+            title=title,
+            body=body,
+            notification_type=Notification.NotificationType.LOW_RATING_ALERT,
+        )
+        # Async push delivery
+        from .notifications.tasks import send_push_notification_task
+        send_push_notification_task.delay(
+            user_id=membership.user.id,
+            title=title,
+            body=body,
+            url='/dashboard/ratings',
+        )
+
+    # 2. SSE event
+    try:
+        publish_rating_event(hotel, 'rating.low_score', rating)
+    except Exception:
+        logger.exception('Failed to publish rating SSE event')
+
+    # 3. WhatsApp to on-call phone
+    if hotel.oncall_phone:
+        from .notifications.tasks import send_low_score_whatsapp_task
+        send_low_score_whatsapp_task.delay(hotel_id=hotel.id, rating_id=rating.id)
+
+    # 4. Email to on-call email
+    if hotel.oncall_email:
+        from .notifications.tasks import send_low_score_email_task
+        send_low_score_email_task.delay(hotel_id=hotel.id, rating_id=rating.id)
+
+    # 5. Activity trail (request ratings only)
+    if prompt.service_request:
+        RequestActivity.objects.create(
+            request=prompt.service_request,
+            actor=rating.guest,
+            action='FEEDBACK_ALERT',
+            details={'score': rating.score},
+        )
+
+
+def publish_rating_event(hotel, event_type, rating):
+    """Publish rating SSE event to the existing request stream channel."""
+    channel = f'hotel:{hotel.id}:requests'
+    payload = json.dumps({
+        'event': event_type,
+        'rating_id': rating.id,
+        'public_id': str(rating.service_request.public_id) if rating.service_request_id else None,
+        'score': rating.score,
+        'hotel_id': hotel.id,
+    })
+    try:
+        r = get_sse_redis()
+        r.publish(channel, payload)
+    except Exception:
+        logger.exception('Failed to publish rating SSE event')
+
+
+def send_stay_survey(hotel, guest_stay, triggered_by):
+    """Admin triggers checkout survey. Creates prompt + enqueues WhatsApp."""
+    prompt, created = RatingPrompt.objects.get_or_create(
+        hotel=hotel,
+        guest_stay=guest_stay,
+        prompt_type='STAY',
+        defaults={
+            'guest': guest_stay.guest,
+            'status': 'QUEUED',
+            'eligible_at': timezone.now(),
+            'queued_at': timezone.now(),
+        },
+    )
+    if not created:
+        raise ValidationError('Survey already sent for this stay.')
+
+    # WhatsApp delivery — send task transitions QUEUED → SENT on 2xx,
+    # or QUEUED → FAILED on 4xx (same lifecycle as batch-sent prompts).
+    from .notifications.tasks import send_stay_survey_whatsapp_task
+    send_stay_survey_whatsapp_task.delay(
+        hotel_id=hotel.id,
+        guest_id=guest_stay.guest_id,
+        prompt_id=prompt.id,
+    )

@@ -11,7 +11,8 @@ from .models import (
     SpecialRequestOffering, SpecialRequestOfferingImage,
     GuestStay, ServiceRequest, RequestActivity,
     Notification, NotificationRoute, PushSubscription, QRCode, HotelInfoSection,
-    BookingEmailTemplate,
+    BookingEmailTemplate, GuestInvite, DeliveryRecord,
+    Rating, RatingPrompt,
 )
 from .validators import validate_image_upload
 
@@ -229,6 +230,9 @@ class HotelPublicSerializer(serializers.ModelSerializer):
             'destination_slug',
             # Guest features
             'custom_requests_enabled',
+            # Guest ratings (guest needs these to show rating UI)
+            'ratings_enabled', 'external_review_url',
+            'external_review_threshold',
             # Relations
             'departments', 'info_sections',
         ]
@@ -303,7 +307,11 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
             # Notification channels
             'whatsapp_notifications_enabled', 'email_notifications_enabled',
             # Guest features
-            'custom_requests_enabled',
+            'custom_requests_enabled', 'guest_invite_enabled',
+            # Guest ratings
+            'ratings_enabled', 'rating_delay_hours', 'rating_batch_hour',
+            'rating_max_per_batch', 'external_review_url',
+            'external_review_threshold',
             # Request routing
             'fallback_department', 'fallback_department_name',
         ]
@@ -384,6 +392,40 @@ class HotelSettingsSerializer(serializers.ModelSerializer):
         if opens > 0 and closes > 0 and opens < closes:
             raise serializers.ValidationError(
                 'Default booking opens must be >= default booking closes.'
+            )
+
+        # Rating settings validation
+        batch_hour = data.get(
+            'rating_batch_hour',
+            getattr(self.instance, 'rating_batch_hour', 20),
+        )
+        if batch_hour > 23:
+            raise serializers.ValidationError(
+                {'rating_batch_hour': 'Must be 0-23.'}
+            )
+        delay_hours = data.get(
+            'rating_delay_hours',
+            getattr(self.instance, 'rating_delay_hours', 2),
+        )
+        if delay_hours < 0 or delay_hours > 168:
+            raise serializers.ValidationError(
+                {'rating_delay_hours': 'Must be between 0 and 168 (7 days).'}
+            )
+        max_per_batch = data.get(
+            'rating_max_per_batch',
+            getattr(self.instance, 'rating_max_per_batch', 3),
+        )
+        if max_per_batch < 1 or max_per_batch > 20:
+            raise serializers.ValidationError(
+                {'rating_max_per_batch': 'Must be between 1 and 20.'}
+            )
+        threshold = data.get(
+            'external_review_threshold',
+            getattr(self.instance, 'external_review_threshold', 4),
+        )
+        if threshold < 1 or threshold > 5:
+            raise serializers.ValidationError(
+                {'external_review_threshold': 'Must be between 1 and 5.'}
             )
 
         return data
@@ -1718,6 +1760,7 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
         source='special_request_offering.id', read_only=True, default=None,
     )
     special_request_category = serializers.SerializerMethodField()
+    rating_score = serializers.SerializerMethodField()
 
     class Meta:
         model = ServiceRequest
@@ -1730,7 +1773,7 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
             'guest_notes', 'guest_date',
             'guest_time', 'guest_count', 'after_hours',
             'response_due_at', 'created_at', 'acknowledged_at',
-            'confirmed_at',
+            'confirmed_at', 'rating_score',
         ]
         # confirmation_token explicitly excluded
 
@@ -1749,6 +1792,15 @@ class ServiceRequestListSerializer(serializers.ModelSerializer):
 
     def get_special_request_category(self, obj):
         return obj.special_request_category or None
+
+    def get_rating_score(self, obj):
+        rating = getattr(obj, '_rating_score', None)
+        if rating is not None:
+            return rating
+        # Fallback: query if not prefetched
+        from .models import Rating
+        r = Rating.objects.filter(service_request=obj).values_list('score', flat=True).first()
+        return r
 
 
 class ServiceRequestDetailSerializer(ServiceRequestListSerializer):
@@ -2073,3 +2125,160 @@ class NotificationRouteSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'target': 'Enter a valid email address.'})
 
         return data
+
+
+# ---------------------------------------------------------------------------
+# Guest Invite serializers
+# ---------------------------------------------------------------------------
+
+class GuestInviteSerializer(serializers.ModelSerializer):
+    """Read serializer for GuestInvite list/detail. Annotates delivery info."""
+    sent_by_name = serializers.SerializerMethodField()
+    delivery_status = serializers.CharField(read_only=True, default=None)
+    delivery_error = serializers.CharField(read_only=True, default=None)
+
+    class Meta:
+        model = GuestInvite
+        fields = [
+            'id', 'guest_phone', 'guest_name', 'room_number',
+            'status', 'sent_by_name',
+            'delivery_status', 'delivery_error',
+            'created_at', 'expires_at', 'used_at',
+        ]
+        read_only_fields = fields
+
+    def get_sent_by_name(self, obj):
+        if obj.sent_by:
+            name = obj.sent_by.get_full_name()
+            return name if name else obj.sent_by.email or obj.sent_by.phone
+        return None
+
+
+class SendInviteSerializer(serializers.Serializer):
+    """Write serializer for creating a guest invite."""
+    phone = serializers.CharField(max_length=20)
+    guest_name = serializers.CharField(max_length=100)
+    room_number = serializers.CharField(max_length=20, required=False, default='')
+
+    def validate_phone(self, value):
+        digits = re.sub(r'\D', '', value)
+        if len(digits) < 10 or len(digits) > 15:
+            raise serializers.ValidationError('Phone number must be 10-15 digits (with country code).')
+        return digits
+
+
+# ---------------------------------------------------------------------------
+# Guest Ratings
+# ---------------------------------------------------------------------------
+
+class RatingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Rating
+        fields = [
+            'id', 'rating_type', 'score', 'feedback',
+            'review_clicked_at', 'created_at',
+        ]
+        read_only_fields = fields
+
+
+class RatingPromptSerializer(serializers.ModelSerializer):
+    """Guest-facing prompt serializer — for request prompts."""
+    service_request_public_id = serializers.UUIDField(
+        source='service_request.public_id', read_only=True,
+    )
+    request_title = serializers.SerializerMethodField()
+    department_name = serializers.CharField(
+        source='service_request.department.name', read_only=True,
+    )
+    request_date = serializers.DateField(
+        source='service_request.guest_date', read_only=True,
+    )
+
+    class Meta:
+        model = RatingPrompt
+        fields = [
+            'id', 'service_request_public_id', 'request_title',
+            'department_name', 'request_date', 'status',
+        ]
+        read_only_fields = fields
+
+    def get_request_title(self, obj):
+        sr = obj.service_request
+        if not sr:
+            return None
+        return (
+            getattr(sr.special_request_offering, 'name', None)
+            or getattr(sr.experience, 'name', None)
+            or getattr(sr.event, 'name', None)
+            or getattr(sr.department, 'name', None)
+            or 'Request'
+        )
+
+
+class StayPromptSerializer(serializers.ModelSerializer):
+    """Guest-facing prompt serializer — for stay prompts."""
+    class Meta:
+        model = RatingPrompt
+        fields = ['id', 'status']
+        read_only_fields = fields
+
+
+class SubmitRatingSerializer(serializers.Serializer):
+    score = serializers.IntegerField(min_value=1, max_value=5)
+    feedback = serializers.CharField(required=False, default='', allow_blank=True)
+
+    def validate(self, data):
+        if data['score'] <= 3 and not data.get('feedback', '').strip():
+            raise serializers.ValidationError(
+                {'feedback': 'Feedback is required for ratings of 3 or below.'}
+            )
+        return data
+
+
+class AdminRatingSerializer(serializers.ModelSerializer):
+    """Admin-facing rating serializer with guest info."""
+    guest_name = serializers.SerializerMethodField()
+    room_number = serializers.SerializerMethodField()
+    department_name = serializers.SerializerMethodField()
+    request_public_id = serializers.UUIDField(
+        source='service_request.public_id', read_only=True,
+    )
+
+    class Meta:
+        model = Rating
+        fields = [
+            'id', 'rating_type', 'score', 'feedback',
+            'review_clicked_at', 'created_at',
+            'guest_name', 'room_number', 'department_name',
+            'request_public_id',
+        ]
+        read_only_fields = fields
+
+    def get_guest_name(self, obj):
+        return obj.guest.get_full_name() or obj.guest.phone or 'Guest'
+
+    def get_room_number(self, obj):
+        if obj.guest_stay:
+            return obj.guest_stay.room_number
+        # For request ratings, get room from service_request's guest_stay
+        if obj.service_request and obj.service_request.guest_stay:
+            return obj.service_request.guest_stay.room_number
+        return ''
+
+    def get_department_name(self, obj):
+        if obj.service_request and obj.service_request.department:
+            return obj.service_request.department.name
+        return None
+
+
+class RatingSummarySerializer(serializers.Serializer):
+    """Read-only summary stats — not model-backed."""
+    total_count = serializers.IntegerField()
+    average_score = serializers.FloatField(allow_null=True)
+    distribution = serializers.DictField(child=serializers.IntegerField())
+    by_department = serializers.ListField(child=serializers.DictField())
+
+
+class SendSurveySerializer(serializers.Serializer):
+    """Validates stay survey trigger — no input fields, just validates the stay."""
+    pass

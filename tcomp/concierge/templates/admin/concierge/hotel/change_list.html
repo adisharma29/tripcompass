@@ -1,0 +1,6 @@
+{% extends "admin/change_list.html" %}
+
+{% block object-tools-items %}
+  {% if provision_url %}<li><a href="{{ provision_url }}" class="addlink">Provision New Hotel</a></li>{% endif %}
+  {{ block.super }}
+{% endblock %}

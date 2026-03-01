@@ -2,16 +2,19 @@ import logging
 
 from .base import NotificationEvent
 from .email import EmailAdapter
+from .oncall import OncallAdapter
 from .push import PushAdapter
 from .whatsapp import WhatsAppAdapter
 
 logger = logging.getLogger(__name__)
 
 # Registry of all adapters (order = dispatch order).
+# OncallAdapter runs last — safety-net for escalations after all route-based adapters.
 ADAPTERS = [
     PushAdapter(),
     WhatsAppAdapter(),
     EmailAdapter(),
+    OncallAdapter(),
 ]
 
 

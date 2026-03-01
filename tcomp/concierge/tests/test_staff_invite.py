@@ -133,14 +133,23 @@ class SendStaffInviteWhatsAppTest(TestCase):
 @override_settings(
     RESEND_API_KEY='re_test_key',
     RESEND_FROM_EMAIL='Test <test@test.com>',
+    FRONTEND_ORIGIN='https://refuje.com',
 )
 class SendStaffInviteEmailTest(TestCase):
 
+    def _make_user(self, email='john@example.com', first_name='John'):
+        user = MagicMock()
+        user.email = email
+        user.first_name = first_name
+        user.pk = 1
+        return user
+
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_happy_path(self, mock_send):
+    def test_happy_path(self, mock_send, _mock_token):
         mock_send.return_value = {'id': 'email-123'}
 
-        result = send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+        result = send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
         self.assertTrue(result)
         mock_send.assert_called_once()
 
@@ -150,66 +159,73 @@ class SendStaffInviteEmailTest(TestCase):
 
     @override_settings(RESEND_API_KEY='')
     def test_missing_api_key(self):
-        result = send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+        result = send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
         self.assertFalse(result)
 
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_permanent_validation_error(self, mock_send):
+    def test_permanent_validation_error(self, mock_send, _mock_token):
         from resend.exceptions import ValidationError
         mock_send.side_effect = ValidationError('invalid email', 400, 'validation_error')
 
-        result = send_staff_invite_email('bad@', 'John', 'Test Hotel', 'Staff')
+        result = send_staff_invite_email(self._make_user(email='bad@'), 'Test Hotel', 'Staff')
         self.assertFalse(result)
 
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_permanent_missing_api_key_error(self, mock_send):
+    def test_permanent_missing_api_key_error(self, mock_send, _mock_token):
         from resend.exceptions import MissingApiKeyError
         mock_send.side_effect = MissingApiKeyError('missing key', 401, 'missing_api_key')
 
-        result = send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+        result = send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
         self.assertFalse(result)
 
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_permanent_invalid_api_key_error(self, mock_send):
+    def test_permanent_invalid_api_key_error(self, mock_send, _mock_token):
         from resend.exceptions import InvalidApiKeyError
         mock_send.side_effect = InvalidApiKeyError('bad key', 403, 'invalid_api_key')
 
-        result = send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+        result = send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
         self.assertFalse(result)
 
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_permanent_missing_fields_error(self, mock_send):
+    def test_permanent_missing_fields_error(self, mock_send, _mock_token):
         from resend.exceptions import MissingRequiredFieldsError
         mock_send.side_effect = MissingRequiredFieldsError(
             'missing fields', 422, 'missing_required_fields',
         )
 
-        result = send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+        result = send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
         self.assertFalse(result)
 
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_transient_rate_limit_propagates(self, mock_send):
+    def test_transient_rate_limit_propagates(self, mock_send, _mock_token):
         from resend.exceptions import RateLimitError
         mock_send.side_effect = RateLimitError('rate limited', 429, 'rate_limit_exceeded')
 
         with self.assertRaises(RateLimitError):
-            send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+            send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
 
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_transient_application_error_propagates(self, mock_send):
+    def test_transient_application_error_propagates(self, mock_send, _mock_token):
         from resend.exceptions import ApplicationError
         mock_send.side_effect = ApplicationError('server error', 500, 'application_error')
 
         with self.assertRaises(ApplicationError):
-            send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+            send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
 
+    @patch('concierge.services.generate_password_token', return_value=('dWlk', 'tok-123'))
     @patch('resend.Emails.send')
-    def test_unknown_resend_error_propagates(self, mock_send):
+    def test_unknown_resend_error_propagates(self, mock_send, _mock_token):
         from resend.exceptions import ResendError
         mock_send.side_effect = ResendError('unknown', 499, 'unknown_type', 'retry')
 
         with self.assertRaises(ResendError):
-            send_staff_invite_email('john@example.com', 'John', 'Test Hotel', 'Staff')
+            send_staff_invite_email(self._make_user(), 'Test Hotel', 'Staff')
 
 
 # ---------------------------------------------------------------------------

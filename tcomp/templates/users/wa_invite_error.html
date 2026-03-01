@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invite Error</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .card {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            max-width: 400px;
+            width: 100%;
+            padding: 40px 32px;
+            text-align: center;
+        }
+        .icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+        h1 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #1a1a1a;
+            margin-bottom: 12px;
+        }
+        .message {
+            color: #666;
+            font-size: 15px;
+            line-height: 1.5;
+            margin-bottom: 24px;
+        }
+        a.action {
+            display: inline-block;
+            background: #18181b;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 10px;
+            padding: 14px 32px;
+            font-size: 16px;
+            font-weight: 500;
+            transition: background 0.15s;
+        }
+        a.action:hover { background: #27272a; }
+        .footer {
+            margin-top: 24px;
+            color: #aaa;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">&#9888;&#65039;</div>
+        <h1>Something went wrong</h1>
+        <p class="message">{{ message }}</p>
+        {% if action_url %}
+        <a class="action" href="{{ action_url }}">{{ action_label }}</a>
+        {% endif %}
+        <p class="footer">Powered by Refuje</p>
+    </div>
+</body>
+</html>
